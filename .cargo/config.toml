@@ -1,0 +1,9 @@
+# Development-only linker flags so the example host binary re-exports the
+# napi_* symbols that dlopen'ed .node native addons resolve.
+# Embedded hosts do this in their own build.rs instead, e.g.
+# `deno_napi::print_linker_flags("<host-binary-name>")`.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))']
+rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]
+
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-export_dynamic"]
