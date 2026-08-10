@@ -1,7 +1,13 @@
-# Publishes the crate to crates.io when a version tag (vX.Y.Z) is pushed.
-# The tag version must match the `version` field in Cargo.toml; bump both
-# together before tagging. Requires the CARGO_REGISTRY_TOKEN repository secret
-# (a crates.io API token, https://crates.io/settings/tokens).
+# Publishes the crate to crates.io via trusted publishing (OIDC, no API token
+# secret) when a version tag (vX.Y.Z) is pushed. The tag version must match the
+# `version` field in Cargo.toml; bump both together before tagging.
+#
+# One-time setup (crates.io side, in the browser):
+# 1. Publish the first version manually (`cargo publish`) — the initial
+#    publish requires an API token; later versions can use trusted publishing.
+# 2. crates.io -> crate page -> Settings -> Trusted Publishing -> Add ->
+#    GitHub: owner `agentsyaml`, repo `libdeno`, workflow `release.yml`,
+#    environment left empty.
 name: Release
 
 on:
@@ -16,14 +22,22 @@ jobs:
   publish:
     name: publish to crates.io
     runs-on: ubuntu-latest
+    permissions:
+      # Required for the OIDC token exchange (trusted publishing).
+      id-token: write
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Exchanges the GitHub OIDC token for a short-lived crates.io token
+      # (auto-revoked afterwards). No CARGO_REGISTRY_TOKEN secret needed.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
       # cargo publish builds the crate (including the V8 snapshot) to verify
       # the package before uploading; a failed build aborts the publish.
       - name: Publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked
