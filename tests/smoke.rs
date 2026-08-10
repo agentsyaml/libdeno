@@ -123,6 +123,33 @@ fn require_traversal_outside_granted_dir_is_denied() {
 }
 
 #[test]
+fn cwd_option_sets_process_cwd_for_script() {
+    // options.cwd must be what the script observes (Deno.cwd/process.cwd),
+    // not the host process's cwd, and the host cwd must be restored after.
+    let dir = temp_dir("cwd-opt");
+    fs::create_dir_all(&dir).unwrap();
+    let original_cwd = std::env::current_dir().unwrap();
+    let entry = dir.join("main.js");
+    // Canonicalize: Deno.cwd()/process.cwd() come from getcwd, which resolves
+    // symlinks (e.g. /var -> /private/var on macOS), while temp_dir() paths
+    // are not canonicalized.
+    let expected = fs::canonicalize(&dir).unwrap().display().to_string();
+    fs::write(
+        &entry,
+        format!("if (Deno.cwd() !== {expected:?}) throw new Error('cwd mismatch');"),
+    )
+    .unwrap();
+    let options = LibdenoOptions {
+        cwd: Some(dir.clone()),
+        ..Default::default()
+    };
+    let code = run(&entry, &options).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(std::env::current_dir().unwrap(), original_cwd);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn node_builtins_are_available() {
     let dir = temp_dir("node-builtins");
     let entry = dir.join("main.js");

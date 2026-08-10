@@ -85,6 +85,10 @@ pub fn run_in_subprocess(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<i32, LibdenoError> {
+    // Serialize with run(): the cwd the child inherits is captured here, and
+    // run() switches the process cwd for its duration — without the lock a
+    // concurrent run could hand this child a stale cwd.
+    let _lock = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let cwd = options.cwd.clone().unwrap_or(std::env::current_dir()?);
     let token = child_token();
     let request = ChildRunRequest {
