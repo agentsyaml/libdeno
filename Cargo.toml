@@ -1,6 +1,6 @@
 [package]
 name = "libdeno"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Embed the Deno runtime in Rust with direct npm: specifier support"
 license = "MIT"
@@ -47,9 +47,32 @@ deno_features = "0.54.0"
 thiserror = "1"
 
 [build-dependencies]
-deno_runtime = { version = "0.265.0", features = ["snapshot"] }
-deno_napi = "0.188.0"
-deno_core = { version = "0.410.0", features = ["v8", "reactor-tokio", "v8_use_custom_libcxx"] }
+# The snapshot pipeline needs the runtime and the v8 backend linked into the
+# build script. deno_runtime is backend-agnostic — the embedder must enable
+# deno_core's `v8` feature (same as the normal dependency), otherwise deno_v8
+# compiles without its v8 backend in the build-dependency universe. Both are
+# optional and feature-gated: docs.rs builds with `no-default-features`, so the
+# build script has no dependencies and links nothing (the v8 crate emits no
+# static lib under DOCS_RS=1, which would fail the build-script link).
+deno_runtime = { version = "0.265.0", features = ["snapshot"], optional = true }
+deno_core = { version = "0.410.0", features = ["v8", "reactor-tokio", "v8_use_custom_libcxx"], optional = true }
+
+[features]
+default = ["snapshot"]
+# Compiles the V8 runtime snapshot (and residual lazy sources) in build.rs.
+# Disable only for documentation builds (see [package.metadata.docs.rs]);
+# without it the crate compiles with an empty snapshot and is not runnable.
+snapshot = ["dep:deno_runtime", "dep:deno_core"]
+
+# docs.rs cannot build the snapshot pipeline: it requires linking the Deno
+# runtime (V8) into the build script, and docs.rs builds offline — the v8
+# crate skips emitting its static library when DOCS_RS is set, so the build
+# script link fails. docs.rs only rustdoc's the lib (never links/runs it), so
+# an empty snapshot + empty residual tables are sufficient. With
+# no-default-features the `snapshot` feature is off and build.rs emits
+# placeholders instead.
+[package.metadata.docs.rs]
+no-default-features = true
 
 [profile.release]
 debug = false

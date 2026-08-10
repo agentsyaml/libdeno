@@ -107,7 +107,7 @@ pub struct LibdenoOptions {
     /// restricts the runtime to the declared capabilities; a flag without a
     /// value allows that capability globally.
     pub permissions: Vec<String>,
-    /// Arguments exposed to the script via `process.argv` (after argv[0]).
+    /// Arguments exposed to the script via `process.argv` (after `argv[0]`).
     pub args: Vec<String>,
     /// Working directory that relative paths (entry, permissions, node_modules
     /// discovery) resolve against. Defaults to the process current directory.

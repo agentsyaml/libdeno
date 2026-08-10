@@ -69,9 +69,9 @@ fn child_token() -> String {
 /// The child inherits stdout/stderr, so script output still appears. Entry,
 /// permissions, args and cwd are passed over stdin as JSON, together with a
 /// fresh per-run auth `token`. The same token is handed to the child via the
-/// [`LIBDENO_CHILD_TOKEN`] environment variable; the child refuses to run
+/// `LIBDENO_CHILD_TOKEN` environment variable; the child refuses to run
 /// unless the request token matches, so a process that can set
-/// [`LIBDENO_CHILD_MODE`] and write the child's stdin cannot inject a request
+/// `LIBDENO_CHILD_MODE` and write the child's stdin cannot inject a request
 /// of its own.
 ///
 /// # Security
@@ -135,8 +135,8 @@ pub fn run_in_subprocess(
 /// script and exits the process with the script's exit code (including
 /// `Deno.exit(n)`), so it does not return.
 ///
-/// Child mode is serviced only when both [`LIBDENO_CHILD_MODE`] and
-/// [`LIBDENO_CHILD_TOKEN`] are set and the request's token matches the
+/// Child mode is serviced only when both `LIBDENO_CHILD_MODE` and
+/// `LIBDENO_CHILD_TOKEN` are set and the request's token matches the
 /// environment token — the handshake [`run_in_subprocess`] sets up. A missing
 /// or mismatched token exits with an error rather than falling through to a
 /// host run, which could otherwise execute the host at elevated privilege.
