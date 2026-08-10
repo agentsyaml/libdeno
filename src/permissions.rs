@@ -58,7 +58,13 @@ pub fn build_permissions(
             None => (arg.as_str(), None),
         };
         if flag == "-A" || flag == "--allow-all" {
-            // Explicit allow-all: keep the default.
+            // Explicit allow-all: keep the default. A value is rejected — it
+            // would otherwise silently grant everything.
+            if value.is_some() {
+                return Err(LibdenoError::Permission(format!(
+                    "flag `{flag}` does not take a value"
+                )));
+            }
             return Ok(PermissionsContainer::allow_all(parser));
         }
         // `--allow-read` (no value) means global; `--allow-read=` (empty value)
@@ -128,10 +134,10 @@ pub fn build_permissions(
                 has_allow = true;
                 extend(&mut opts.allow_sys, specs);
             }
-            "--allow-import" => {
-                has_allow = true;
-                extend(&mut opts.allow_import, specs);
-            }
+            "--allow-import" => return Err(LibdenoError::Permission(
+                "flag `--allow-import` is not supported; module loading is gated by --allow-net"
+                    .to_string(),
+            )),
             _ => {
                 return Err(LibdenoError::Permission(format!(
                     "unknown permission flag: {flag}"
@@ -185,6 +191,26 @@ mod tests {
         assert_eq!(
             p.query_net(Some("example.com")).unwrap(),
             PermissionState::Granted
+        );
+    }
+
+    #[test]
+    fn allow_all_with_value_is_rejected() {
+        for bad in ["-A=anything", "--allow-all=x"] {
+            let args = vec![bad.to_string()];
+            assert!(
+                build_permissions(&args, parser(), std::env::current_dir().unwrap().as_path())
+                    .is_err(),
+                "`{bad}` must be rejected, not grant allow-all"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_import_is_rejected() {
+        let args = vec!["--allow-import=https://x".to_string()];
+        assert!(
+            build_permissions(&args, parser(), std::env::current_dir().unwrap().as_path()).is_err()
         );
     }
 

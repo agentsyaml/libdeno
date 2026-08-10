@@ -63,11 +63,16 @@ struct NpmProcessState {
 
 impl deno_runtime::deno_process::NpmProcessStateProvider for NpmProcessStateProviderImpl {
     fn get_npm_process_state(&self) -> String {
-        deno_core::serde_json::to_string(&NpmProcessState {
+        match deno_core::serde_json::to_string(&NpmProcessState {
             kind: self.kind.clone(),
             local_node_modules_path: self.local_node_modules_path.clone(),
-        })
-        .unwrap()
+        }) {
+            Ok(json) => json,
+            Err(e) => {
+                eprintln!("libdeno: failed to serialize npm process state: {e}");
+                "{}".to_string()
+            }
+        }
     }
 }
 
@@ -131,26 +136,28 @@ impl deno_npm_installer::lifecycle_scripts::LifecycleScriptsExecutor
 /// deno_lib::npm::create_npm_process_state_provider.
 pub fn create_npm_process_state_provider(
     resolver_factory: &Arc<ResolverFactory<RealSys>>,
-) -> deno_runtime::deno_process::NpmProcessStateProviderRc {
+) -> deno_core::anyhow::Result<deno_runtime::deno_process::NpmProcessStateProviderRc> {
     use deno_resolver::npm::NpmResolver;
-    match resolver_factory.npm_resolver().expect("npm resolver") {
+    match resolver_factory.npm_resolver()? {
         NpmResolver::Managed(managed) => {
             let resolution = managed.resolution();
-            deno_fs::sync::MaybeArc::new(NpmProcessStateProviderImpl {
+            Ok(deno_fs::sync::MaybeArc::new(NpmProcessStateProviderImpl {
                 kind: NpmProcessStateKind::Snapshot(
                     resolution.serialized_valid_snapshot().into_serialized(),
                 ),
                 local_node_modules_path: managed
                     .root_node_modules_path()
                     .map(|p| p.to_string_lossy().to_string()),
-            })
+            }))
         }
-        NpmResolver::Byonm(byonm) => deno_fs::sync::MaybeArc::new(NpmProcessStateProviderImpl {
-            kind: NpmProcessStateKind::Byonm,
-            local_node_modules_path: byonm
-                .root_node_modules_path()
-                .map(|p| p.to_string_lossy().to_string()),
-        }),
+        NpmResolver::Byonm(byonm) => {
+            Ok(deno_fs::sync::MaybeArc::new(NpmProcessStateProviderImpl {
+                kind: NpmProcessStateKind::Byonm,
+                local_node_modules_path: byonm
+                    .root_node_modules_path()
+                    .map(|p| p.to_string_lossy().to_string()),
+            }))
+        }
     }
 }
 
@@ -298,7 +305,11 @@ impl RuntimeServices {
             deno_resolver::file_fetcher::DenoGraphLoaderOptions {
                 file_header_overrides: Default::default(),
                 include_npm_sources: false,
-                permissions: Some(permissions.deep_clone()),
+                // Live container (clone shares the Arc<Mutex<Permissions>>,
+                // unlike deep_clone which forks a private copy) so
+                // Deno.permissions.revoke is honored by graph fetches, matching
+                // the CLI. Do NOT revert to deep_clone.
+                permissions: Some(permissions.clone()),
                 file_permission_api_name: None,
                 reporter: None,
             },
@@ -315,7 +326,7 @@ impl RuntimeServices {
         let graph_resolver = Arc::new(
             GraphResolver::new(resolver_factory.clone(), npm_installer_factory.clone()).await?,
         );
-        let npm_process_state_provider = create_npm_process_state_provider(&resolver_factory);
+        let npm_process_state_provider = create_npm_process_state_provider(&resolver_factory)?;
 
         Ok(Self {
             shared: Arc::new(SharedServices {

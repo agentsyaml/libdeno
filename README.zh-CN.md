@@ -74,7 +74,7 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `LibdenoOptions.cwd: Option<PathBuf>` | 相对路径（入口、权限、node_modules 发现）解析的工作目录，默认进程当前目录。 |
 | `LibdenoError` | 枚举：`Entry`（入口解析失败）、`Permission`（权限字符串非法）、`Runtime`、`Core`、`Js`（脚本异常）、`Io`。 |
 
-支持的权限标志：`--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names] --allow-import[=urls]`，以及 `-A` / `--allow-all`。
+支持的权限标志：`--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`，以及 `-A` / `--allow-all`。
 
 完整 API 文档见 [`docs/api.md`](docs/api.md)（英文）。
 

@@ -53,7 +53,6 @@ Supported flags:
 | `--allow-run` | executable names |
 | `--allow-ffi` | `.so`/`.dylib` paths |
 | `--allow-sys` | system API names |
-| `--allow-import` | URLs |
 | `-A` / `--allow-all` | — (allow everything, the default stance) |
 
 ### `args`

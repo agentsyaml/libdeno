@@ -25,7 +25,6 @@ listed descriptors are allowed (`--allow-read=./src,./public`).
 | `--allow-run` | executable names | `--allow-run=git` |
 | `--allow-ffi` | native library paths | `--allow-ffi=./libfoo.so` |
 | `--allow-sys` | system API names | `--allow-sys=getpid` |
-| `--allow-import` | URLs | `--allow-import=example.com/mod.ts` |
 | `-A` / `--allow-all` | — | allow everything (the default) |
 
 Deny/ignore forms (`--deny-*`, `--ignore-*`) are not currently exposed, and

@@ -22,18 +22,15 @@ fn runs_plain_js_and_returns_exit_code() {
 }
 
 #[test]
-fn propagates_script_exit_code() {
-    // NOTE: Deno.exit(n) in this embedded runtime calls deno_os::exit, which
-    // runs std::process::exit(n) directly — the host process exits before
-    // run() returns. Exit-code propagation is therefore only observable via a
-    // child process (see the demo host), not in-process. We assert here only
-    // that the runtime accepts the call (a script ending normally is tested
-    // elsewhere).
+fn in_process_deno_exit_returns_code() {
+    // Deno.exit(n) is intercepted (a WatcherExitHandle lives in the OpState):
+    // op_exit terminates the isolate instead of calling std::process::exit, so
+    // the host process survives and run() returns the requested code.
     let dir = temp_dir("exitcode");
     let entry = dir.join("main.js");
-    fs::write(&entry, "console.log('before exit');").unwrap();
+    fs::write(&entry, "Deno.exit(7);").unwrap();
     let code = run(&entry, &LibdenoOptions::default()).unwrap();
-    assert_eq!(code, 0);
+    assert_eq!(code, 7);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -88,6 +85,36 @@ fn permissions_restrict_fs_reads() {
     };
     let err = run(&entry, &options).unwrap_err();
     // Runtime surfaces the denial as a NotCapable error.
+    assert!(
+        err.to_string().contains("NotCapable"),
+        "unexpected error: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn require_traversal_outside_granted_dir_is_denied() {
+    // Regression for the node_modules component bypass: a require path with a
+    // `node_modules` component was previously exempted from the read check
+    // lexically, so `node_modules/../..` traversal could read any file. The
+    // resolved (canonicalized) path is what the permission check and the npm
+    // exemption see now, so a node_modules-looking prefix with `..` cannot
+    // smuggle a non-npm file past the gate.
+    let dir = temp_dir("perm-traversal");
+    let granted = dir.join("granted");
+    fs::create_dir_all(&granted).unwrap();
+    // The node_modules dir must exist so the traversal path canonicalizes.
+    fs::create_dir_all(granted.join("node_modules")).unwrap();
+    fs::write(dir.join("secret.txt"), "secret data").unwrap();
+    // .cjs so the module is treated as CommonJS and gets a real `require`
+    // (ambiguous .js files are ESM in this runtime).
+    let entry = granted.join("main.cjs");
+    fs::write(&entry, "require('./node_modules/../../secret.txt');").unwrap();
+    let options = LibdenoOptions {
+        permissions: vec![format!("--allow-read={}", granted.display())],
+        ..Default::default()
+    };
+    let err = run(&entry, &options).unwrap_err();
     assert!(
         err.to_string().contains("NotCapable"),
         "unexpected error: {err}"

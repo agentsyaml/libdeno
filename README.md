@@ -77,7 +77,7 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `LibdenoOptions.cwd: Option<PathBuf>` | Working directory that relative paths (entry, permissions, `node_modules` discovery) resolve against. Defaults to the process current directory. |
 | `LibdenoError` | Enum: `Entry` (entry resolution failed), `Permission` (invalid permission flag), `Runtime`, `Core`, `Js` (script exception), `Io`. |
 
-Supported permission flags: `--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names] --allow-import[=urls]`, plus `-A` / `--allow-all`.
+Supported permission flags: `--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`, plus `-A` / `--allow-all`.
 
 Full API documentation: [`docs/api.md`](docs/api.md).
 

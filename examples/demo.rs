@@ -22,7 +22,9 @@ fn main() {
         println!(
             "permission flags: --allow-read[=paths] --allow-write[=paths] --allow-env[=names]"
         );
-        println!("  --allow-net[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names] --allow-import[=urls]");
+        println!(
+            "  --allow-net[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]"
+        );
         return;
     }
 

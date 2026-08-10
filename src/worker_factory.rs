@@ -8,7 +8,6 @@ use std::sync::Arc;
 use deno_runtime::deno_fs::FileSystem;
 use deno_runtime::deno_inspector_server::MainInspectorSessionChannel;
 use deno_runtime::deno_node::NodeExtInitServices;
-use deno_runtime::deno_permissions::PermissionsContainer;
 use deno_runtime::deno_web::InMemoryBroadcastChannel;
 use deno_runtime::ops::worker_host::CreateWebWorkerArgs;
 use deno_runtime::web_worker::WebWorker;
@@ -31,7 +30,6 @@ type WebWorkerFactoryShared = (
     Arc<deno_runtime::FeatureChecker>,
     Arc<dyn FileSystem>,
     Arc<SharedServices>,
-    PermissionsContainer,
     MainInspectorSessionChannel,
     BootstrapOptions,
 );
@@ -47,29 +45,42 @@ pub fn create_web_worker_factory(
     feature_checker: Arc<deno_runtime::FeatureChecker>,
     fs: Arc<dyn FileSystem>,
     services: Arc<SharedServices>,
-    permissions: PermissionsContainer,
     main_inspector_session_tx: MainInspectorSessionChannel,
     bootstrap_base: BootstrapOptions,
-) -> Arc<deno_runtime::ops::worker_host::CreateWebWorkerCb> {
+) -> deno_core::anyhow::Result<Arc<deno_runtime::ops::worker_host::CreateWebWorkerCb>> {
+    // All fallible resolver init runs up front so the factory construction
+    // itself can fail cleanly; the per-spawn callback below stays infallible.
+    let cjs_tracker = services.resolver_factory.cjs_tracker()?.clone();
+    let node_resolver = services.resolver_factory.node_resolver()?.clone();
+    let pkg_json_resolver = services.resolver_factory.pkg_json_resolver().clone();
+    let in_npm_pkg_checker = services.resolver_factory.in_npm_package_checker()?.clone();
+
     let shared: Arc<WebWorkerFactoryShared> = Arc::new((
         blob_store,
         broadcast_channel,
         feature_checker,
         fs,
         services,
-        permissions,
+        // The inspector session channel is intentionally SHARED across workers:
+        // each worker sends its own session-pair proxy through this one sender,
+        // which is how a single attached inspector reaches all workers. Do not
+        // give each worker a fresh channel (worker inspection would silently die).
         main_inspector_session_tx,
         bootstrap_base,
     ));
 
-    Arc::new(move |args: CreateWebWorkerArgs| {
+    Ok(Arc::new(move |args: CreateWebWorkerArgs| {
+        // Worker's own permissions container: each worker carries the
+        // permissions captured at `new Worker(...)` time (args.permissions),
+        // NOT the parent's. Grabbed first so the move of args.permissions
+        // below is safe.
+        let worker_permissions = args.permissions.clone();
         let (
             blob_store,
             broadcast_channel,
             feature_checker,
             fs,
             services,
-            permissions,
             main_inspector_session_tx,
             bootstrap_base,
         ) = &*shared;
@@ -79,28 +90,22 @@ pub fn create_web_worker_factory(
             feature_checker.clone(),
             fs.clone(),
             services.clone(),
-            permissions.clone(),
             main_inspector_session_tx.clone(),
             bootstrap_base.clone(),
-        );
+        )
+        // All fallible init already ran at factory construction above; the
+        // recursive call re-runs the same get_or_try_init-cached resolvers, so
+        // this cannot fail. Kept as expect() because the callback is infallible.
+        .expect("resolver factory already initialized in create_web_worker_factory");
         let module_loader: Rc<dyn deno_core::ModuleLoader> = Rc::new(GraphModuleLoader::new(
             services.clone(),
-            permissions.clone(),
+            worker_permissions.clone(),
         ));
-        let node_require_loader: deno_runtime::deno_node::NodeRequireLoaderRc =
-            Rc::new(SimpleNodeRequireLoader::new(
-                services
-                    .resolver_factory
-                    .cjs_tracker()
-                    .expect("cjs tracker")
-                    .clone(),
-            ));
-        let node_resolver = services
-            .resolver_factory
-            .node_resolver()
-            .expect("node resolver")
-            .clone();
-        let pkg_json_resolver = services.resolver_factory.pkg_json_resolver().clone();
+        let node_require_loader: deno_runtime::deno_node::NodeRequireLoaderRc = Rc::new(
+            SimpleNodeRequireLoader::new(cjs_tracker.clone(), in_npm_pkg_checker.clone()),
+        );
+        let node_resolver = node_resolver.clone();
+        let pkg_json_resolver = pkg_json_resolver.clone();
         let sys = services.sys.clone();
         WebWorker::bootstrap_from_options(
             WebWorkerServiceOptions {
@@ -119,6 +124,12 @@ pub fn create_web_worker_factory(
                     sys,
                 }),
                 npm_process_state_provider: Some(services.npm_process_state_provider.clone()),
+                // Op-level checks use the worker's own permissions container
+                // (args.permissions), as deno_runtime expects.
+                // Residual: worker-triggered graph fetches are checked against
+                // the shared live parent container (matches the CLI's
+                // shared-graph behavior; a module already fetched into the
+                // graph is not re-checked per worker).
                 permissions: args.permissions,
                 root_cert_store_provider: None,
                 shared_array_buffer_store: None,
@@ -158,5 +169,5 @@ pub fn create_web_worker_factory(
                 wait_for_page_wait_for_debugger: false,
             },
         )
-    })
+    }))
 }

@@ -7,3 +7,12 @@ rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]
 
 [target.'cfg(target_os = "macos")']
 rustflags = ["-C", "link-arg=-Wl,-export_dynamic"]
+
+# Windows mirrors deno_napi::print_linker_flags, which links the host against
+# its napi symbol export list (`/DEF:generated_symbol_exports_list_windows.def`).
+# That def file lives inside the deno_napi crate source, which a committed
+# config cannot reference (cargo does not expand env vars in rustflags), so we
+# export the addon loader's entry point directly instead. For the full export
+# list, call `deno_napi::print_linker_flags("<host-binary-name>")` from a build.rs.
+[target.'cfg(windows)']
+rustflags = ["-C", "link-arg=/EXPORT:napi_register_module_v1"]

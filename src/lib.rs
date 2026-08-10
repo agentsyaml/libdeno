@@ -132,10 +132,26 @@ async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, Libden
     > = Arc::new(deno_runtime::deno_permissions::RuntimePermissionDescriptorParser::new(RealSys));
     let permissions = build_permissions(&options.permissions, permission_parser.clone(), &cwd)?;
     let services = Arc::new(
-        RuntimeServices::new(cwd, config_start_paths, permissions.deep_clone())
+        RuntimeServices::new(cwd, config_start_paths, permissions.clone())
             .await
             .map_err(LibdenoError::Runtime)?,
     );
+
+    // has_node_modules_dir must be derived from the resolver AFTER
+    // RuntimeServices::new: that construction runs
+    // initialize_npm_resolution_if_managed, which decides Managed vs BYONM.
+    let has_node_modules_dir = {
+        use deno_resolver::npm::NpmResolver;
+        match services
+            .shared
+            .resolver_factory
+            .npm_resolver()
+            .map_err(LibdenoError::Runtime)?
+        {
+            NpmResolver::Managed(managed) => managed.root_node_modules_path().is_some(),
+            NpmResolver::Byonm(byonm) => byonm.root_node_modules_path().is_some(),
+        }
+    };
 
     let module_loader: Rc<dyn deno_core::ModuleLoader> = Rc::new(GraphModuleLoader::new(
         services.shared.clone(),
@@ -145,8 +161,14 @@ async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, Libden
     let node_resolver = services.shared.resolver_factory.node_resolver()?.clone();
     let pkg_json_resolver = services.shared.resolver_factory.pkg_json_resolver().clone();
     let cjs_tracker = services.shared.resolver_factory.cjs_tracker()?.clone();
-    let node_require_loader: deno_runtime::deno_node::NodeRequireLoaderRc =
-        Rc::new(SimpleNodeRequireLoader::new(cjs_tracker));
+    let in_npm_pkg_checker = services
+        .shared
+        .resolver_factory
+        .in_npm_package_checker()?
+        .clone();
+    let node_require_loader: deno_runtime::deno_node::NodeRequireLoaderRc = Rc::new(
+        SimpleNodeRequireLoader::new(cjs_tracker, in_npm_pkg_checker),
+    );
     let node_sys = services.shared.sys.clone();
     let node_services = Some(NodeExtInitServices {
         node_require_loader: node_require_loader.clone(),
@@ -194,10 +216,19 @@ async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, Libden
         bundle_provider: None,
     };
 
+    // Track against deno_runtime's release tag; scripts feature-detect on
+    // Deno.version.deno, so this must be the embedded Deno release, NOT
+    // libdeno's crate version. deno_runtime 0.265.0 == Deno v2.9.5.
+    const DENO_VERSION: &str = "2.9.5";
+
     let main_bootstrap = BootstrapOptions {
-        deno_version: env!("CARGO_PKG_VERSION").to_string(),
-        user_agent: format!("libdeno/{}", env!("CARGO_PKG_VERSION")),
-        has_node_modules_dir: true,
+        deno_version: DENO_VERSION.to_string(),
+        user_agent: format!(
+            "libdeno/{}/Deno/{}",
+            env!("CARGO_PKG_VERSION"),
+            DENO_VERSION
+        ),
+        has_node_modules_dir,
         location: Some(main_module.clone()),
         args: options.args.clone(),
         unstable_features: unstable_ids,
@@ -229,10 +260,9 @@ async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, Libden
             feature_checker,
             fs.clone(),
             services.shared.clone(),
-            permissions.clone(),
             MainInspectorSessionChannel::default(),
             main_bootstrap.clone(),
-        );
+        )?;
 
     let options = WorkerOptions {
         bootstrap: main_bootstrap,
@@ -245,15 +275,48 @@ async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, Libden
     };
 
     let mut worker = MainWorker::bootstrap_from_options(&main_module, worker_services, options);
-    worker.execute_main_module(&main_module).await?;
-    worker.run_event_loop(false).await?;
-    worker.dispatch_load_event()?;
-    worker.run_event_loop(false).await?;
-    worker.dispatch_beforeunload_event()?;
-    worker.dispatch_unload_event()?;
-    worker.dispatch_process_beforeexit_event()?;
-    worker.dispatch_process_exit_event()?;
-    Ok(worker.exit_code())
+
+    // Intercept Deno.exit: registering a WatcherExitHandle in the OpState makes
+    // op_exit terminate the isolate and return (the CLI's --watch path) instead
+    // of calling std::process::exit and killing the embedder's process. The
+    // requested code is preserved in the ExitCode op state and returned below.
+    let isolate_handle = worker.js_runtime.v8_isolate().thread_safe_handle();
+    worker
+        .js_runtime
+        .op_state()
+        .borrow_mut()
+        .put(deno_runtime::deno_os::WatcherExitHandle(isolate_handle));
+
+    let run_result: Result<(), LibdenoError> = async {
+        worker.execute_main_module(&main_module).await?;
+        worker.run_event_loop(false).await?;
+        worker.dispatch_load_event()?;
+        worker.run_event_loop(false).await?;
+        worker.dispatch_beforeunload_event()?;
+        worker.dispatch_unload_event()?;
+        worker.dispatch_process_beforeexit_event()?;
+        worker.dispatch_process_exit_event()?;
+        Ok(())
+    }
+    .await;
+
+    match run_result {
+        Ok(()) => Ok(worker.exit_code()),
+        // A termination error with the WatcherExited marker set means the script
+        // called Deno.exit(n): return n instead of propagating the termination
+        // error. (Deno.exit(0) is indistinguishable from natural completion.)
+        Err(_)
+            if worker
+                .js_runtime
+                .op_state()
+                .borrow()
+                .try_borrow::<deno_runtime::deno_os::WatcherExited>()
+                .is_some() =>
+        {
+            Ok(worker.exit_code())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Resolve the entry module: a file path, or a directory / package.json whose

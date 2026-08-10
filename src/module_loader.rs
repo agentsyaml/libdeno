@@ -190,6 +190,11 @@ impl ModuleLoader for GraphModuleLoader {
 
             let graph = services.graph.lock().await;
             let requested = as_deno_resolver_requested_module_type(&requested_module_type);
+            let in_npm_pkg_checker = services
+                .resolver_factory
+                .in_npm_package_checker()
+                .map_err(|e| JsErrorBox::generic(e.to_string()))?
+                .clone();
             let loaded = services
                 .resolver_factory
                 .module_loader()
@@ -199,7 +204,10 @@ impl ModuleLoader for GraphModuleLoader {
                     &specifier,
                     maybe_referrer.as_ref(),
                     &requested,
-                    Some(&FsCjsAnalysisSourceProvider::new(permissions.clone())),
+                    Some(&FsCjsAnalysisSourceProvider::new(
+                        permissions.clone(),
+                        in_npm_pkg_checker,
+                    )),
                 )
                 .await
                 .map_err(|e| JsErrorBox::generic(e.to_string()))?;
@@ -237,9 +245,14 @@ impl ModuleLoader for GraphModuleLoader {
                     ..
                 } => {
                     let asset_specifier = asset_specifier.into_owned();
+                    // SECURITY: never use fetch_bypass_permissions here. An
+                    // external asset is reachable from arbitrary JS imports and
+                    // this fetch must honor the same live permissions container
+                    // that gated this module load. Keep the unstable_*_imports
+                    // flags OFF — this fix is what makes them safe to flip later.
                     let file = services
                         .file_fetcher
-                        .fetch_bypass_permissions(&asset_specifier)
+                        .fetch(&asset_specifier, &permissions)
                         .await
                         .map_err(|e| JsErrorBox::generic(e.to_string()))?;
                     let media_type = file.resolve_media_type_and_charset().0;

@@ -27,8 +27,15 @@ fn main() {
 }
 
 fn create_cli_snapshot(snapshot_path: &Path, residual_path: &Path, out_dir: &Path) {
+    // The TypeScript version bundled in deno_runtime 0.265.0's snapshot.
+    // No crate in the dep tree exposes it (deno_ast has no ts_version()).
+    // Source of truth: the deno repo's cli/snapshot/shared.rs TS_VERSION at
+    // the tag for deno_runtime 0.265.0 (v2.9.5) — update in lockstep with the
+    // deno_runtime bump.
+    const TS_VERSION: &str = "6.0.3";
+
     let snapshot_options = SnapshotOptions {
-        ts_version: "5.8.2".to_string(),
+        ts_version: TS_VERSION.to_string(),
         v8_version: deno_runtime::deno_core::v8::VERSION_STRING,
         target: env::var("TARGET").unwrap(),
     };

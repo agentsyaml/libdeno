@@ -15,6 +15,7 @@ use http::header::ETAG;
 use http::header::IF_NONE_MATCH;
 use http::header::LOCATION;
 use http::HeaderMap;
+use std::time::Duration;
 use url::Url;
 
 #[derive(Debug)]
@@ -26,6 +27,8 @@ impl Default for ReqwestHttpClient {
     fn default() -> Self {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(300))
             .user_agent(concat!("libdeno/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("failed to build http client");
@@ -89,6 +92,7 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
         maybe_etag: Option<String>,
         maybe_registry_config: Option<&RegistryConfig>,
     ) -> Result<NpmCacheHttpClientResponse, DownloadError> {
+        let mut url = url;
         let err = |status_code, message: String| DownloadError {
             status_code,
             error: deno_error::JsErrorBox::generic(message),
@@ -96,7 +100,7 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
 
         // Use the npmrc credentials when the caller did not supply an explicit
         // auth value (private registries).
-        let auth = maybe_auth.or_else(|| {
+        let mut auth = maybe_auth.or_else(|| {
             maybe_registry_config.and_then(|c| {
                 if let Some(token) = &c.auth_token {
                     Some(format!("Bearer {token}"))
@@ -118,6 +122,7 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
         // transient network errors are retried with a short backoff.
         let max_attempts = 3;
         let mut attempt = 0;
+        let mut redirects_remaining: u32 = 10;
         loop {
             attempt += 1;
             let mut request = self.client.get(url.clone());
@@ -154,6 +159,43 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
                         return Ok(NpmCacheHttpClientResponse::Bytes(
                             NpmCacheHttpClientBytesResponse { bytes, etag },
                         ));
+                    }
+                    // Follow redirects manually (the client uses Policy::none):
+                    // registries (GitHub Packages, corporate mirrors) redirect
+                    // tarball/metadata URLs. 304 is already handled above.
+                    if status.is_redirection() {
+                        if redirects_remaining == 0 {
+                            return Err(err(
+                                Some(status.as_u16()),
+                                format!("npm registry request failed with status {status}"),
+                            ));
+                        }
+                        redirects_remaining -= 1;
+                        let location = response
+                            .headers()
+                            .get(LOCATION)
+                            .and_then(|v| v.to_str().ok())
+                            .ok_or_else(|| {
+                                err(
+                                    Some(status.as_u16()),
+                                    format!("npm registry request failed with status {status}"),
+                                )
+                            })?;
+                        let next = url.join(location).map_err(|e| {
+                            err(
+                                Some(status.as_u16()),
+                                format!("invalid npm registry redirect location: {e}"),
+                            )
+                        })?;
+                        // Never leak registry bearer tokens off-origin: drop
+                        // auth on scheme/host/port change (origin, like the
+                        // file fetcher's analog), not just host.
+                        if next.origin() != url.origin() {
+                            auth = None;
+                        }
+                        url = next;
+                        attempt = 0; // a redirect is a new request, not a retry
+                        continue;
                     }
                     // 429/5xx are transient; everything else is a hard failure.
                     if (status.as_u16() == 429 || status.is_server_error())
@@ -198,6 +240,25 @@ mod tests {
                 let _ = stream.read(&mut buf); // drain the request line + headers
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// Like `serve`, but accepts two connections in sequence: the first gets
+    /// `first`, the second gets `second`. Used to simulate a redirect followed
+    /// by the real response.
+    fn serve_then(first: &'static str, second: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for response in [first, second] {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf); // drain the request line + headers
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
             }
         });
         format!("http://{addr}/")
@@ -292,6 +353,32 @@ mod tests {
                     assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR)
                 }
                 other => panic!("expected status code error, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn npm_download_follows_redirect() {
+        // A registry 302 to a relative Location must be followed to the target
+        // and yield the final body (the client itself uses Policy::none).
+        let url = serve_then(
+            "HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: application/octet-stream\r\n\r\nhello",
+        );
+        let client = ReqwestHttpClient::default();
+        runtime().block_on(async {
+            let resp = client
+                .download_with_retries_on_any_tokio_runtime(
+                    Url::parse(&url).unwrap(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            match resp {
+                NpmCacheHttpClientResponse::Bytes(bytes) => assert_eq!(bytes.bytes, b"hello"),
+                _ => panic!("expected npm registry bytes response"),
             }
         });
     }
