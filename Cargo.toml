@@ -6,6 +6,7 @@ description = "Embed the Deno runtime in Rust with direct npm: specifier support
 license = "MIT"
 readme = "README.md"
 documentation = "https://docs.rs/libdeno"
+repository = "https://github.com/agentsyaml/libdeno"
 keywords = ["deno", "runtime", "embed", "npm", "javascript"]
 categories = ["api-bindings", "development-tools"]
 authors = ["Zhenxing Sun <zhenxing.sun@irootech.com>"]

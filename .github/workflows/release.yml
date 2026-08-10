@@ -1,0 +1,29 @@
+# Publishes the crate to crates.io when a version tag (vX.Y.Z) is pushed.
+# The tag version must match the `version` field in Cargo.toml; bump both
+# together before tagging. Requires the CARGO_REGISTRY_TOKEN repository secret
+# (a crates.io API token, https://crates.io/settings/tokens).
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # cargo publish builds the crate (including the V8 snapshot) to verify
+      # the package before uploading; a failed build aborts the publish.
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
