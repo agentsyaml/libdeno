@@ -2,6 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/libdeno.svg)](https://crates.io/crates/libdeno)
 [![docs.rs](https://docs.rs/libdeno/badge.svg)](https://docs.rs/libdeno)
+[![CI](https://github.com/agentsyaml/libdeno/actions/workflows/ci.yml/badge.svg)](https://github.com/agentsyaml/libdeno/actions/workflows/ci.yml)
 
 > Embed the Deno runtime in Rust with direct `npm:` specifier support.
 
