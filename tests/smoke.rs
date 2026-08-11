@@ -211,3 +211,32 @@ fn subprocess_mode_passes_args() {
     assert_eq!(code, 0);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn subprocess_child_uses_options_cwd() {
+    // The child's working directory must be options.cwd (pinned via
+    // Command::current_dir at spawn), never the host process's cwd — and
+    // run_in_subprocess must not depend on a process-global cwd lock (a
+    // long-lived child must not block later calls in the same process).
+    let dir = temp_dir("subproc-cwd");
+    fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("main.js");
+    // Canonicalize: Deno.cwd()/process.cwd() come from getcwd, which resolves
+    // symlinks (e.g. /var -> /private/var on macOS).
+    let expected = fs::canonicalize(&dir).unwrap().display().to_string();
+    fs::write(
+        &entry,
+        format!("if (Deno.cwd() !== {expected:?}) throw new Error('cwd mismatch');"),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("LIBDENO_HOST_EXE", env!("CARGO_BIN_EXE_child_host"));
+    }
+    let options = LibdenoOptions {
+        cwd: Some(dir.clone()),
+        ..Default::default()
+    };
+    let code = libdeno::run_in_subprocess(&entry, &options).unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -1,6 +1,6 @@
 [package]
 name = "libdeno"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Embed the Deno runtime in Rust with direct npm: specifier support"
 license = "MIT"
@@ -76,3 +76,7 @@ no-default-features = true
 
 [profile.release]
 debug = false
+
+# Standalone workspace root so downstream projects can consume this crate via
+# path/git/patch dependencies without cargo workspace conflicts.
+[workspace]

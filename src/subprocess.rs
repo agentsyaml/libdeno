@@ -85,17 +85,21 @@ pub fn run_in_subprocess(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<i32, LibdenoError> {
-    // Serialize with run(): the cwd the child inherits is captured here, and
-    // run() switches the process cwd for its duration — without the lock a
-    // concurrent run could hand this child a stale cwd.
-    let _lock = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // No CWD_LOCK here: the child's working directory is pinned explicitly via
+    // Command::current_dir below (and again via the JSON `cwd`, which the
+    // child's run() chdirs to), so the parent's process cwd — which a
+    // concurrent in-process run() may switch — is irrelevant to the child.
+    // Holding the lock across child.wait() would deadlock hosts that run
+    // long-lived children (plugins/daemons): the first child would hold the
+    // process-global lock forever and block every later run_in_subprocess or
+    // run() call in the same process.
     let cwd = options.cwd.clone().unwrap_or(std::env::current_dir()?);
     let token = child_token();
     let request = ChildRunRequest {
         entry: entry.as_ref().to_string_lossy().into_owned(),
         permissions: options.permissions.clone(),
         args: options.args.clone(),
-        cwd: Some(cwd),
+        cwd: Some(cwd.clone()),
         token: token.clone(),
     };
     let payload = deno_core::serde_json::to_vec(&request)
@@ -108,6 +112,7 @@ pub fn run_in_subprocess(
     let mut child = std::process::Command::new(exe)
         .env(LIBDENO_CHILD_MODE, "1")
         .env(LIBDENO_CHILD_TOKEN, &token)
+        .current_dir(&cwd)
         .stdin(std::process::Stdio::piped())
         .spawn()
         .map_err(LibdenoError::Io)?;

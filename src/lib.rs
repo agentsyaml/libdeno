@@ -86,9 +86,12 @@ impl Drop for CwdGuard {
     }
 }
 
-/// Serializes [`run`]/[`run_in_subprocess`]: the process cwd is switched to
-/// `LibdenoOptions.cwd` for the duration of a run, and the cwd a subprocess
-/// inherits is captured at spawn, so concurrent calls would stomp each other.
+/// Serializes in-process [`run`] calls: [`run`] switches the process cwd to
+/// `LibdenoOptions.cwd` for its duration (CwdGuard), and the process cwd is
+/// global, so concurrent runs would stomp each other. [`run_in_subprocess`]
+/// does NOT take this lock — it pins the child's cwd explicitly via
+/// `Command::current_dir`, so holding a process-global lock across
+/// `child.wait()` (long-lived plugin/daemon children) must never happen here.
 /// The CLI has the same single-cwd model; runs are heavyweight (a full worker
 /// bootstrap), so serialization costs nothing in practice.
 pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -144,10 +147,11 @@ pub enum LibdenoError {
 /// Runs `entry` (a file, a directory, or a package.json) to completion and
 /// returns the exit code the script requested (0 on normal completion).
 ///
-/// Each call builds its own current-thread runtime and worker. Calls are
-/// serialized process-wide: the process cwd is switched to `options.cwd` for
-/// the duration of the run (and restored afterwards), so scripts observe a
-/// consistent working directory.
+/// Each call builds its own current-thread runtime and worker. `run` calls
+/// are serialized among themselves: the process cwd is switched to
+/// `options.cwd` for the duration of the run (and restored afterwards), so
+/// scripts observe a consistent working directory. [`run_in_subprocess`] does
+/// not take the cwd lock (it pins the child's cwd at spawn instead).
 pub fn run(entry: impl AsRef<Path>, options: &LibdenoOptions) -> Result<i32, LibdenoError> {
     // The process cwd is process-global; serialize so a concurrent run cannot
     // observe another run's cwd (see CWD_LOCK).
