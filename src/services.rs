@@ -100,15 +100,26 @@ impl deno_npm_installer::lifecycle_scripts::LifecycleScriptsExecutor
                     .map(|p| p.as_path())
                     .unwrap_or(pkg.package_folder.as_path());
                 let pkg_bin = pkg.package_folder.join("node_modules").join(".bin");
+                // PATH is `;`-separated on Windows, `:`-separated elsewhere.
+                let sep = if cfg!(windows) { ';' } else { ':' };
                 let path = format!(
-                    "{}:{}:{}",
+                    "{}{sep}{}{sep}{}",
                     pkg_bin.display(),
                     root_bin.display(),
                     std::env::var("PATH").unwrap_or_default(),
                 );
                 let name = pkg.package.id.nv.name.as_str();
-                let status = tokio::process::Command::new("sh")
-                    .arg("-c")
+                // npm lifecycle scripts run via sh on unix, cmd on Windows
+                // (mirrors npm's own script-shell default per-platform).
+                let mut cmd =
+                    tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+                // /d skips AutoRun, /s keeps nested quotes intact (npm uses
+                // `cmd /d /s /c`); on unix `sh -c`.
+                #[cfg(windows)]
+                cmd.args(["/d", "/s", "/C"]);
+                #[cfg(not(windows))]
+                cmd.arg("-c");
+                let status = cmd
                     .arg(script)
                     .current_dir(cwd)
                     .env("PATH", &path)

@@ -2,6 +2,9 @@
 name = "libdeno"
 version = "0.1.2"
 edition = "2021"
+# Matches the toolchain pinned by deno v2.9.5 (rust-toolchain.toml); the deno
+# stack publishes no rust-version, and the v8 crate requires edition 2024.
+rust-version = "1.95"
 description = "Embed the Deno runtime in Rust with direct npm: specifier support"
 license = "MIT"
 readme = "README.md"
@@ -21,14 +24,17 @@ deno_resolver = { version = "0.88.0", features = ["graph", "deno_ast"] }
 node_resolver = "0.95.0"
 # deno_runtime is backend-agnostic; the embedder must enable the v8 backend.
 deno_core = { version = "0.410.0", features = ["v8", "reactor-tokio", "v8_use_custom_libcxx"] }
-deno_graph = "=0.110.1"
+# Caret (not exact): nothing in the tree pins deno_graph exactly, so this
+# allows patch bumps on `cargo update`. The committed Cargo.lock + CI's
+# `--locked` keeps it pinned in practice.
+deno_graph = "0.110.1"
 deno_cache_dir = "0.49.0"
 deno_config = "0.107.0"
 deno_npm_installer = "0.52.0"
 deno_npm_cache = "0.76.0"
 deno_npm = "0.69.0"
 deno_npmrc = "0.18.0"
-base64 = "0.21"
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 deno_media_type = { version = "0.4.0", features = ["module_specifier"] }
 # Must match deno_core/deno_runtime's pin so JsErrorBox is a single type.
@@ -41,10 +47,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 http = "1"
 bytes = "1"
 url = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt", "time", "sync", "process"] }
 deno_fs = "0.167.0"
 deno_features = "0.54.0"
-thiserror = "1"
+thiserror = "2"
 
 [build-dependencies]
 # The snapshot pipeline needs the runtime and the v8 backend linked into the

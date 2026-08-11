@@ -1,3 +1,11 @@
+# The v8 crate's output rlib exceeds sccache's archive member limit
+# ("Archive member size is too large"), so bypass any machine-global
+# sccache wrapper configured in ~/.cargo/config.toml for this project.
+# Note: this only beats the *config file* — a shell-level RUSTC_WRAPPER env
+# var outranks it and would silently re-enable sccache.
+[build]
+rustc-wrapper = ""
+
 # Development-only linker flags so the example host binary re-exports the
 # napi_* symbols that dlopen'ed .node native addons resolve.
 # Embedded hosts do this in their own build.rs instead, e.g.

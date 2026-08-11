@@ -4803,7 +4803,7 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.21.7",
+ "base64 0.22.1",
  "bytes",
  "deno_cache_dir",
  "deno_config",
@@ -4825,7 +4825,7 @@ dependencies = [
  "reqwest",
  "serde",
  "sys_traits",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "url",
 ]

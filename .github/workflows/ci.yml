@@ -11,8 +11,14 @@ env:
 
 jobs:
   test:
-    name: build + test
-    runs-on: ubuntu-latest
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+      # macos-15 = arm64, macos-15-intel = x86_64 (both standard labels;
+      # macos-13 is retired and macos-14 is deprecated).
+      os: [ubuntu-latest, macos-15, macos-15-intel, windows-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -32,4 +38,38 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --all-targets
+        # --locked keeps CI in sync with the committed Cargo.lock (the release
+        # publish is --locked too, so lockfile drift fails here, not at tag).
+        run: cargo test --all-targets --locked
+
+  release-build:
+    name: release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build (release)
+        # Exercises the release profile (optimizations + final link) that the
+        # dev-profile test job never touches.
+        run: cargo build --release --all-targets --locked
+
+  msrv:
+    name: MSRV check (1.95.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check (MSRV)
+        run: cargo check --locked
