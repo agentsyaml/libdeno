@@ -67,7 +67,14 @@ struct CwdGuard(Option<PathBuf>);
 impl CwdGuard {
     fn set(cwd: &Path) -> Self {
         let prev = std::env::current_dir().ok();
-        if std::env::set_current_dir(cwd).is_err() {
+        // Canonicalize so scripts observe a consistent cwd on every platform:
+        // unix getcwd already resolves aliases (e.g. /var -> /private/var),
+        // but Windows GetCurrentDirectory echoes back exactly what was set —
+        // including 8.3 short names (e.g. RUNNER~1) from temp paths — so
+        // canonicalizing first makes Deno.cwd()/process.cwd() match
+        // fs::canonicalize everywhere.
+        let target = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        if std::env::set_current_dir(&target).is_err() {
             eprintln!(
                 "libdeno: failed to chdir to cwd {}; relative paths resolve against the host cwd",
                 cwd.display()
