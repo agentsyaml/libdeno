@@ -72,16 +72,17 @@ jobs:
 
       # The main page's Deployments/Environments area is populated only by the
       # Deployments API — workflow runs don't create deployments by
-      # themselves. Record the publish so the vX.Y.Z release shows up there.
+      # themselves. required_contexts: [] skips the commit-status gate (the
+      # CI run on the tag commit may still be in flight); a JSON body via
+      # --input is needed so the empty array round-trips as JSON.
       - name: Record deployment
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          deployment_id="$(gh api "repos/${{ github.repository }}/deployments" \
-            -f ref="$GITHUB_REF_NAME" \
-            -f environment=production \
-            -f description="publish libdeno $GITHUB_REF_NAME to crates.io" \
-            --jq '.id')"
+          deployment_id="$(gh api "repos/${{ github.repository }}/deployments" --input - --jq '.id' <<'JSON'
+          {"ref":"${{ github.ref_name }}","environment":"production","required_contexts":[],"description":"publish libdeno ${{ github.ref_name }} to crates.io"}
+          JSON
+          )"
           gh api "repos/${{ github.repository }}/deployments/${deployment_id}/statuses" \
             -f state=success \
             -f description="published to crates.io"
