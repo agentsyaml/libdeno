@@ -30,33 +30,20 @@ struct ChildRunRequest {
     entry: String,
     permissions: Vec<String>,
     args: Vec<String>,
-    cwd: Option<PathBuf>,
+    cwd: PathBuf,
     /// Per-run auth token, verified against [`LIBDENO_CHILD_TOKEN`].
     token: String,
 }
 
 /// Generates a fresh 32-hex-char auth token for a child run.
 ///
-/// On unix the entropy comes from `/dev/urandom`; elsewhere a hash of the
-/// clock and PID is used — a weak fallback, acceptable because the token only
-/// authenticates the same-user subprocess handshake, not a security boundary.
+/// The token authenticates the same-user subprocess handshake, not a security
+/// boundary (see [`run_in_subprocess`]); it still needs real entropy so a
+/// stdin-only third party cannot guess it.
 fn child_token() -> String {
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let mut buf = [0u8; 16];
-            if f.read_exact(&mut buf).is_ok() {
-                return buf.iter().map(|b| format!("{b:02x}")).collect();
-            }
-        }
-    }
-    // Weak fallback (non-unix, or urandom unavailable): clock nanos + PID.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    format!("{nanos:016x}{:016x}", std::process::id())
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).expect("failed to read system randomness for child token");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Runs `entry` in a child process and returns its exit code.
@@ -85,45 +72,53 @@ pub fn run_in_subprocess(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<i32, LibdenoError> {
-    // No CWD_LOCK here: the child's working directory is pinned explicitly via
-    // Command::current_dir below (and again via the JSON `cwd`, which the
-    // child's run() chdirs to), so the parent's process cwd — which a
-    // concurrent in-process run() may switch — is irrelevant to the child.
-    // Holding the lock across child.wait() would deadlock hosts that run
-    // long-lived children (plugins/daemons): the first child would hold the
-    // process-global lock forever and block every later run_in_subprocess or
-    // run() call in the same process.
-    let cwd = options.cwd.clone().unwrap_or(std::env::current_dir()?);
+    // Take CWD_LOCK only around the cwd read + spawn (both fast): a
+    // concurrent in-process run() may switch the process-global cwd
+    // mid-flight, and pinning the child's cwd from a stale read would run it
+    // in the wrong tree. The lock is NOT held across child.wait() — that
+    // would deadlock hosts that run long-lived children (plugins/daemons):
+    // the first child would hold the process-global lock forever and block
+    // every later run_in_subprocess or run() call in the same process.
     let token = child_token();
-    let request = ChildRunRequest {
-        entry: entry.as_ref().to_string_lossy().into_owned(),
-        permissions: options.permissions.clone(),
-        args: options.args.clone(),
-        cwd: Some(cwd.clone()),
-        token: token.clone(),
+    let (payload, mut child) = {
+        let _lock = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = options.cwd.clone().unwrap_or(std::env::current_dir()?);
+        let request = ChildRunRequest {
+            entry: entry.as_ref().to_string_lossy().into_owned(),
+            permissions: options.permissions.clone(),
+            args: options.args.clone(),
+            cwd: cwd.clone(),
+            token: token.clone(),
+        };
+        let payload = deno_core::serde_json::to_vec(&request)
+            .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
+        let exe = std::env::var_os(LIBDENO_HOST_EXE)
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_exe()?);
+        let child = std::process::Command::new(exe)
+            .env(LIBDENO_CHILD_MODE, "1")
+            .env(LIBDENO_CHILD_TOKEN, &token)
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(LibdenoError::Io)?;
+        (payload, child)
     };
-    let payload = deno_core::serde_json::to_vec(&request)
-        .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
-
-    let exe = std::env::var_os(LIBDENO_HOST_EXE)
-        .map(PathBuf::from)
-        .unwrap_or(std::env::current_exe()?);
-
-    let mut child = std::process::Command::new(exe)
-        .env(LIBDENO_CHILD_MODE, "1")
-        .env(LIBDENO_CHILD_TOKEN, &token)
-        .current_dir(&cwd)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .map_err(LibdenoError::Io)?;
     {
         use std::io::Write;
-        child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| LibdenoError::Runtime(deno_core::anyhow::anyhow!("child has no stdin")))?
-            .write_all(&payload)
-            .map_err(LibdenoError::Io)?;
+        let write_result = match child.stdin.as_mut() {
+            Some(stdin) => stdin.write_all(&payload).map_err(LibdenoError::Io),
+            None => Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                "child has no stdin"
+            ))),
+        };
+        if let Err(e) = write_result {
+            // Don't leak the child (or a zombie) on this error path: it may be
+            // blocked reading stdin or already dead.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
     }
     // Close the child's stdin so a script reading process.stdin sees EOF
     // instead of blocking forever on the still-open pipe.
@@ -152,7 +147,9 @@ pub fn run_in_subprocess(
 /// authenticated only by the token. Never run a host with child mode enabled
 /// under elevated privileges (setuid, service daemon, admin/root).
 pub fn maybe_handle_child_mode() -> bool {
-    if std::env::var_os(LIBDENO_CHILD_MODE).is_none() {
+    // Only an explicit `LIBDENO_CHILD_MODE=1` enters child mode; a stale or
+    // accidental value must not turn the host into a request server.
+    if std::env::var(LIBDENO_CHILD_MODE).as_deref() != Ok("1") {
         return false;
     }
     let Some(env_token) = std::env::var_os(LIBDENO_CHILD_TOKEN) else {
@@ -173,7 +170,7 @@ pub fn maybe_handle_child_mode() -> bool {
         let options = LibdenoOptions {
             permissions: request.permissions,
             args: request.args,
-            cwd: request.cwd,
+            cwd: Some(request.cwd),
         };
         run(&request.entry, &options)
     })();

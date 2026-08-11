@@ -69,7 +69,7 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 
 | Item | Description |
 |---|---|
-| `run(entry, &options) -> Result<i32, LibdenoError>` | Runs the entry to completion and returns the exit code the script requested. Each call builds an independent current-thread runtime and worker, so multiple invocations are fully isolated. |
+| `run(entry, &options) -> Result<i32, LibdenoError>` | Runs the entry to completion and returns the exit code the script requested. Each call builds its own current-thread runtime and worker; invocations share the process cwd (serialized via an internal lock, restored afterwards), the on-disk npm/HTTP caches, and `DENO_DIR`. |
 | `run_in_subprocess(entry, &options) -> Result<i32, LibdenoError>` | Runs the entry in a child process. `Deno.exit(n)` then terminates only the child; the host stays alive and observes `n`. The host must call `maybe_handle_child_mode()` at the start of `main()`. |
 | `maybe_handle_child_mode() -> bool` | Services `run_in_subprocess` child requests. Returns `false` on a normal host launch; in child mode it executes the script and exits with its code. |
 | `LibdenoOptions.permissions: Vec<String>` | `--allow-*` capability strings. An empty list allows everything; passing any entry restricts the runtime to the declared capabilities. |

@@ -43,43 +43,66 @@ impl HttpClient for ReqwestHttpClient {
         url: &Url,
         headers: HeaderMap,
     ) -> Result<SendResponse, SendError> {
-        let response = self
-            .client
-            .get(url.clone())
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| SendError::Failed(e.into()))?;
-        let status = response.status();
-
-        // is_redirection() covers 300..=399 including 304, so the 304 check must
-        // come first: a 304 (re-validation of a stale cached module) is not a
-        // redirect and carries no Location header.
-        if status == http::StatusCode::NOT_MODIFIED {
-            return Ok(SendResponse::NotModified);
-        }
-
-        if status.is_redirection() {
-            let mut redirect_headers = HeaderMap::new();
-            if let Some(location) = response.headers().get(LOCATION) {
-                redirect_headers.insert(LOCATION, location.clone());
-            }
-            return Ok(SendResponse::Redirect(redirect_headers));
-        }
-
-        if status.is_success() {
-            let headers = response.headers().clone();
-            let body = response
-                .bytes()
+        // Transient failures (network errors, 429/5xx) are retried with a
+        // bounded backoff, mirroring the npm path below: a single dropped
+        // packet must not fail a module fetch for the whole run.
+        let max_attempts = 3;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self
+                .client
+                .get(url.clone())
+                .headers(headers.clone())
+                .send()
                 .await
-                .map_err(|e| SendError::Failed(e.into()))?;
-            return Ok(SendResponse::Success(headers, body.to_vec()));
-        }
+            {
+                Ok(response) => {
+                    let status = response.status();
 
-        if status == http::StatusCode::NOT_FOUND {
-            return Err(SendError::NotFound);
+                    // is_redirection() covers 300..=399 including 304, so the
+                    // 304 check must come first: a 304 (re-validation of a
+                    // stale cached module) is not a redirect and carries no
+                    // Location header.
+                    if status == http::StatusCode::NOT_MODIFIED {
+                        return Ok(SendResponse::NotModified);
+                    }
+
+                    if status.is_redirection() {
+                        let mut redirect_headers = HeaderMap::new();
+                        if let Some(location) = response.headers().get(LOCATION) {
+                            redirect_headers.insert(LOCATION, location.clone());
+                        }
+                        return Ok(SendResponse::Redirect(redirect_headers));
+                    }
+
+                    if status.is_success() {
+                        let headers = response.headers().clone();
+                        let body = response
+                            .bytes()
+                            .await
+                            .map_err(|e| SendError::Failed(e.into()))?;
+                        return Ok(SendResponse::Success(headers, body.to_vec()));
+                    }
+
+                    if status == http::StatusCode::NOT_FOUND {
+                        return Err(SendError::NotFound);
+                    }
+                    if (status.as_u16() == 429 || status.is_server_error())
+                        && attempt < max_attempts
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(200 * attempt)).await;
+                        continue;
+                    }
+                    return Err(SendError::StatusCode(status));
+                }
+                Err(_) if attempt < max_attempts => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * attempt)).await;
+                    continue;
+                }
+                Err(e) => return Err(SendError::Failed(e.into())),
+            }
         }
-        Err(SendError::StatusCode(status))
     }
 }
 
@@ -232,27 +255,15 @@ mod tests {
     /// Serves a single canned HTTP response on an ephemeral port and returns
     /// the URL. The client request is drained so the server can respond.
     fn serve(response: &'static str) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 2048];
-                let _ = stream.read(&mut buf); // drain the request line + headers
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-            }
-        });
-        format!("http://{addr}/")
+        serve_many(vec![response])
     }
 
-    /// Like `serve`, but accepts two connections in sequence: the first gets
-    /// `first`, the second gets `second`. Used to simulate a redirect followed
-    /// by the real response.
-    fn serve_then(first: &'static str, second: &'static str) -> String {
+    /// Serves one canned HTTP response per accepted connection, in sequence.
+    fn serve_many(responses: Vec<&'static str>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            for response in [first, second] {
+            for response in responses {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0u8; 2048];
                     let _ = stream.read(&mut buf); // drain the request line + headers
@@ -262,6 +273,13 @@ mod tests {
             }
         });
         format!("http://{addr}/")
+    }
+
+    /// Like `serve_many`, but accepts two connections in sequence: the first
+    /// gets `first`, the second gets `second`. Used to simulate a redirect
+    /// followed by the real response.
+    fn serve_then(first: &'static str, second: &'static str) -> String {
+        serve_many(vec![first, second])
     }
 
     fn runtime() -> tokio::runtime::Runtime {
@@ -341,7 +359,12 @@ mod tests {
 
     #[test]
     fn other_error_status_is_reported() {
-        let url = serve("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        // A 5xx is retried up to 3 attempts; once the attempts are exhausted
+        // the status itself is reported. Connection: close forces a fresh
+        // connection per attempt so the mock serves exactly one response each.
+        let five_hundred =
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let url = serve_many(vec![five_hundred, five_hundred, five_hundred]);
         let client = ReqwestHttpClient::default();
         runtime().block_on(async {
             let err = client

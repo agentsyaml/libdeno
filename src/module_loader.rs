@@ -43,7 +43,8 @@ use crate::services::SharedServices;
 
 pub struct GraphModuleLoader {
     services: Arc<SharedServices>,
-    /// Permission snapshot used for permission-gated reads during CJS analysis.
+    /// Live permissions container (shallow clone) used for permission-gated
+    /// reads during CJS analysis — revocations stay honored; do NOT deep-clone.
     permissions: PermissionsContainer,
 }
 
@@ -281,10 +282,18 @@ async fn build_graph(
     let graph_resolver = services.graph_resolver.clone();
     let mut graph = services.graph.lock().await;
 
-    // Already loaded by a previous prepare_load (e.g. an earlier root built
-    // the whole transitive graph). Avoid rebuilding the tree.
+    // Already loaded successfully by a previous prepare_load (e.g. an earlier
+    // root built the whole transitive graph). Avoid rebuilding the tree — but
+    // deno_graph records load failures in the graph's error table (not on the
+    // module node), so "node exists" alone is not "loaded fine": a transient
+    // failure would otherwise poison the module for the rest of the run and
+    // every worker sharing the graph. Retry only when the node exists without
+    // an error for this specifier.
     if graph.get(specifier).is_some() {
-        return Ok(());
+        let failed = graph.module_errors().any(|e| e.specifier() == specifier);
+        if !failed {
+            return Ok(());
+        }
     }
 
     graph

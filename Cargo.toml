@@ -41,6 +41,8 @@ deno_media_type = { version = "0.4.0", features = ["module_specifier"] }
 deno_error = "=0.7.1"
 sys_traits = "0.1.28"
 deno_semver = "0.10.0"
+# Child-mode auth token entropy (already in the tree via the deno stack).
+getrandom = "0.2"
 async-trait = "0.1"
 anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "gzip", "brotli", "stream", "http2"] }

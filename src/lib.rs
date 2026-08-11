@@ -163,6 +163,15 @@ pub fn run(entry: impl AsRef<Path>, options: &LibdenoOptions) -> Result<i32, Lib
     // The process cwd is process-global; serialize so a concurrent run cannot
     // observe another run's cwd (see CWD_LOCK).
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Building a runtime inside a tokio runtime panics; report instead of
+    // taking down the host. Embedders calling run() from an async task should
+    // use run_in_subprocess (or spawn a thread).
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+            "libdeno::run() cannot be called from inside a tokio runtime; \
+             call it from a non-async context or use run_in_subprocess"
+        )));
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -178,7 +187,13 @@ async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, Libden
         deno_runtime::deno_tls::rustls::crypto::aws_lc_rs::default_provider(),
     );
 
-    let cwd = options.cwd.clone().unwrap_or(std::env::current_dir()?);
+    // Canonicalize once so entry resolution, permission grants, node_modules
+    // discovery and the process cwd all agree: unix getcwd already
+    // canonicalizes (e.g. /var -> /private/var) and CwdGuard canonicalizes
+    // before chdir, so a symlinked options.cwd would otherwise split
+    // Deno.cwd() (canonical) from relative grants/entry (aliased).
+    let cwd_raw = options.cwd.clone().unwrap_or(std::env::current_dir()?);
+    let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
     // Scripts observe this directory as their working directory
     // (process.cwd()/Deno.cwd(), relative reads, relative imports); the
     // previous process cwd is restored when the run finishes.

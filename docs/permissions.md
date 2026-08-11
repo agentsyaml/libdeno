@@ -38,7 +38,7 @@ not a silent grant.
 
 ## How it works
 
-`build_permissions` (`src/lib.rs`) splits each flag on `=`, parses the
+`build_permissions` (`src/permissions.rs`) splits each flag on `=`, parses the
 comma-separated value, and fills a `PermissionsOptions` struct. If no
 `--allow-*` flag was seen, it returns
 `PermissionsContainer::allow_all`. Otherwise it constructs a
@@ -49,8 +49,10 @@ The parsed container is:
 - handed to the file fetcher (`DenoGraphLoaderOptions.permissions`) for
   module fetching,
 - handed to `WorkerServiceOptions.permissions` for the main worker,
-- **deep-cloned** into `RuntimeServices` and passed to web workers via
-  `CreateWebWorkerArgs.permissions`.
+- cloned (shallow — the container wraps an `Arc`, so the clone is live, not
+  a snapshot) into `RuntimeServices` and passed to web workers via
+  `CreateWebWorkerArgs.permissions`. Permission revocations stay honored in
+  the workers; do not deep-clone here.
 
 The `CjsAnalysisSourceProvider` and `SimpleNodeRequireLoader` enforce the
 same read permissions as `Deno.readTextFile`: a fully-granted read
