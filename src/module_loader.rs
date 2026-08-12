@@ -29,6 +29,7 @@ use deno_core::RequestedModuleType;
 use deno_core::ResolutionKind;
 use deno_error::JsErrorBox;
 use deno_graph::BuildOptions;
+use deno_graph::ModuleGraph;
 use deno_media_type::MediaType;
 use deno_resolver::loader::LoadedModuleOrAsset;
 use deno_resolver::loader::LoadedModuleSource;
@@ -39,19 +40,28 @@ use node_resolver::ResolutionMode;
 use deno_runtime::deno_permissions::PermissionsContainer;
 
 use crate::node_loader::FsCjsAnalysisSourceProvider;
-use crate::services::SharedServices;
+use crate::services::{RealFileFetcher, RealGraphLoader, RuntimeServices, SharedServices};
 
 pub struct GraphModuleLoader {
-    services: Arc<SharedServices>,
+    shared: Arc<SharedServices>,
+    /// Per-run permission-bound fetch pipeline: the file fetcher (permission-
+    /// gated reads), the graph loader and the module graph all come from the
+    /// run's RuntimeServices, so worker loaders share the run's graph.
+    file_fetcher: Arc<RealFileFetcher>,
+    graph_loader: Arc<RealGraphLoader>,
+    graph: Arc<tokio::sync::Mutex<ModuleGraph>>,
     /// Live permissions container (shallow clone) used for permission-gated
     /// reads during CJS analysis — revocations stay honored; do NOT deep-clone.
     permissions: PermissionsContainer,
 }
 
 impl GraphModuleLoader {
-    pub fn new(services: Arc<SharedServices>, permissions: PermissionsContainer) -> Self {
+    pub fn new(runtime: Arc<RuntimeServices>, permissions: PermissionsContainer) -> Self {
         Self {
-            services,
+            shared: runtime.shared.clone(),
+            file_fetcher: runtime.file_fetcher.clone(),
+            graph_loader: runtime.graph_loader.clone(),
+            graph: runtime.graph.clone(),
             permissions,
         }
     }
@@ -92,7 +102,7 @@ impl GraphModuleLoader {
 
         let mode = ResolutionMode::Import;
 
-        self.services
+        self.shared
             .graph_resolver
             .resolve(
                 specifier,
@@ -121,14 +131,16 @@ impl ModuleLoader for GraphModuleLoader {
         _maybe_content: Option<String>,
         _options: ModuleLoadOptions,
     ) -> Pin<Box<dyn Future<Output = Result<(), JsErrorBox>>>> {
-        let services = self.services.clone();
+        let services = self.shared.clone();
+        let graph_loader = self.graph_loader.clone();
+        let graph = self.graph.clone();
         let specifier = module_specifier.clone();
         Box::pin(async move {
             if matches!(specifier.scheme(), "node") {
                 // node: builtins come from the extension module map; nothing to load.
                 return Ok(());
             }
-            build_graph(&services, &specifier)
+            build_graph(&services, &graph_loader, &graph, &specifier)
                 .await
                 .map_err(|e| JsErrorBox::generic(format!("Failed to load \"{specifier}\": {e}")))
         })
@@ -151,7 +163,9 @@ impl ModuleLoader for GraphModuleLoader {
             )));
         }
 
-        let services = self.services.clone();
+        let services = self.shared.clone();
+        let file_fetcher = self.file_fetcher.clone();
+        let graph = self.graph.clone();
         let permissions = self.permissions.clone();
         let requested_specifier = module_specifier.clone();
         let maybe_referrer = maybe_referrer.map(|r| r.specifier.clone());
@@ -189,7 +203,7 @@ impl ModuleLoader for GraphModuleLoader {
                 requested_specifier.clone()
             };
 
-            let graph = services.graph.lock().await;
+            let graph_guard = graph.lock().await;
             let requested = as_deno_resolver_requested_module_type(&requested_module_type);
             let in_npm_pkg_checker = services
                 .resolver_factory
@@ -201,7 +215,7 @@ impl ModuleLoader for GraphModuleLoader {
                 .module_loader()
                 .map_err(|e| JsErrorBox::generic(e.to_string()))?
                 .load(
-                    &graph,
+                    &graph_guard,
                     &specifier,
                     maybe_referrer.as_ref(),
                     &requested,
@@ -251,14 +265,13 @@ impl ModuleLoader for GraphModuleLoader {
                     // specifier Cow, now detached). Drop it before the asset
                     // fetch so a slow remote asset download does not hold the
                     // graph lock and block every other concurrent load/build.
-                    drop(graph);
+                    drop(graph_guard);
                     // SECURITY: never use fetch_bypass_permissions here. An
                     // external asset is reachable from arbitrary JS imports and
                     // this fetch must honor the same live permissions container
                     // that gated this module load. Keep the unstable_*_imports
                     // flags OFF — this fix is what makes them safe to flip later.
-                    let file = services
-                        .file_fetcher
+                    let file = file_fetcher
                         .fetch(&asset_specifier, &permissions)
                         .await
                         .map_err(|e| JsErrorBox::generic(e.to_string()))?;
@@ -279,13 +292,15 @@ impl ModuleLoader for GraphModuleLoader {
     }
 }
 
-/// Builds (or extends) the shared module graph rooted at `specifier`.
+/// Builds (or extends) the per-run module graph rooted at `specifier`.
 async fn build_graph(
-    services: &SharedServices,
+    shared: &SharedServices,
+    graph_loader: &RealGraphLoader,
+    graph: &tokio::sync::Mutex<ModuleGraph>,
     specifier: &ModuleSpecifier,
 ) -> Result<(), deno_core::anyhow::Error> {
-    let jsr_version_resolver = services.resolver_factory.jsr_version_resolver()?;
-    let graph_resolver = services.graph_resolver.clone();
+    let jsr_version_resolver = shared.resolver_factory.jsr_version_resolver()?;
+    let graph_resolver = shared.graph_resolver.clone();
     // ponytail: the graph lock covers the whole build below, including the
     // slow work (remote module fetches with 30s connect / 300s total timeouts,
     // npm resolve_pkg_reqs installs). It cannot be narrowed: ModuleGraph::build
@@ -296,7 +311,7 @@ async fn build_graph(
     // graph field type is fixed in services.rs. A slow module therefore still
     // serializes concurrent builds of *other* roots; revisit only if deno_graph
     // gains a lock-free incremental build API.
-    let mut graph = services.graph.lock().await;
+    let mut graph = graph.lock().await;
 
     // Already loaded successfully by a previous prepare_load (e.g. an earlier
     // root built the whole transitive graph). Avoid rebuilding the tree — but
@@ -316,7 +331,7 @@ async fn build_graph(
         .build(
             vec![specifier.clone()],
             vec![],
-            &*services.graph_loader,
+            graph_loader,
             BuildOptions {
                 is_dynamic: false,
                 skip_dynamic_deps: false,
@@ -326,7 +341,7 @@ async fn build_graph(
                 unstable_config_imports: false,
                 executor: Default::default(),
                 locker: None,
-                file_system: &services.sys,
+                file_system: &shared.sys,
                 jsr_url_provider: &deno_graph::source::DefaultJsrUrlProvider,
                 jsr_version_resolver: Cow::Borrowed(&**jsr_version_resolver),
                 passthrough_jsr_specifiers: false,

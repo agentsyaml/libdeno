@@ -43,6 +43,20 @@ let exit_code = run("app.js", &options).unwrap();
 - A directory: `run("./my-app", ...)` (uses its `package.json` `main`, default `index.js`)
 - A `package.json` itself: `run("./my-app/package.json", ...)`
 
+### Reuse the resolver stack: `LibdenoRuntime` + `run_with`
+
+`run()` rebuilds the resolver stack (workspace / resolver / npm-installer factories, graph resolver) on every call. For long-lived hosts running many scripts in the same project, build the stack once and reuse it — it is rebuilt automatically when the config chain changes:
+
+```rust
+use libdeno::{LibdenoRuntime, LibdenoOptions, run_with};
+
+let runtime = LibdenoRuntime::new("./my-app").await.unwrap();
+let options = LibdenoOptions::default();
+let exit_code = run_with(&runtime, "app.js", &options).unwrap();
+```
+
+Scripts run in the runtime's cwd (`LibdenoOptions.cwd` is ignored there); each `run_with` still rebuilds the permission-bound file fetcher / graph loader / graph from its own `options.permissions`, so one run's grants can never leak into another.
+
 ### Run the demo
 
 ```bash
@@ -71,6 +85,8 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | Item | Description |
 |---|---|
 | `run(entry, &options) -> Result<i32, LibdenoError>` | Runs the entry to completion and returns the exit code the script requested. Each call builds its own current-thread runtime and worker; invocations share the process cwd (serialized via an internal lock, restored afterwards), the on-disk npm/HTTP caches, and `DENO_DIR`. |
+| `LibdenoRuntime::new(cwd)` | Builds the resolver stack for a project directory once (async). Reused by `run_with`; rebuilt automatically when the config chain (deno.json / deno.jsonc / import_map.json / package.json / .npmrc / node_modules) changes. |
+| `run_with(&runtime, entry, &options) -> Result<i32, LibdenoError>` | Like `run`, but reuses `runtime`'s resolver stack. Semantics identical to `run` (cwd lock, tokio re-entry check, exit codes, deadlines); the script runs in the runtime's cwd and permission-bound components are rebuilt per call. |
 | `run_in_subprocess(entry, &options) -> Result<i32, LibdenoError>` | Runs the entry in a child process. `Deno.exit(n)` then terminates only the child; the host stays alive and observes `n`. The host must call `maybe_handle_child_mode()` at the start of `main()`. |
 | `maybe_handle_child_mode() -> bool` | Services `run_in_subprocess` child requests. Returns `false` on a normal host launch; in child mode it executes the script and exits with its code. |
 | `LibdenoOptions.permissions: Vec<String>` | `--allow-*` capability strings. An empty list allows everything; passing any entry restricts the runtime to the declared capabilities. |

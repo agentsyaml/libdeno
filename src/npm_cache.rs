@@ -120,10 +120,10 @@ fn stat_fingerprint(path: &Path) -> Option<(u64, u64)> {
     Some((mtime, meta.len()))
 }
 
-/// Content hash of a small file (package.json), None when absent or
-/// unreadable. The cache is process-local, so DefaultHasher (no cross-process
-/// stability guarantee) is fine here.
-fn content_hash(path: &Path) -> Option<u64> {
+/// Content hash of a small file, None when absent or unreadable. The cache is
+/// process-local, so DefaultHasher (no cross-process stability guarantee) is
+/// fine here. Reused by the runtime's config fingerprint (runtime.rs).
+pub(crate) fn content_hash(path: &Path) -> Option<u64> {
     let bytes = std::fs::read(path).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);

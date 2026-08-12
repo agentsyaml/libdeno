@@ -24,6 +24,7 @@ mod module_loader;
 mod node_loader;
 mod npm_cache;
 mod permissions;
+mod runtime;
 mod services;
 mod subprocess;
 mod worker_factory;
@@ -45,13 +46,13 @@ use deno_runtime::worker::WorkerOptions;
 use deno_runtime::worker::WorkerServiceOptions;
 use deno_runtime::BootstrapOptions;
 
-pub use subprocess::maybe_handle_child_mode;
-pub use subprocess::run_in_subprocess;
+pub use runtime::{run_with, LibdenoRuntime};
+pub use subprocess::{maybe_handle_child_mode, run_in_subprocess};
 
 use module_loader::GraphModuleLoader;
 use node_loader::SimpleNodeRequireLoader;
 use permissions::build_permissions;
-use services::RuntimeServices;
+use services::{RuntimeServices, SharedServices};
 use sys_traits::impls::RealSys;
 use worker_factory::create_web_worker_factory;
 
@@ -193,13 +194,6 @@ pub fn run(entry: impl AsRef<Path>, options: &LibdenoOptions) -> Result<i32, Lib
 }
 
 async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, LibdenoError> {
-    // rustls needs an explicit CryptoProvider when both aws-lc-rs and ring are
-    // enabled in the dep graph (deno_tls enables aws-lc-rs; reqwest's rustls
-    // enables ring); the deno CLI does the same.
-    let _ = deno_runtime::deno_tls::rustls::crypto::CryptoProvider::install_default(
-        deno_runtime::deno_tls::rustls::crypto::aws_lc_rs::default_provider(),
-    );
-
     // Canonicalize once so entry resolution, permission grants, node_modules
     // discovery and the process cwd all agree: unix getcwd already
     // canonicalizes (e.g. /var -> /private/var) and CwdGuard canonicalizes
@@ -207,24 +201,41 @@ async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, Libden
     // Deno.cwd() (canonical) from relative grants/entry (aliased).
     let cwd_raw = options.cwd.clone().unwrap_or(std::env::current_dir()?);
     let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
-    // Scripts observe this directory as their working directory (Deno.cwd(),
-    // relative reads/imports); the previous process cwd is restored on exit.
     let _cwd_guard = CwdGuard::set(&cwd);
     let main_module = resolve_entry(entry, &cwd).map_err(LibdenoError::Entry)?;
-
-    let fs: Arc<dyn FileSystem> = Arc::new(RealFs);
     let config_start_paths = main_module
         .to_file_path()
         .ok()
         .and_then(|p| p.parent().map(|d| vec![d.to_path_buf()]))
         .unwrap_or_else(|| vec![cwd.clone()]);
+    let shared = SharedServices::new(cwd.clone(), config_start_paths)
+        .await
+        .map_err(LibdenoError::Runtime)?;
+    run_inner_with(shared, cwd, entry, options).await
+}
+
+/// The per-run half of a [`run`]/[`run_with`] against an already-built
+/// resolver stack: the permission-bound services and the run lifecycle.
+pub(crate) async fn run_inner_with(
+    shared: Arc<SharedServices>,
+    cwd: PathBuf,
+    entry: &Path,
+    options: &LibdenoOptions,
+) -> Result<i32, LibdenoError> {
+    // rustls needs an explicit CryptoProvider (aws-lc-rs and ring are both
+    // enabled in the dep graph); the deno CLI does the same.
+    let _ = deno_runtime::deno_tls::rustls::crypto::CryptoProvider::install_default(
+        deno_runtime::deno_tls::rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let _cwd_guard = CwdGuard::set(&cwd);
+    let main_module = resolve_entry(entry, &cwd).map_err(LibdenoError::Entry)?;
+
+    let fs: Arc<dyn FileSystem> = Arc::new(RealFs);
     let permission_parser =
         Arc::new(deno_runtime::deno_permissions::RuntimePermissionDescriptorParser::new(RealSys));
     let permissions = build_permissions(&options.permissions, permission_parser.clone(), &cwd)?;
     let services = Arc::new(
-        RuntimeServices::new(cwd, config_start_paths, permissions.clone())
-            .await
-            .map_err(LibdenoError::Runtime)?,
+        RuntimeServices::new(shared, cwd, permissions.clone()).map_err(LibdenoError::Runtime)?,
     );
 
     // has_node_modules_dir must come AFTER RuntimeServices::new: that runs
@@ -243,7 +254,7 @@ async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, Libden
     };
 
     let module_loader: Rc<dyn deno_core::ModuleLoader> = Rc::new(GraphModuleLoader::new(
-        services.shared.clone(),
+        services.clone(),
         permissions.clone(),
     ));
 
@@ -332,7 +343,7 @@ async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, Libden
             broadcast_channel,
             feature_checker,
             fs.clone(),
-            services.shared.clone(),
+            services.clone(),
             MainInspectorSessionChannel::default(),
             main_bootstrap.clone(),
             options.max_heap_bytes,
@@ -378,25 +389,13 @@ async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, Libden
 
     let exit_code = match run_result {
         Ok(()) => worker.exit_code(),
-        Err(_) if has_watcher_exited(&worker) => worker.exit_code(),
+        Err(_) if crate::runtime::has_watcher_exited(&worker) => worker.exit_code(),
         Err(e) => return Err(e),
     };
     // Cache the resolved npm snapshot (managed, no lockfile) only now: the
     // graph build has populated the resolution, so the snapshot is real.
     services.save_npm_snapshot_cache();
     Ok(exit_code)
-}
-
-/// True when the script called `Deno.exit(n)`: op_exit terminated the isolate
-/// with the WatcherExited marker set, and the requested code is in the ExitCode
-/// op state. (`Deno.exit(0)` is indistinguishable from natural completion.)
-fn has_watcher_exited(worker: &MainWorker) -> bool {
-    worker
-        .js_runtime
-        .op_state()
-        .borrow()
-        .try_borrow::<deno_runtime::deno_os::WatcherExited>()
-        .is_some()
 }
 
 /// Resolve the entry module: a file path, or a directory / package.json whose

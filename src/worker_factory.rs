@@ -25,7 +25,7 @@ use sys_traits::impls::RealSys;
 
 use crate::module_loader::GraphModuleLoader;
 use crate::node_loader::SimpleNodeRequireLoader;
-use crate::services::SharedServices;
+use crate::services::RuntimeServices;
 use crate::RESIDUAL_LAZY_ESM;
 use crate::RESIDUAL_LAZY_JS;
 use crate::STARTUP_SNAPSHOT;
@@ -33,13 +33,15 @@ use crate::STARTUP_SNAPSHOT;
 /// Immutable state shared with every spawned worker (and nested factories).
 /// The trailing resolver instances are resolved once at factory construction;
 /// nested factories reuse them instead of re-running fallible resolver factory
-/// init, so the worker-spawning path has no error left to panic on.
+/// init, so the worker-spawning path has no error left to panic on. The
+/// per-run `RuntimeServices` carries the run's file fetcher / graph loader /
+/// module graph, which workers share with the main run.
 type WebWorkerFactoryShared = (
     Arc<dyn deno_runtime::deno_web::BlobStoreTrait>,
     InMemoryBroadcastChannel,
     Arc<deno_runtime::FeatureChecker>,
     Arc<dyn FileSystem>,
-    Arc<SharedServices>,
+    Arc<RuntimeServices>,
     MainInspectorSessionChannel,
     BootstrapOptions,
     // V8 heap cap (bytes) inherited from the main worker's LibdenoOptions.
@@ -56,9 +58,9 @@ type WebWorkerFactoryShared = (
 );
 
 /// Builds the `new Worker(...)` factory. Each spawned worker builds its own
-/// Rc-based loader/node services from the shared `Arc<RuntimeServices>`, so
+/// Rc-based loader/node services from the per-run `Arc<RuntimeServices>`, so
 /// nothing non-Send crosses threads. Nested workers get their own factory
-/// built from the same shared state, so spawning is recursive. `max_heap_bytes`
+/// built from the same per-run state, so spawning is recursive. `max_heap_bytes`
 /// (the main worker's `LibdenoOptions` heap cap) is forwarded so `new Worker()`
 /// cannot bypass the heap limit.
 #[allow(clippy::too_many_arguments)]
@@ -67,24 +69,28 @@ pub fn create_web_worker_factory(
     broadcast_channel: InMemoryBroadcastChannel,
     feature_checker: Arc<deno_runtime::FeatureChecker>,
     fs: Arc<dyn FileSystem>,
-    services: Arc<SharedServices>,
+    runtime: Arc<RuntimeServices>,
     main_inspector_session_tx: MainInspectorSessionChannel,
     bootstrap_base: BootstrapOptions,
     max_heap_bytes: Option<usize>,
 ) -> deno_core::anyhow::Result<Arc<deno_runtime::ops::worker_host::CreateWebWorkerCb>> {
     // All fallible resolver init runs up front so the factory construction
     // itself can fail cleanly; the per-spawn callback below stays infallible.
-    let cjs_tracker = services.resolver_factory.cjs_tracker()?.clone();
-    let node_resolver = services.resolver_factory.node_resolver()?.clone();
-    let pkg_json_resolver = services.resolver_factory.pkg_json_resolver().clone();
-    let in_npm_pkg_checker = services.resolver_factory.in_npm_package_checker()?.clone();
+    let cjs_tracker = runtime.shared.resolver_factory.cjs_tracker()?.clone();
+    let node_resolver = runtime.shared.resolver_factory.node_resolver()?.clone();
+    let pkg_json_resolver = runtime.shared.resolver_factory.pkg_json_resolver().clone();
+    let in_npm_pkg_checker = runtime
+        .shared
+        .resolver_factory
+        .in_npm_package_checker()?
+        .clone();
 
     let shared: Arc<WebWorkerFactoryShared> = Arc::new((
         blob_store,
         broadcast_channel,
         feature_checker,
         fs,
-        services,
+        runtime,
         // The inspector session channel is intentionally SHARED across workers:
         // each worker sends its own session-pair proxy through this one sender,
         // which is how a single attached inspector reaches all workers. Do not
@@ -120,7 +126,7 @@ fn build_web_worker_factory(
             broadcast_channel,
             feature_checker,
             fs,
-            services,
+            runtime,
             main_inspector_session_tx,
             bootstrap_base,
             max_heap_bytes,
@@ -130,11 +136,11 @@ fn build_web_worker_factory(
             in_npm_pkg_checker,
         ) = &*shared;
         // Nested factory for the spawned worker's own workers: built from the
-        // same shared state and the same already-initialized resolvers, so
+        // same per-run state and the same already-initialized resolvers, so
         // this call cannot fail (no script-reachable error path, no panic).
         let nested_cb = build_web_worker_factory(shared.clone());
         let module_loader: Rc<dyn deno_core::ModuleLoader> = Rc::new(GraphModuleLoader::new(
-            services.clone(),
+            runtime.clone(),
             worker_permissions.clone(),
         ));
         let node_require_loader: deno_runtime::deno_node::NodeRequireLoaderRc = Rc::new(
@@ -142,7 +148,7 @@ fn build_web_worker_factory(
         );
         let node_resolver = node_resolver.clone();
         let pkg_json_resolver = pkg_json_resolver.clone();
-        let sys = services.sys.clone();
+        let sys = runtime.shared.sys.clone();
         WebWorker::bootstrap_from_options(
             WebWorkerServiceOptions {
                 blob_store: blob_store.clone(),
@@ -159,7 +165,7 @@ fn build_web_worker_factory(
                     pkg_json_resolver,
                     sys,
                 }),
-                npm_process_state_provider: Some(services.npm_process_state_provider.clone()),
+                npm_process_state_provider: Some(runtime.shared.npm_process_state_provider.clone()),
                 // Op-level checks use the worker's own permissions container
                 // (args.permissions), as deno_runtime expects.
                 // Residual: worker-triggered graph fetches are checked against

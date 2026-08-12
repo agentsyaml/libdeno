@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use deno_cache_dir::file_fetcher::CacheSetting;
 use deno_cache_dir::file_fetcher::NullBlobStore;
+use deno_cache_dir::GlobalHttpCacheRc;
+use deno_cache_dir::GlobalOrLocalHttpCache;
 use deno_config::deno_json::NodeModulesDirMode;
 use deno_graph::GraphKind;
 use deno_graph::ModuleGraph;
@@ -188,19 +190,27 @@ fn resolve_lockfile_path(resolver_factory: &Arc<ResolverFactory<RealSys>>) -> Op
         .and_then(|dir| dir.workspace.resolve_lockfile_path().ok().flatten())
 }
 
-/// Thread-safe subset of `RuntimeServices` shared with web workers. The
-/// npm installer factory is excluded: it holds a non-Send `Box<dyn Fn()>`
-/// (the lockfile snapshot resolver), so only the resolver/graph pieces cross
-/// worker boundaries.
+/// The permission-free half of the resolver pipeline, built once and reused
+/// across runs (and web workers): the workspace/resolver factories, the
+/// graph resolver, the npm process state provider, and the disk caches the
+/// per-run file fetcher / graph loader borrow. The npm installer factory is
+/// excluded — it holds a non-Send `Box<dyn Fn()>` (the lockfile snapshot
+/// resolver) — and so is every permission-bound piece (the file fetcher, the
+/// graph loader and the module graph are per-run, see `RuntimeServices`).
 pub struct SharedServices {
     pub sys: RealSys,
     pub resolver_factory: Arc<ResolverFactory<RealSys>>,
-    pub file_fetcher: Arc<RealFileFetcher>,
-    /// The official graph loader: FileFetcher wrapper implementing
-    /// deno_graph::source::Loader.
-    pub graph_loader: Arc<RealGraphLoader>,
-    /// Shared module graph. `prepare_load` builds it, `load` reads from it.
-    pub graph: Arc<tokio::sync::Mutex<ModuleGraph>>,
+    /// One reqwest client shared by the npm installer and every per-run file
+    /// fetcher: reqwest::Client is Arc-backed, so all clones share the
+    /// connection pool and the single builder config from http.rs.
+    pub http_client: Arc<ReqwestHttpClient>,
+    /// Disk-backed module caches; borrowed by the per-run file fetcher /
+    /// graph loader (which are themselves per-run: they bind permissions).
+    pub http_cache: Arc<GlobalOrLocalHttpCache<RealSys>>,
+    pub global_http_cache: GlobalHttpCacheRc<RealSys>,
+    /// In-memory virtual files (deno_resolver MemoryFiles) backing the
+    /// per-run file fetcher.
+    pub memory_files: Arc<MemoryFiles>,
     /// Implements deno_graph's `Resolver` and `NpmResolver` traits for graph
     /// building.
     pub graph_resolver: Arc<GraphResolver>,
@@ -208,40 +218,18 @@ pub struct SharedServices {
     pub npm_process_state_provider: deno_runtime::deno_process::NpmProcessStateProviderRc,
 }
 
-pub struct RuntimeServices {
-    /// The Send+Sync core shared with the main worker and web workers.
-    pub shared: Arc<SharedServices>,
-    /// Canonical project cwd; the identity half of the npm snapshot cache key.
-    cwd: PathBuf,
-}
-
-impl RuntimeServices {
-    /// Saves the fully-resolved npm snapshot into the in-process cache for
-    /// lockfile-free managed projects. Called after a successful [`crate::run`]
-    /// (from run_inner): only then has the graph build populated the
-    /// resolution — the installer's initialize_npm_resolution_if_managed
-    /// returns Ok(None) on a cache miss without resolving anything, so saving
-    /// earlier would store an empty snapshot. Lockfile projects skip this:
-    /// their snapshot comes from the on-disk lockfile (and the resolve
-    /// callback never serves them).
-    pub fn save_npm_snapshot_cache(&self) {
-        let lock_path = resolve_lockfile_path(&self.shared.resolver_factory);
-        if lock_path.as_deref().is_some_and(|p| p.exists()) {
-            return;
-        }
-        use deno_resolver::npm::NpmResolver;
-        let Ok(NpmResolver::Managed(managed)) = self.shared.resolver_factory.npm_resolver() else {
-            return;
-        };
-        let key = crate::npm_cache::compute_key(&self.cwd);
-        crate::npm_cache::insert(key, managed.resolution().serialized_valid_snapshot());
-    }
-
+impl SharedServices {
+    /// Builds the permission-free resolver stack once: workspace/resolver
+    /// factories, the shared http client and disk caches, the npm installer
+    /// factory (including the Wave 1 snapshot-cache resolution callback), the
+    /// initialized npm resolution, the graph resolver and the npm process
+    /// state provider. The permission-bound file fetcher / graph loader /
+    /// module graph are NOT built here — `RuntimeServices::new` rebuilds them
+    /// per run so one run's grants can never leak into another.
     pub async fn new(
         initial_cwd: PathBuf,
         config_start_paths: Vec<PathBuf>,
-        permissions: deno_runtime::deno_permissions::PermissionsContainer,
-    ) -> deno_core::anyhow::Result<Self> {
+    ) -> deno_core::anyhow::Result<Arc<Self>> {
         let sys = RealSys;
 
         let workspace_factory = Arc::new(WorkspaceFactory::new(
@@ -302,11 +290,8 @@ impl RuntimeServices {
 
         // The installer factory is intentionally non-Send: it holds a
         // `Box<dyn Fn()>` (the lockfile snapshot resolver) and is used only
-        // on the main worker thread; workers share the resolver/graph pieces
-        // via `SharedServices` instead.
-        // One reqwest client for both the npm installer and the file fetcher:
-        // reqwest::Client is Arc-backed, so the clones below share the
-        // connection pool and the single builder config from http.rs.
+        // during stack construction here; the graph resolver and per-run
+        // pieces share the resolver/graph state via `SharedServices` instead.
         let http_client = Arc::new(ReqwestHttpClient::new()?);
         #[allow(clippy::arc_with_non_send_sync)]
         let npm_installer_factory = Arc::new(NpmInstallerFactory::new(
@@ -353,41 +338,8 @@ impl RuntimeServices {
 
         let memory_files = Arc::new(MemoryFiles::default());
         let http_cache = Arc::new(workspace_factory.http_cache()?.clone());
-        let file_fetcher = Arc::new(PermissionedFileFetcher::new(
-            NullBlobStore,
-            http_cache,
-            (*http_client).clone(),
-            memory_files,
-            sys.clone(),
-            PermissionedFileFetcherOptions {
-                allow_remote: true,
-                cache_setting: CacheSetting::Use,
-            },
-        ));
-
-        let in_npm_pkg_checker = resolver_factory.in_npm_package_checker()?.clone();
         let global_http_cache = workspace_factory.global_http_cache()?.clone();
-        let graph_loader = Arc::new(deno_resolver::file_fetcher::DenoGraphLoader::new(
-            file_fetcher.clone(),
-            global_http_cache,
-            in_npm_pkg_checker,
-            sys.clone(),
-            deno_resolver::file_fetcher::DenoGraphLoaderOptions {
-                file_header_overrides: Default::default(),
-                include_npm_sources: false,
-                // Live container (clone shares the Arc<Mutex<Permissions>>,
-                // unlike deep_clone which forks a private copy) so
-                // Deno.permissions.revoke is honored by graph fetches, matching
-                // the CLI. Do NOT revert to deep_clone.
-                permissions: Some(permissions.clone()),
-                file_permission_api_name: None,
-                reporter: None,
-            },
-        ));
 
-        let graph = Arc::new(tokio::sync::Mutex::new(ModuleGraph::new(
-            GraphKind::CodeOnly,
-        )));
         // Load the lockfile/package.json npm snapshot so that managed npm
         // resolution is initialized before the graph asks for packages. The
         // resolved snapshot is cached AFTER a successful run (see
@@ -402,17 +354,105 @@ impl RuntimeServices {
         );
         let npm_process_state_provider = create_npm_process_state_provider(&resolver_factory)?;
 
+        Ok(Arc::new(Self {
+            sys,
+            resolver_factory,
+            http_client,
+            http_cache,
+            global_http_cache,
+            memory_files,
+            graph_resolver,
+            npm_process_state_provider,
+        }))
+    }
+}
+
+/// Per-run services: everything permission-bound that must be rebuilt for
+/// every run so one run's grants can never leak into another. Cheap to build
+/// (the expensive factory construction lives in [`SharedServices::new`]).
+pub struct RuntimeServices {
+    /// The permission-free resolver stack (shared with web workers).
+    pub shared: Arc<SharedServices>,
+    /// Canonical project cwd; the identity half of the npm snapshot cache key.
+    cwd: PathBuf,
+    /// Per-run file fetcher (permission-gated reads; the live permissions
+    /// container is passed per fetch call).
+    pub file_fetcher: Arc<RealFileFetcher>,
+    /// Per-run graph loader: FileFetcher wrapper implementing
+    /// deno_graph::source::Loader, bound to this run's permissions.
+    pub graph_loader: Arc<RealGraphLoader>,
+    /// Per-run module graph. `prepare_load` builds it, `load` reads from it.
+    pub graph: Arc<tokio::sync::Mutex<ModuleGraph>>,
+}
+
+impl RuntimeServices {
+    /// Saves the fully-resolved npm snapshot into the in-process cache for
+    /// lockfile-free managed projects. Called after a successful [`crate::run`]
+    /// (from run_inner): only then has the graph build populated the
+    /// resolution — the installer's initialize_npm_resolution_if_managed
+    /// returns Ok(None) on a cache miss without resolving anything, so saving
+    /// earlier would store an empty snapshot. Lockfile projects skip this:
+    /// their snapshot comes from the on-disk lockfile (and the resolve
+    /// callback never serves them).
+    pub fn save_npm_snapshot_cache(&self) {
+        let lock_path = resolve_lockfile_path(&self.shared.resolver_factory);
+        if lock_path.as_deref().is_some_and(|p| p.exists()) {
+            return;
+        }
+        use deno_resolver::npm::NpmResolver;
+        let Ok(NpmResolver::Managed(managed)) = self.shared.resolver_factory.npm_resolver() else {
+            return;
+        };
+        let key = crate::npm_cache::compute_key(&self.cwd);
+        crate::npm_cache::insert(key, managed.resolution().serialized_valid_snapshot());
+    }
+
+    /// Builds the per-run permission-bound components over an existing
+    /// [`SharedServices`] stack: the file fetcher, the graph loader (bound to
+    /// this run's live permissions container) and a fresh module graph.
+    pub fn new(
+        shared: Arc<SharedServices>,
+        cwd: PathBuf,
+        permissions: deno_runtime::deno_permissions::PermissionsContainer,
+    ) -> deno_core::anyhow::Result<Self> {
+        let in_npm_pkg_checker = shared.resolver_factory.in_npm_package_checker()?.clone();
+        let file_fetcher = Arc::new(PermissionedFileFetcher::new(
+            NullBlobStore,
+            shared.http_cache.clone(),
+            (*shared.http_client).clone(),
+            shared.memory_files.clone(),
+            shared.sys.clone(),
+            PermissionedFileFetcherOptions {
+                allow_remote: true,
+                cache_setting: CacheSetting::Use,
+            },
+        ));
+        let graph_loader = Arc::new(deno_resolver::file_fetcher::DenoGraphLoader::new(
+            file_fetcher.clone(),
+            shared.global_http_cache.clone(),
+            in_npm_pkg_checker,
+            shared.sys.clone(),
+            deno_resolver::file_fetcher::DenoGraphLoaderOptions {
+                file_header_overrides: Default::default(),
+                include_npm_sources: false,
+                // Live container (clone shares the Arc<Mutex<Permissions>>,
+                // unlike deep_clone which forks a private copy) so
+                // Deno.permissions.revoke is honored by graph fetches, matching
+                // the CLI. Do NOT revert to deep_clone.
+                permissions: Some(permissions.clone()),
+                file_permission_api_name: None,
+                reporter: None,
+            },
+        ));
+        let graph = Arc::new(tokio::sync::Mutex::new(ModuleGraph::new(
+            GraphKind::CodeOnly,
+        )));
         Ok(Self {
-            shared: Arc::new(SharedServices {
-                sys,
-                resolver_factory,
-                file_fetcher,
-                graph_loader,
-                graph,
-                graph_resolver,
-                npm_process_state_provider,
-            }),
-            cwd: initial_cwd,
+            shared,
+            cwd,
+            file_fetcher,
+            graph_loader,
+            graph,
         })
     }
 }
