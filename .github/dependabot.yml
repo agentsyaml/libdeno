@@ -20,5 +20,12 @@ updates:
       # One PR for all action bumps per week, not one per action.
       actions:
         patterns: ["*"]
+    ignore:
+      # dtolnay/rust-toolchain is pinned by commit SHA on two branches
+      # (stable + 1.95.0, the MSRV job). Dependabot cannot tell the branches
+      # apart and would "upgrade" the 1.95.0 pin onto the stable SHA, silently
+      # turning the MSRV check into a stable-toolchain check. Both pins are
+      # updated manually (see the note above).
+      - dependency-name: "dtolnay/rust-toolchain"
     commit-message:
       prefix: "chore(ci)"
