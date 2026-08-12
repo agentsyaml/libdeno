@@ -240,3 +240,63 @@ fn subprocess_child_uses_options_cwd() {
     assert_eq!(code, 0);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn execution_deadline_terminates_infinite_loop() {
+    // P1: a short execution_deadline must force-terminate a busy JS loop
+    // (V8 terminate_execution from the deadline thread) and report Timeout
+    // instead of hanging the host process.
+    let dir = temp_dir("deadline-loop");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "while (true) {}").unwrap();
+    let options = LibdenoOptions {
+        execution_deadline: Some(std::time::Duration::from_millis(200)),
+        ..Default::default()
+    };
+    let err = run(&entry, &options).unwrap_err();
+    assert!(
+        matches!(err, libdeno::LibdenoError::Timeout(_)),
+        "expected Timeout, got: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn execution_deadline_allows_normal_scripts() {
+    // Control: a script that finishes well inside the deadline completes
+    // normally and returns its exit code.
+    let dir = temp_dir("deadline-ok");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('fast');").unwrap();
+    let options = LibdenoOptions {
+        execution_deadline: Some(std::time::Duration::from_secs(30)),
+        ..Default::default()
+    };
+    let code = run(&entry, &options).unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn execution_deadline_kills_parked_event_loop() {
+    // A script parked on a far-future timer has no JS frames to interrupt, so
+    // the deadline's outer timeout (deadline + grace) must fire instead. This
+    // covers the second, idle-event-loop half of run_with_deadline.
+    let dir = temp_dir("deadline-parked");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "await new Promise((resolve) => setTimeout(resolve, 60_000));",
+    )
+    .unwrap();
+    let options = LibdenoOptions {
+        execution_deadline: Some(std::time::Duration::from_millis(100)),
+        ..Default::default()
+    };
+    let err = run(&entry, &options).unwrap_err();
+    assert!(
+        matches!(err, libdeno::LibdenoError::Timeout(_)),
+        "expected Timeout, got: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

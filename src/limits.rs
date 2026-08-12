@@ -254,3 +254,103 @@ pub(crate) fn node_ipc_init() -> Option<(i64, ChildIpcSerialization)> {
     };
     Some((fd, serialization))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn isolate_create_params_maps_heap_cap() {
+        // P2: max_heap_bytes must reach isolate creation as the V8
+        // old-generation ceiling; None leaves V8 defaults untouched.
+        assert!(isolate_create_params(None).is_none());
+        let params = isolate_create_params(Some(12345)).unwrap();
+        assert_eq!(params.max_old_generation_size_in_bytes(), 12345);
+    }
+
+    #[test]
+    fn code_cache_fifo_evicts_oldest_entry() {
+        // P2-3: inserting past CODE_CACHE_MAX_ENTRIES must evict the oldest
+        // entry (FIFO) instead of growing without bound. 1025 inserts are a
+        // few trivial vec pushes, so the real 1024-entry cap is exercised.
+        let cache = InMemoryCodeCache::default();
+        let spec = |i: u64| {
+            ModuleSpecifier::from_file_path(format!("/libdeno-code-cache-test/{i}.js")).unwrap()
+        };
+        let hash = 7u64;
+        for i in 0..=CODE_CACHE_MAX_ENTRIES as u64 {
+            cache.set_sync(spec(i), CodeCacheType::EsModule, hash, &[0u8, 1, 2]);
+        }
+        assert!(
+            cache
+                .get_sync(&spec(0), CodeCacheType::EsModule, hash)
+                .is_none(),
+            "oldest entry must be evicted"
+        );
+        assert!(
+            cache
+                .get_sync(
+                    &spec(CODE_CACHE_MAX_ENTRIES as u64),
+                    CodeCacheType::EsModule,
+                    hash
+                )
+                .is_some(),
+            "newest entry must be present"
+        );
+        // A different source hash is a different key: no false hits.
+        assert!(cache
+            .get_sync(&spec(5), CodeCacheType::EsModule, 999)
+            .is_none());
+    }
+
+    #[test]
+    fn code_cache_replace_and_type_keying() {
+        let cache = InMemoryCodeCache::default();
+        let spec = ModuleSpecifier::from_file_path("/libdeno-code-cache-test/update.js").unwrap();
+        // Re-setting the same key replaces the value without growing the vec.
+        cache.set_sync(spec.clone(), CodeCacheType::Script, 1, b"old");
+        cache.set_sync(spec.clone(), CodeCacheType::Script, 1, b"new");
+        assert_eq!(
+            cache.get_sync(&spec, CodeCacheType::Script, 1).unwrap(),
+            b"new"
+        );
+        // CodeCacheType is part of the key: EsModule and Script are distinct.
+        cache.set_sync(spec.clone(), CodeCacheType::EsModule, 1, b"esm");
+        assert_eq!(
+            cache.get_sync(&spec, CodeCacheType::Script, 1).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            cache.get_sync(&spec, CodeCacheType::EsModule, 1).unwrap(),
+            b"esm"
+        );
+    }
+
+    #[test]
+    fn node_ipc_requires_paired_spawn_marker() {
+        // P2 security: NODE_CHANNEL_FD alone must NOT enable IPC — only the
+        // LIBDENO_SPAWNED_IPC marker captured at process entry does. Env vars
+        // are process-global, but no other unit test in this binary touches
+        // these names or the marker, so the sequencing below is race-free.
+        std::env::set_var("NODE_CHANNEL_FD", "10");
+        // Marker not yet captured: a stray FD from some other spawner is ignored.
+        assert!(node_ipc_init().is_none());
+        // The spawned side captures the marker; the same FD is now honored.
+        std::env::set_var("LIBDENO_SPAWNED_IPC", "1");
+        capture_spawned_ipc_marker();
+        assert_eq!(node_ipc_init().map(|(fd, _)| fd), Some(10));
+        assert!(matches!(
+            node_ipc_init(),
+            Some((10, ChildIpcSerialization::Json))
+        ));
+        // Advanced serialization mode is propagated.
+        std::env::set_var("NODE_CHANNEL_SERIALIZATION_MODE", "advanced");
+        assert!(matches!(
+            node_ipc_init(),
+            Some((10, ChildIpcSerialization::Advanced))
+        ));
+        // A non-numeric FD is rejected, never adopted.
+        std::env::set_var("NODE_CHANNEL_FD", "not-a-fd");
+        assert!(node_ipc_init().is_none());
+    }
+}

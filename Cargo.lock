@@ -4820,6 +4820,7 @@ dependencies = [
  "deno_resolver",
  "deno_runtime",
  "deno_semver",
+ "futures-util",
  "getrandom 0.4.3",
  "http",
  "node_resolver",

@@ -94,3 +94,8 @@ strip = true
 # Standalone workspace root so downstream projects can consume this crate via
 # path/git/patch dependencies without cargo workspace conflicts.
 [workspace]
+
+[dev-dependencies]
+# Already in the tree via reqwest; needed to build a stream-backed response
+# body (unknown content length) in http tests.
+futures-util = "0.3"

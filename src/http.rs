@@ -426,6 +426,47 @@ mod tests {
     }
 
     #[test]
+    fn body_over_module_cap_is_an_error() {
+        // P2: a response whose declared length is unknown (stream-backed body,
+        // as chunked responses arrive on the wire) is bounded by the module
+        // cap; an oversized stream trips the limit without transferring
+        // 256MiB+ over a socket. Note: reqwest::Response::from infers
+        // content_length from the concrete body size, so a Vec body always
+        // reports its real length and lands on the tarball branch — a stream
+        // (unknown length) is required to exercise the module-cap branch.
+        use futures_util::stream;
+        use reqwest::Body;
+        let oversized = http::Response::builder()
+            .status(200)
+            .body(Body::wrap_stream(stream::iter([Ok::<_, std::io::Error>(
+                bytes::Bytes::from(vec![0u8; (256 << 20) + 1]),
+            )])))
+            .unwrap();
+        let mut response = reqwest::Response::from(oversized);
+        runtime().block_on(async {
+            let err = read_body_limited(&mut response).await.unwrap_err();
+            assert!(err.contains("limit"), "unexpected error: {err}");
+        });
+    }
+
+    #[test]
+    fn declared_large_content_length_gets_tarball_cap() {
+        // P2: Content-Length above the module cap selects the 1GiB tarball
+        // bound, so a 257MiB body that would trip the module cap is accepted.
+        let size = (256 << 20) + 1;
+        let declared = http::Response::builder()
+            .status(200)
+            .header("Content-Length", size as u64)
+            .body(reqwest::Body::from(vec![0u8; size]))
+            .unwrap();
+        let mut response = reqwest::Response::from(declared);
+        runtime().block_on(async {
+            let body = read_body_limited(&mut response).await.unwrap();
+            assert_eq!(body.len(), size);
+        });
+    }
+
+    #[test]
     fn npm_download_follows_redirect() {
         // A registry 302 to a relative Location must be followed to the target
         // and yield the final body (the client itself uses Policy::none).
