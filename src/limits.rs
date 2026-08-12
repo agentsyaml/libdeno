@@ -274,8 +274,12 @@ mod tests {
         // entry (FIFO) instead of growing without bound. 1025 inserts are a
         // few trivial vec pushes, so the real 1024-entry cap is exercised.
         let cache = InMemoryCodeCache::default();
+        // Pure URL string, not from_file_path: a drive-letter-less absolute
+        // path is not a file URL on Windows (from_file_path returns Err there),
+        // while Url::parse of "file:///..." succeeds identically on every
+        // platform. The specifier is only ever used as a cache key here.
         let spec = |i: u64| {
-            ModuleSpecifier::from_file_path(format!("/libdeno-code-cache-test/{i}.js")).unwrap()
+            ModuleSpecifier::parse(&format!("file:///libdeno-code-cache-test/{i}.js")).unwrap()
         };
         let hash = 7u64;
         for i in 0..=CODE_CACHE_MAX_ENTRIES as u64 {
@@ -306,7 +310,9 @@ mod tests {
     #[test]
     fn code_cache_replace_and_type_keying() {
         let cache = InMemoryCodeCache::default();
-        let spec = ModuleSpecifier::from_file_path("/libdeno-code-cache-test/update.js").unwrap();
+        // URL string (not from_file_path): platform-independent, see the FIFO
+        // test above.
+        let spec = ModuleSpecifier::parse("file:///libdeno-code-cache-test/update.js").unwrap();
         // Re-setting the same key replaces the value without growing the vec.
         cache.set_sync(spec.clone(), CodeCacheType::Script, 1, b"old");
         cache.set_sync(spec.clone(), CodeCacheType::Script, 1, b"new");
