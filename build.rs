@@ -59,11 +59,26 @@ fn main() {
 #[cfg(feature = "snapshot")]
 fn create_cli_snapshot(snapshot_path: &Path, residual_path: &Path, out_dir: &Path) {
     // The TypeScript version bundled in deno_runtime 0.265.0's snapshot.
-    // No crate in the dep tree exposes it (deno_ast has no ts_version()).
+    // No crate in the dep tree exposes the bundled TypeScript compiler
+    // version (deno_ast::VERSION is the deno_ast crate version, not the TS
+    // compiler's), so it cannot be machine-verified against a dependency.
     // Source of truth: the deno repo's cli/snapshot/shared.rs TS_VERSION at
     // the tag for deno_runtime 0.265.0 (v2.9.5) — update in lockstep with the
-    // deno_runtime bump.
+    // deno_runtime bump (see the format assertion below).
     const TS_VERSION: &str = "6.0.3";
+    // Sanity check: TS_VERSION must be a bare x.y.z version. This only
+    // catches malformed values, not a wrong-but-well-formed one; upgrading
+    // deno_runtime still requires syncing TS_VERSION by hand to the new
+    // tag's cli/snapshot/shared.rs.
+    let ts_version_parts: Vec<&str> = TS_VERSION.split('.').collect();
+    assert!(
+        ts_version_parts.len() == 3
+            && ts_version_parts
+                .iter()
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+        "TS_VERSION {TS_VERSION:?} must be a bare x.y.z version; \
+         sync it by hand with the deno tag when bumping deno_runtime"
+    );
 
     let snapshot_options = SnapshotOptions {
         ts_version: TS_VERSION.to_string(),

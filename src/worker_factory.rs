@@ -5,6 +5,9 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
+use deno_resolver::cjs::CjsTrackerRc;
+use deno_resolver::npm::DenoInNpmPackageChecker;
+use deno_resolver::npm::NpmResolver;
 use deno_runtime::deno_fs::FileSystem;
 use deno_runtime::deno_inspector_server::MainInspectorSessionChannel;
 use deno_runtime::deno_node::NodeExtInitServices;
@@ -15,6 +18,10 @@ use deno_runtime::web_worker::WebWorkerOptions;
 use deno_runtime::web_worker::WebWorkerServiceOptions;
 use deno_runtime::BootstrapOptions;
 use deno_runtime::WorkerExecutionMode;
+use node_resolver::DenoIsBuiltInNodeModuleChecker;
+use node_resolver::NodeResolverRc;
+use node_resolver::PackageJsonResolverRc;
+use sys_traits::impls::RealSys;
 
 use crate::module_loader::GraphModuleLoader;
 use crate::node_loader::SimpleNodeRequireLoader;
@@ -24,6 +31,9 @@ use crate::RESIDUAL_LAZY_JS;
 use crate::STARTUP_SNAPSHOT;
 
 /// Immutable state shared with every spawned worker (and nested factories).
+/// The trailing resolver instances are resolved once at factory construction;
+/// nested factories reuse them instead of re-running fallible resolver factory
+/// init, so the worker-spawning path has no error left to panic on.
 type WebWorkerFactoryShared = (
     Arc<dyn deno_runtime::deno_web::BlobStoreTrait>,
     InMemoryBroadcastChannel,
@@ -32,12 +42,25 @@ type WebWorkerFactoryShared = (
     Arc<SharedServices>,
     MainInspectorSessionChannel,
     BootstrapOptions,
+    // V8 heap cap (bytes) inherited from the main worker's LibdenoOptions.
+    Option<usize>,
+    CjsTrackerRc<DenoInNpmPackageChecker, RealSys>,
+    NodeResolverRc<
+        DenoInNpmPackageChecker,
+        DenoIsBuiltInNodeModuleChecker,
+        NpmResolver<RealSys>,
+        RealSys,
+    >,
+    PackageJsonResolverRc<RealSys>,
+    DenoInNpmPackageChecker,
 );
 
 /// Builds the `new Worker(...)` factory. Each spawned worker builds its own
 /// Rc-based loader/node services from the shared `Arc<RuntimeServices>`, so
 /// nothing non-Send crosses threads. Nested workers get their own factory
-/// built from the same shared state, so spawning is recursive.
+/// built from the same shared state, so spawning is recursive. `max_heap_bytes`
+/// (the main worker's `LibdenoOptions` heap cap) is forwarded so `new Worker()`
+/// cannot bypass the heap limit.
 #[allow(clippy::too_many_arguments)]
 pub fn create_web_worker_factory(
     blob_store: Arc<dyn deno_runtime::deno_web::BlobStoreTrait>,
@@ -47,6 +70,7 @@ pub fn create_web_worker_factory(
     services: Arc<SharedServices>,
     main_inspector_session_tx: MainInspectorSessionChannel,
     bootstrap_base: BootstrapOptions,
+    max_heap_bytes: Option<usize>,
 ) -> deno_core::anyhow::Result<Arc<deno_runtime::ops::worker_host::CreateWebWorkerCb>> {
     // All fallible resolver init runs up front so the factory construction
     // itself can fail cleanly; the per-spawn callback below stays infallible.
@@ -67,9 +91,25 @@ pub fn create_web_worker_factory(
         // give each worker a fresh channel (worker inspection would silently die).
         main_inspector_session_tx,
         bootstrap_base,
+        max_heap_bytes,
+        cjs_tracker,
+        node_resolver,
+        pkg_json_resolver,
+        in_npm_pkg_checker,
     ));
 
-    Ok(Arc::new(move |args: CreateWebWorkerArgs| {
+    Ok(build_web_worker_factory(shared))
+}
+
+/// Infallible half of the factory. All fallible resolver init already ran
+/// (and is memoized on the shared ResolverFactory) in `create_web_worker_factory`,
+/// so building — and recursively rebuilding — nested factories from the same
+/// shared state and the same resolver instances can never fail. The script-
+/// reachable `new Worker(...)` path therefore has no error to panic on.
+fn build_web_worker_factory(
+    shared: Arc<WebWorkerFactoryShared>,
+) -> Arc<deno_runtime::ops::worker_host::CreateWebWorkerCb> {
+    Arc::new(move |args: CreateWebWorkerArgs| {
         // Worker's own permissions container: each worker carries the
         // permissions captured at `new Worker(...)` time (args.permissions),
         // NOT the parent's. Grabbed first so the move of args.permissions
@@ -83,20 +123,16 @@ pub fn create_web_worker_factory(
             services,
             main_inspector_session_tx,
             bootstrap_base,
+            max_heap_bytes,
+            cjs_tracker,
+            node_resolver,
+            pkg_json_resolver,
+            in_npm_pkg_checker,
         ) = &*shared;
-        let nested_cb = create_web_worker_factory(
-            blob_store.clone(),
-            broadcast_channel.clone(),
-            feature_checker.clone(),
-            fs.clone(),
-            services.clone(),
-            main_inspector_session_tx.clone(),
-            bootstrap_base.clone(),
-        )
-        // All fallible init already ran at factory construction above; the
-        // recursive call re-runs the same get_or_try_init-cached resolvers, so
-        // this cannot fail. Kept as expect() because the callback is infallible.
-        .expect("resolver factory already initialized in create_web_worker_factory");
+        // Nested factory for the spawned worker's own workers: built from the
+        // same shared state and the same already-initialized resolvers, so
+        // this call cannot fail (no script-reachable error path, no panic).
+        let nested_cb = build_web_worker_factory(shared.clone());
         let module_loader: Rc<dyn deno_core::ModuleLoader> = Rc::new(GraphModuleLoader::new(
             services.clone(),
             worker_permissions.clone(),
@@ -150,7 +186,7 @@ pub fn create_web_worker_factory(
                 residual_lazy_js_sources: RESIDUAL_LAZY_JS,
                 residual_lazy_esm_sources: RESIDUAL_LAZY_ESM,
                 unsafely_ignore_certificate_errors: None,
-                create_params: None,
+                create_params: crate::limits::isolate_create_params(*max_heap_bytes),
                 seed: None,
                 create_web_worker_cb: nested_cb,
                 format_js_error_fn: None,
@@ -169,5 +205,5 @@ pub fn create_web_worker_factory(
                 wait_for_page_wait_for_debugger: false,
             },
         )
-    }))
+    })
 }

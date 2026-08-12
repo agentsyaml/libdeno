@@ -18,22 +18,70 @@ use http::HeaderMap;
 use std::time::Duration;
 use url::Url;
 
-#[derive(Debug)]
+use crate::LibdenoError;
+
+/// Cap on the decompressed response body we buffer for module fetches,
+/// guarding against decompression bombs. reqwest auto-decompresses
+/// gzip/brotli (enabled in Cargo.toml) at the transport layer before the body
+/// reaches us, so this counts true memory usage, not the wire size.
+const MAX_RESPONSE_BODY_BYTES: usize = 256 << 20;
+/// Cap for npm tarball downloads: some legal packages exceed 256MiB, and
+/// registries serve tarballs with an explicit Content-Length, so a response
+/// claiming more than the module cap gets this larger bound. Still bounded,
+/// so a broken/oversized response fails fast instead of OOMing the host.
+const MAX_TARBALL_BODY_BYTES: usize = 1 << 30;
+
+#[derive(Debug, Clone)]
 pub struct ReqwestHttpClient {
     client: reqwest::Client,
 }
 
-impl Default for ReqwestHttpClient {
-    fn default() -> Self {
+impl ReqwestHttpClient {
+    /// Sole constructor: every request path (file fetcher + npm installer)
+    /// shares this builder config. reqwest::Client is Arc-backed, so `Clone`
+    /// shares the same connection pool and configuration.
+    ///
+    /// reqwest 0.12 has no client-level response body limit (`response_body_limit`
+    /// does not exist here), so the caps are enforced per read in
+    /// [`read_body_limited`]. Because gzip/brotli auto-decompression runs at the
+    /// transport layer, the bytes that helper sees are already decompressed and
+    /// the cap doubles as a decompression-bomb guard.
+    pub fn new() -> Result<Self, LibdenoError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(300))
             .user_agent(concat!("libdeno/", env!("CARGO_PKG_VERSION")))
             .build()
-            .expect("failed to build http client");
-        Self { client }
+            .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
+        Ok(Self { client })
     }
+}
+
+/// Reads the full (already auto-decompressed) response body into a Vec,
+/// failing once the accumulated size exceeds the per-request cap instead of
+/// buffering an unbounded response. The cap is chosen from the declared
+/// Content-Length: a response claiming more than the module cap is a
+/// tarball-sized download (npm packages) and gets the larger tarball bound;
+/// everything else — and every chunked response without Content-Length —
+/// stays on the module cap. Over-limit is an error, never a retry.
+async fn read_body_limited(response: &mut reqwest::Response) -> Result<Vec<u8>, String> {
+    let limit = match response.content_length() {
+        Some(len) if len as usize > MAX_RESPONSE_BODY_BYTES => MAX_TARBALL_BODY_BYTES,
+        _ => MAX_RESPONSE_BODY_BYTES,
+    };
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("failed to read response body: {e}"))?
+    {
+        if body.len() + chunk.len() > limit {
+            return Err(format!("response body exceeded the {limit}-byte limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[async_trait::async_trait(?Send)]
@@ -78,11 +126,11 @@ impl HttpClient for ReqwestHttpClient {
 
                     if status.is_success() {
                         let headers = response.headers().clone();
-                        let body = response
-                            .bytes()
+                        let mut response = response;
+                        let body = read_body_limited(&mut response)
                             .await
                             .map_err(|e| SendError::Failed(e.into()))?;
-                        return Ok(SendResponse::Success(headers, body.to_vec()));
+                        return Ok(SendResponse::Success(headers, body));
                     }
 
                     if status == http::StatusCode::NOT_FOUND {
@@ -172,13 +220,10 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
                             .get(ETAG)
                             .and_then(|v| v.to_str().ok())
                             .map(String::from);
-                        let bytes = response
-                            .bytes()
-                            .await
-                            .map_err(|e| {
-                                err(None, format!("failed to read npm registry response: {e}"))
-                            })?
-                            .to_vec();
+                        let mut response = response;
+                        let bytes = read_body_limited(&mut response).await.map_err(|e| {
+                            err(None, format!("failed to read npm registry response: {e}"))
+                        })?;
                         return Ok(NpmCacheHttpClientResponse::Bytes(
                             NpmCacheHttpClientBytesResponse { bytes, etag },
                         ));
@@ -294,7 +339,7 @@ mod tests {
         // Regression: is_redirection() includes 304, so the 304 branch must be
         // checked first. A stale-cache re-validation must yield NotModified.
         let url = serve("HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n");
-        let client = ReqwestHttpClient::default();
+        let client = ReqwestHttpClient::new().unwrap();
         runtime().block_on(async {
             let resp = client
                 .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
@@ -309,7 +354,7 @@ mod tests {
         let url = serve(
       "HTTP/1.1 301 Moved Permanently\r\nLocation: https://example.com/new\r\nContent-Length: 0\r\n\r\n",
     );
-        let client = ReqwestHttpClient::default();
+        let client = ReqwestHttpClient::new().unwrap();
         runtime().block_on(async {
             let resp = client
                 .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
@@ -328,7 +373,7 @@ mod tests {
     fn success_returns_body() {
         let url =
             serve("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello");
-        let client = ReqwestHttpClient::default();
+        let client = ReqwestHttpClient::new().unwrap();
         runtime().block_on(async {
             let resp = client
                 .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
@@ -347,7 +392,7 @@ mod tests {
     #[test]
     fn not_found_is_an_error() {
         let url = serve("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-        let client = ReqwestHttpClient::default();
+        let client = ReqwestHttpClient::new().unwrap();
         runtime().block_on(async {
             let err = client
                 .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
@@ -365,7 +410,7 @@ mod tests {
         let five_hundred =
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let url = serve_many(vec![five_hundred, five_hundred, five_hundred]);
-        let client = ReqwestHttpClient::default();
+        let client = ReqwestHttpClient::new().unwrap();
         runtime().block_on(async {
             let err = client
                 .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
@@ -388,7 +433,7 @@ mod tests {
             "HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: application/octet-stream\r\n\r\nhello",
         );
-        let client = ReqwestHttpClient::default();
+        let client = ReqwestHttpClient::new().unwrap();
         runtime().block_on(async {
             let resp = client
                 .download_with_retries_on_any_tokio_runtime(

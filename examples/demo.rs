@@ -56,6 +56,7 @@ fn main() {
         permissions,
         args: script_args,
         cwd: None,
+        ..Default::default()
     };
     match run(&entry, &options) {
         Ok(code) => std::process::exit(code),
@@ -74,5 +75,6 @@ fn print_error(e: &LibdenoError) {
         LibdenoError::Core(e) => eprintln!("runtime error: {e}"),
         LibdenoError::Js(e) => eprintln!("script error: {e}"),
         LibdenoError::Io(e) => eprintln!("io error: {e}"),
+        LibdenoError::Timeout(d) => eprintln!("execution deadline exceeded: {d:?}"),
     }
 }

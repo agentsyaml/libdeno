@@ -4820,7 +4820,7 @@ dependencies = [
  "deno_resolver",
  "deno_runtime",
  "deno_semver",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "http",
  "node_resolver",
  "reqwest",

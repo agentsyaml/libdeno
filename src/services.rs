@@ -177,6 +177,17 @@ pub type RealGraphLoader =
     deno_resolver::file_fetcher::DenoGraphLoader<NullBlobStore, RealSys, ReqwestHttpClient>;
 pub type RealNpmInstallerFactory = NpmInstallerFactory<ReqwestHttpClient, LogReporter, RealSys>;
 
+/// Resolves the project lockfile path exactly as deno_npm_installer's
+/// maybe_lockfile does (deno_resolver::lockfile): deno.json's `lock` setting,
+/// else `<package.json dir>/deno.lock`, else None.
+fn resolve_lockfile_path(resolver_factory: &Arc<ResolverFactory<RealSys>>) -> Option<PathBuf> {
+    resolver_factory
+        .workspace_factory()
+        .workspace_directory()
+        .ok()
+        .and_then(|dir| dir.workspace.resolve_lockfile_path().ok().flatten())
+}
+
 /// Thread-safe subset of `RuntimeServices` shared with web workers. The
 /// npm installer factory is excluded: it holds a non-Send `Box<dyn Fn()>`
 /// (the lockfile snapshot resolver), so only the resolver/graph pieces cross
@@ -200,9 +211,32 @@ pub struct SharedServices {
 pub struct RuntimeServices {
     /// The Send+Sync core shared with the main worker and web workers.
     pub shared: Arc<SharedServices>,
+    /// Canonical project cwd; the identity half of the npm snapshot cache key.
+    cwd: PathBuf,
 }
 
 impl RuntimeServices {
+    /// Saves the fully-resolved npm snapshot into the in-process cache for
+    /// lockfile-free managed projects. Called after a successful [`crate::run`]
+    /// (from run_inner): only then has the graph build populated the
+    /// resolution — the installer's initialize_npm_resolution_if_managed
+    /// returns Ok(None) on a cache miss without resolving anything, so saving
+    /// earlier would store an empty snapshot. Lockfile projects skip this:
+    /// their snapshot comes from the on-disk lockfile (and the resolve
+    /// callback never serves them).
+    pub fn save_npm_snapshot_cache(&self) {
+        let lock_path = resolve_lockfile_path(&self.shared.resolver_factory);
+        if lock_path.as_deref().is_some_and(|p| p.exists()) {
+            return;
+        }
+        use deno_resolver::npm::NpmResolver;
+        let Ok(NpmResolver::Managed(managed)) = self.shared.resolver_factory.npm_resolver() else {
+            return;
+        };
+        let key = crate::npm_cache::compute_key(&self.cwd);
+        crate::npm_cache::insert(key, managed.resolution().serialized_valid_snapshot());
+    }
+
     pub async fn new(
         initial_cwd: PathBuf,
         config_start_paths: Vec<PathBuf>,
@@ -212,7 +246,7 @@ impl RuntimeServices {
 
         let workspace_factory = Arc::new(WorkspaceFactory::new(
             sys.clone(),
-            initial_cwd,
+            initial_cwd.clone(),
             WorkspaceFactoryOptions {
                 // Discover deno.json (import maps, jsx, etc.) walking up from the
                 // main module's directory, like the CLI does.
@@ -259,14 +293,25 @@ impl RuntimeServices {
             },
         ));
 
+        // Lockfile path exactly as deno_npm_installer's maybe_lockfile
+        // resolves it (deno_resolver::lockfile): deno.json's `lock` setting,
+        // else `<package.json dir>/deno.lock`, else None. Projects with a
+        // lockfile keep the original ResolveFromLockfile path; the in-process
+        // snapshot cache only serves lockfile-free projects.
+        let deno_lock_path = resolve_lockfile_path(&resolver_factory);
+
         // The installer factory is intentionally non-Send: it holds a
         // `Box<dyn Fn()>` (the lockfile snapshot resolver) and is used only
         // on the main worker thread; workers share the resolver/graph pieces
         // via `SharedServices` instead.
+        // One reqwest client for both the npm installer and the file fetcher:
+        // reqwest::Client is Arc-backed, so the clones below share the
+        // connection pool and the single builder config from http.rs.
+        let http_client = Arc::new(ReqwestHttpClient::new()?);
         #[allow(clippy::arc_with_non_send_sync)]
         let npm_installer_factory = Arc::new(NpmInstallerFactory::new(
             resolver_factory.clone(),
-            Arc::new(ReqwestHttpClient::default()),
+            http_client.clone(),
             Arc::new(ShellLifecycleScriptsExecutor),
             LogReporter,
             None,
@@ -288,7 +333,21 @@ impl RuntimeServices {
                 },
                 production: false,
                 skip_types: true,
-                resolve_npm_resolution_snapshot: Box::new(|| Ok(None)),
+                // Lockfile-free managed projects reuse the last resolved
+                // snapshot from the process-level cache; a lockfile project
+                // returns None so deno_npm_installer goes through its
+                // maybe_lockfile -> ResolveFromLockfile path unchanged.
+                resolve_npm_resolution_snapshot: Box::new({
+                    let lock_path = deno_lock_path.clone();
+                    let cwd = initial_cwd.clone();
+                    move || {
+                        if lock_path.as_deref().is_some_and(|p| p.exists()) {
+                            return Ok(None);
+                        }
+                        let key = crate::npm_cache::compute_key(&cwd);
+                        Ok(crate::npm_cache::get(&key))
+                    }
+                }),
             },
         ));
 
@@ -297,7 +356,7 @@ impl RuntimeServices {
         let file_fetcher = Arc::new(PermissionedFileFetcher::new(
             NullBlobStore,
             http_cache,
-            ReqwestHttpClient::default(),
+            (*http_client).clone(),
             memory_files,
             sys.clone(),
             PermissionedFileFetcherOptions {
@@ -330,7 +389,11 @@ impl RuntimeServices {
             GraphKind::CodeOnly,
         )));
         // Load the lockfile/package.json npm snapshot so that managed npm
-        // resolution is initialized before the graph asks for packages.
+        // resolution is initialized before the graph asks for packages. The
+        // resolved snapshot is cached AFTER a successful run (see
+        // RuntimeServices::save_npm_snapshot_cache): on a cache miss the
+        // initializer returns Ok(None) without resolving anything, so caching
+        // here would store an empty resolution forever.
         npm_installer_factory
             .initialize_npm_resolution_if_managed()
             .await?;
@@ -349,6 +412,7 @@ impl RuntimeServices {
                 graph_resolver,
                 npm_process_state_provider,
             }),
+            cwd: initial_cwd,
         })
     }
 }

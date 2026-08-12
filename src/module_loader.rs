@@ -246,6 +246,12 @@ impl ModuleLoader for GraphModuleLoader {
                     ..
                 } => {
                     let asset_specifier = asset_specifier.into_owned();
+                    // The graph guard was only needed for the module lookup
+                    // above (the loader's result borrows the graph via its
+                    // specifier Cow, now detached). Drop it before the asset
+                    // fetch so a slow remote asset download does not hold the
+                    // graph lock and block every other concurrent load/build.
+                    drop(graph);
                     // SECURITY: never use fetch_bypass_permissions here. An
                     // external asset is reachable from arbitrary JS imports and
                     // this fetch must honor the same live permissions container
@@ -280,6 +286,16 @@ async fn build_graph(
 ) -> Result<(), deno_core::anyhow::Error> {
     let jsr_version_resolver = services.resolver_factory.jsr_version_resolver()?;
     let graph_resolver = services.graph_resolver.clone();
+    // ponytail: the graph lock covers the whole build below, including the
+    // slow work (remote module fetches with 30s connect / 300s total timeouts,
+    // npm resolve_pkg_reqs installs). It cannot be narrowed: ModuleGraph::build
+    // takes &mut self and runs the loader/npm pipeline internally, interleaved
+    // with graph mutation, so there is no public "fetch first, insert later"
+    // split (and no graph merge API to build into a private graph). A RwLock
+    // would not help either — build still needs the write side — and the
+    // graph field type is fixed in services.rs. A slow module therefore still
+    // serializes concurrent builds of *other* roots; revisit only if deno_graph
+    // gains a lock-free incremental build API.
     let mut graph = services.graph.lock().await;
 
     // Already loaded successfully by a previous prepare_load (e.g. an earlier

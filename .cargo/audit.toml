@@ -1,0 +1,28 @@
+# cargo-audit ignore list (CI runs `cargo audit --deny warnings`).
+#
+# Every entry is upstream-tracked: the advisory lives in a crate pulled in by
+# the deno stack and has no fixed version libdeno can adopt on its own. See
+# SECURITY.md ("Known upstream-tracked advisories") for details and links.
+# Remove an entry (and re-enable the check) once an upstream fix lands and
+# flows into the tree via `cargo update`.
+[advisories]
+ignore = [
+  # hickory-proto 0.25.x (deno stack pin): NSEC3 DoS, patched = [].
+  # deno main has not moved off hickory-proto 0.25 yet.
+  "RUSTSEC-2026-0118",
+  # hickory-proto 0.25.x (deno stack pin): DoS, patched >= 0.26.1.
+  "RUSTSEC-2026-0119",
+  # rsa 0.9.x (CVE-2023-49092, Marvin timing attack): patched = [] — the
+  # RustCrypto/RSA project has shipped no stable fixed release.
+  "RUSTSEC-2023-0071",
+  # Informational: bincode 1.x unmaintained (deno stack dependency).
+  "RUSTSEC-2025-0141",
+  # Informational: rustls-pemfile unmaintained (deno stack dependency).
+  "RUSTSEC-2025-0134",
+  # Informational: smartstring unmaintained (deno stack dependency).
+  "RUSTSEC-2026-0249",
+  # Informational: paste unmaintained (deno stack dependency).
+  "RUSTSEC-2024-0436",
+  # Informational (unsound, no fix): rand 0.8 in the deno stack.
+  "RUSTSEC-2026-0097",
+]

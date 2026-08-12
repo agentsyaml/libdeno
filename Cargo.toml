@@ -42,7 +42,7 @@ deno_error = "=0.7.1"
 sys_traits = "0.1.28"
 deno_semver = "0.10.0"
 # Child-mode auth token entropy (already in the tree via the deno stack).
-getrandom = "0.2"
+getrandom = "0.4"
 async-trait = "0.1"
 anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "gzip", "brotli", "stream", "http2"] }
@@ -84,6 +84,12 @@ no-default-features = true
 
 [profile.release]
 debug = false
+# Release profile for this workspace's own builds (the demo example and CI
+# artifacts). Downstream consumers build libdeno as a dependency, where the
+# root workspace's profile governs; v8's static library dominates the binary
+# there too, so hosts that care about size should enable LTO/strip themselves.
+lto = "thin"
+strip = true
 
 # Standalone workspace root so downstream projects can consume this crate via
 # path/git/patch dependencies without cargo workspace conflicts.

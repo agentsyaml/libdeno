@@ -76,7 +76,9 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `LibdenoOptions.permissions: Vec<String>` | `--allow-*` capability strings. An empty list allows everything; passing any entry restricts the runtime to the declared capabilities. |
 | `LibdenoOptions.args: Vec<String>` | Arguments exposed to the script via `process.argv` (after argv[0]). |
 | `LibdenoOptions.cwd: Option<PathBuf>` | Working directory that relative paths (entry, permissions, `node_modules` discovery) resolve against. Defaults to the process current directory. |
-| `LibdenoError` | Enum: `Entry` (entry resolution failed), `Permission` (invalid permission flag), `Runtime`, `Core`, `Js` (script exception), `Io`. |
+| `LibdenoOptions.max_heap_bytes: Option<usize>` | Hard cap on the V8 old-generation heap in bytes; V8 aborts with OOM when hit. Applies to the main worker **and** web workers spawned via `new Worker(...)`. |
+| `LibdenoOptions.execution_deadline: Option<Duration>` | Hard wall-clock limit; on expiry the isolate is force-terminated and the run fails with `LibdenoError::Timeout`. Does **not** interrupt blocking system calls (NFS-hung file reads, synchronous `Deno.Command` waits) — those unwind only when the syscall itself returns, so the run can exceed the deadline by the syscall's duration. |
+| `LibdenoError` | Enum: `Entry` (entry resolution failed), `Permission` (invalid permission flag), `Runtime`, `Core`, `Js` (script exception), `Io`, `Timeout` (deadline exceeded, isolate terminated). |
 
 Supported permission flags: `--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`, plus `-A` / `--allow-all`.
 

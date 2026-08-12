@@ -5,6 +5,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::limits::LIBDENO_SPAWNED_IPC;
 use crate::run;
 use crate::LibdenoError;
 use crate::LibdenoOptions;
@@ -40,10 +41,10 @@ struct ChildRunRequest {
 /// The token authenticates the same-user subprocess handshake, not a security
 /// boundary (see [`run_in_subprocess`]); it still needs real entropy so a
 /// stdin-only third party cannot guess it.
-fn child_token() -> String {
+fn child_token() -> Result<String, LibdenoError> {
     let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).expect("failed to read system randomness for child token");
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    getrandom::fill(&mut buf).map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Runs `entry` in a child process and returns its exit code.
@@ -79,7 +80,7 @@ pub fn run_in_subprocess(
     // would deadlock hosts that run long-lived children (plugins/daemons):
     // the first child would hold the process-global lock forever and block
     // every later run_in_subprocess or run() call in the same process.
-    let token = child_token();
+    let token = child_token()?;
     let (payload, mut child) = {
         let _lock = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cwd = options.cwd.clone().unwrap_or(std::env::current_dir()?);
@@ -97,6 +98,7 @@ pub fn run_in_subprocess(
             .unwrap_or(std::env::current_exe()?);
         let child = std::process::Command::new(exe)
             .env(LIBDENO_CHILD_MODE, "1")
+            .env(LIBDENO_SPAWNED_IPC, "1")
             .env(LIBDENO_CHILD_TOKEN, &token)
             .current_dir(&cwd)
             .stdin(std::process::Stdio::piped())
@@ -171,6 +173,7 @@ pub fn maybe_handle_child_mode() -> bool {
             permissions: request.permissions,
             args: request.args,
             cwd: Some(request.cwd),
+            ..Default::default()
         };
         run(&request.entry, &options)
     })();
