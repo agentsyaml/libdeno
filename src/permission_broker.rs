@@ -9,6 +9,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::OnceLock;
 
 use deno_runtime::deno_permissions::broker::has_broker;
@@ -72,6 +73,7 @@ pub fn install_permission_broker(path: impl AsRef<Path>) -> Result<(), LibdenoEr
     Ok(())
 }
 
+#[cfg(unix)]
 static HOOK: OnceLock<PermissionPrompt> = OnceLock::new();
 
 /// Installs an in-process permission hook — a plain `Fn(&PermissionRequest) ->
@@ -85,11 +87,11 @@ pub fn install_permission_hook(hook: PermissionPrompt) -> Result<(), LibdenoErro
     #[cfg(not(unix))]
     {
         let _ = hook;
-        return Err(LibdenoError::Permission(
+        Err(LibdenoError::Permission(
             "install_permission_hook is not supported on this platform yet; \
              use install_permission_broker with an external broker process"
                 .to_string(),
-        ));
+        ))
     }
     #[cfg(unix)]
     {
@@ -200,6 +202,7 @@ struct BrokerRequest {
     value: Option<String>,
 }
 
+#[cfg(unix)]
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BrokerResponseLine {
