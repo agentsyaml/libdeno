@@ -722,9 +722,13 @@ fn child_mode_with_wrong_token_is_rejected() {
     let entry_abs = entry.display().to_string();
     let cwd = fs::canonicalize(&dir).unwrap().display().to_string();
     // The request schema of ChildRunRequest, with a token that does NOT match
-    // the env token below.
+    // the env token below. Escape backslashes/quotes: on Windows the path is
+    // `D:\a\...` and a raw backslash is an invalid JSON escape.
+    let json_escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let payload = format!(
-        r#"{{"entry":"{entry_abs}","permissions":[],"allow_all_permissions":true,"prompt":false,"args":[],"cwd":"{cwd}","token":"00000000000000000000000000000000"}}"#
+        r#"{{"entry":"{}","permissions":[],"allow_all_permissions":true,"prompt":false,"args":[],"cwd":"{}","token":"00000000000000000000000000000000"}}"#,
+        json_escape(&entry_abs),
+        json_escape(&cwd)
     );
     let mut child = Command::new(env!("CARGO_BIN_EXE_child_host"))
         .env("LIBDENO_CHILD_MODE", "1")
