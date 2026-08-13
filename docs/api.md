@@ -63,10 +63,14 @@ Supported flags:
 | `--allow-write` | paths |
 | `--allow-env` | environment variable names |
 | `--allow-net` | hosts (optionally with `:port`) |
+| `--allow-import` | import hosts (e.g. `deno.land`); gates remote `https:`/`jsr:` module loading — there is no `--allow-net` fallback |
 | `--allow-run` | executable names |
 | `--allow-ffi` | `.so`/`.dylib` paths |
 | `--allow-sys` | system API names |
 | `-A` / `--allow-all` | — (equivalent to `allow_all_permissions`) |
+
+Static and dynamic file imports are gated by `--allow-read` (the graph loader
+checks each file against the declared scope).
 
 ### `allow_all_permissions`
 
@@ -115,7 +119,7 @@ pub enum LibdenoError {
   Runtime(AnyError),                     // runtime startup / script failure
   Core(deno_core::error::CoreError),     // JS exception escaped event loop
   Io(std::io::Error),                    // host I/O failure (e.g. cwd)
-  Timeout(Duration),                     // execution deadline exceeded, isolate terminated
+  Timeout(String),                     // deadline exceeded / subprocess handshake timed out (message explains which)
 }
 ```
 

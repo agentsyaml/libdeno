@@ -25,10 +25,24 @@ listed descriptors are allowed (`--allow-read=./src,./public`).
 | `--allow-write` | paths | `--allow-write=/tmp` |
 | `--allow-env` | env var names | `--allow-env=HOME,PATH` |
 | `--allow-net` | hosts, optionally `:port` | `--allow-net=example.com:8080` |
+| `--allow-import` | import hosts (see note) | `--allow-import=deno.land` |
 | `--allow-run` | executable names | `--allow-run=git` |
 | `--allow-ffi` | native library paths | `--allow-ffi=./libfoo.so` |
 | `--allow-sys` | system API names | `--allow-sys=getpid` |
 | `-A` / `--allow-all` | — | allow everything (same as `allow_all_permissions: true`) |
+
+`--allow-import` gates **remote module loading** (`https:`/`jsr:` specifiers)
+exactly like the CLI: there is **no `--allow-net` fallback** for module
+fetches, so `--allow-net` alone does not enable them. A value is an import
+host descriptor in `--allow-net` style (`deno.land`, `jsr.io`); full URLs
+(`https://…`) are rejected by the upstream parser, as in the CLI. Without a
+value, import access is granted globally.
+
+**File imports** (`import ... from "./x.js"` or a `file://` URL, static and
+dynamic) are gated by `--allow-read`: the graph loader checks each file
+against the declared read scope (and the broker/hook), so a static import
+outside the scope fails with a `NotCapable` error. This matches the strict
+`--allow-read` guarantee the runtime ops provide.
 
 Deny/ignore forms (`--deny-*`, `--ignore-*`) are not currently exposed, and
 any unrecognized flag is rejected with a permission error rather than silently

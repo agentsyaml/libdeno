@@ -154,10 +154,14 @@ pub fn build_permissions(
                 has_allow = true;
                 extend(&mut opts.allow_sys, specs);
             }
-            "--allow-import" => return Err(LibdenoError::Permission(
-                "flag `--allow-import` is not supported; module loading is gated by --allow-net"
-                    .to_string(),
-            )),
+            "--allow-import" => {
+                has_allow = true;
+                // Values are import descriptor strings (hosts or host:port,
+                // mirroring --allow-net; full URLs like `https://…` are
+                // rejected by the upstream parser, same as the CLI). Without a
+                // value: import access is granted globally.
+                extend(&mut opts.allow_import, specs);
+            }
             _ => {
                 return Err(LibdenoError::Permission(format!(
                     "unknown permission flag: {flag}"
@@ -321,16 +325,41 @@ mod tests {
     }
 
     #[test]
-    fn allow_import_is_rejected() {
-        let args = vec!["--allow-import=https://x".to_string()];
-        assert!(build_permissions(
-            &args,
-            false,
-            false,
-            parser(),
-            std::env::current_dir().unwrap().as_path()
-        )
-        .is_err());
+    fn allow_import_flag_restricts_to_hosts() {
+        // The flag restores remote-module import gating: values are host-style
+        // import descriptors (like --allow-net), not full URLs — the upstream
+        // parser rejects URL schemes, matching the deno CLI.
+        let p = perms(&["--allow-import=jsr.io"], false, false);
+        assert_eq!(
+            p.query_import(Some("jsr.io")).unwrap(),
+            PermissionState::Granted
+        );
+        assert_eq!(
+            p.query_import(Some("deno.land")).unwrap(),
+            PermissionState::Prompt
+        );
+        // Remote module loading has NO --allow-net fallback (upstream checks
+        // only the import permission), so a bare --allow-net grant leaves
+        // import in the Prompt/deny state.
+        let p = perms(&["--allow-net"], false, false);
+        assert_eq!(
+            p.query_import(Some("deno.land")).unwrap(),
+            PermissionState::Prompt
+        );
+    }
+
+    #[test]
+    fn allow_import_without_value_grants_globally() {
+        let p = perms(&["--allow-import"], false, false);
+        assert_eq!(
+            p.query_import(Some("any.host.example")).unwrap(),
+            PermissionState::Granted
+        );
+        // Other capabilities stay restricted: allow-import is not allow-all.
+        assert_eq!(
+            p.query_read(Some("/etc/passwd")).unwrap(),
+            PermissionState::Prompt
+        );
     }
 
     #[test]

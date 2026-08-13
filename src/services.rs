@@ -448,7 +448,14 @@ impl RuntimeServices {
                 // Deno.permissions.revoke is honored by graph fetches, matching
                 // the CLI. Do NOT revert to deep_clone.
                 permissions: Some(permissions.clone()),
-                file_permission_api_name: None,
+                // Gate file-scheme module imports with check_open (api name
+                // "import"), so static file imports honor the --allow-read
+                // scope AND the broker/hook, exactly like dynamic import().
+                // With None, upstream falls back to check_specifier, whose
+                // file branch exempts CheckSpecifierKind::Static entirely —
+                // a static `import ... from "file:///..."` (including relative
+                // imports, which are file scheme) would bypass --allow-read.
+                file_permission_api_name: Some("import"),
                 reporter: None,
             },
         ));

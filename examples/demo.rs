@@ -23,7 +23,7 @@ fn main() {
             "permission flags: --allow-read[=paths] --allow-write[=paths] --allow-env[=names]"
         );
         println!(
-            "  --allow-net[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]"
+            "  --allow-net[=hosts] --allow-import[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]"
         );
         return;
     }
@@ -79,6 +79,6 @@ fn print_error(e: &LibdenoError) {
         LibdenoError::Runtime(e) => eprintln!("error: {e}"),
         LibdenoError::Core(e) => eprintln!("runtime error: {e}"),
         LibdenoError::Io(e) => eprintln!("io error: {e}"),
-        LibdenoError::Timeout(d) => eprintln!("execution deadline exceeded: {d:?}"),
+        LibdenoError::Timeout(msg) => eprintln!("timeout: {msg}"),
     }
 }

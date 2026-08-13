@@ -83,6 +83,13 @@ fn token_matches(a: &str, b: &str) -> bool {
 /// `LIBDENO_CHILD_MODE` and write the child's stdin cannot inject a request
 /// of its own.
 ///
+/// The payload write is bounded at 10s (aligned with the child side's stdin
+/// deadline): a host that never services child mode (never reads stdin)
+/// otherwise blocks the write once the pipe buffer fills; on timeout the
+/// child is killed and `LibdenoError::Timeout` is returned. Note that a
+/// small payload against a non-servicing host still succeeds the write — the
+/// bound only protects once the request exceeds the pipe buffer.
+///
 /// # Security
 ///
 /// Child mode turns a host process into an arbitrary-code-execution server
@@ -131,8 +138,38 @@ pub fn run_in_subprocess(
     };
     {
         use std::io::Write;
-        let write_result = match child.stdin.as_mut() {
-            Some(stdin) => stdin.write_all(&payload).map_err(LibdenoError::Io),
+        let write_result = match child.stdin.take() {
+            Some(mut stdin) => {
+                // The payload write can block forever when the host never
+                // services child mode (a host that does not call
+                // maybe_handle_child_mode never reads stdin): once the pipe
+                // buffer (~64 KiB) fills, write_all blocks until the child
+                // reads. Move the blocking write to a detached thread and
+                // bound the wait at 10s (aligned with the child side's own
+                // stdin deadline). On timeout the child is killed (closing its
+                // pipe end, which unblocks the writer) and a Timeout error is
+                // surfaced. The thread is deliberately not joined: after the
+                // kill it can still be blocked inside write_all, and the
+                // process reaps it at exit.
+                let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+                std::thread::spawn(move || {
+                    let _ = tx.send(stdin.write_all(&payload));
+                });
+                match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(LibdenoError::Io(e)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(LibdenoError::Timeout(
+                        "subprocess handshake timed out after 10s: \
+                             host did not service child mode (stdin not read)"
+                            .to_string(),
+                    )),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                            "child stdin writer terminated unexpectedly"
+                        )))
+                    }
+                }
+            }
             None => Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
                 "child has no stdin"
             ))),
@@ -158,9 +195,9 @@ pub fn run_in_subprocess(
             }
         }
     }
-    // Close the child's stdin so a script reading process.stdin sees EOF
-    // instead of blocking forever on the still-open pipe.
-    drop(child.stdin.take());
+    // The writer thread dropped the last handle to the child's stdin after the
+    // payload write, so a script reading process.stdin sees EOF instead of
+    // blocking forever on the still-open pipe.
     let status = child.wait().map_err(LibdenoError::Io)?;
     Ok(status.code().unwrap_or(1))
 }

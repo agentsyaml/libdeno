@@ -8,7 +8,7 @@
 //! keep both in sync when features are added or removed.
 
 // Mirror of lib.rs's `ENABLED_FEATURES` const.
-const ENABLED_FEATURES: &[&str] = &["kv", "cron", "ffi", "webgpu"];
+const ENABLED_FEATURES: &[&str] = &["kv", "cron", "ffi", "webgpu", "worker-options"];
 
 #[test]
 fn every_enabled_feature_is_a_known_unstable_feature() {

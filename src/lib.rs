@@ -175,10 +175,13 @@ pub enum LibdenoError {
     /// I/O failure in the host (cwd resolution).
     #[error("{0}")]
     Io(#[from] std::io::Error),
-    /// The run exceeded `LibdenoOptions.execution_deadline` and the isolate
-    /// was force-terminated.
-    #[error("execution deadline of {0:?} exceeded; isolate terminated")]
-    Timeout(std::time::Duration),
+    /// A hard time bound fired: the run exceeded
+    /// `LibdenoOptions.execution_deadline` and the isolate was
+    /// force-terminated, or a [`run_in_subprocess`] handshake timed out (the
+    /// host never serviced child mode). The payload is the human-readable
+    /// reason.
+    #[error("{0}")]
+    Timeout(String),
 }
 
 // The lifecycle event dispatches (`dispatch_load_event` and friends) return
@@ -321,10 +324,14 @@ pub(crate) async fn run_inner_with(
 
     let blob_store = BlobStore::default_arc();
     let broadcast_channel = InMemoryBroadcastChannel::default();
-    // Unstable APIs enabled by default (kv, cron, ffi, webgpu) — an "everything
-    // enabled" stance like `deno run --unstable`; an embedded runtime has no
-    // flag surface. JS namespace IDs and FeatureChecker names must stay in sync.
-    const ENABLED_FEATURES: &[&str] = &["kv", "cron", "ffi", "webgpu"];
+    // Unstable APIs enabled by default (kv, cron, ffi, webgpu, worker-options)
+    // — an "everything enabled" stance like `deno run --unstable`; an embedded
+    // runtime has no flag surface. worker-options gates the worker
+    // `permissions`/`env`/`net` options in `new Worker(...)` (op_create_worker
+    // exits the process if the feature is off), so it must stay enabled for
+    // worker permission narrowing to work. JS namespace IDs and FeatureChecker
+    // names must stay in sync.
+    const ENABLED_FEATURES: &[&str] = &["kv", "cron", "ffi", "webgpu", "worker-options"];
     let feature_checker = {
         let mut fc = deno_runtime::FeatureChecker::default();
         for feature in ENABLED_FEATURES {
@@ -426,7 +433,11 @@ pub(crate) async fn run_inner_with(
     {
         Ok(result) => result,
         // Deadline fired: isolate terminated; cwd lock releases on return.
-        Err(deadline) => return Err(LibdenoError::Timeout(deadline)),
+        Err(deadline) => {
+            return Err(LibdenoError::Timeout(format!(
+                "execution deadline of {deadline:?} exceeded; isolate terminated"
+            )))
+        }
     };
 
     let exit_code = match run_result {

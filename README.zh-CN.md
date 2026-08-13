@@ -2,7 +2,7 @@
 
 > 在 Rust 中嵌入 Deno 运行时，原生支持 `npm:` 说明符。
 
-libdeno 是一个 Rust crate，它在你的程序里嵌入一个完整的 Deno 运行时（V8 + 官方模块图管线）。你的 JS/TS 代码可以直接 `import` npm 包、远程模块、`jsr:` 与 `node:` 内置模块，全部经由官方 deno 解析器栈处理——行为与 `deno run` 一致，但运行在你的进程里。
+libdeno 是一个 Rust crate，它在你的程序里嵌入一个完整的 Deno 运行时（V8 + 官方模块图管线）。你的 JS/TS 代码可以直接 `import` npm 包、远程模块、`jsr:` 与 `node:` 内置模块，全部经由官方 deno 解析器栈处理——行为与 `deno run` 一致，但运行在你的进程里。远程（`https:`/`jsr:`）模块加载与 CLI 一样受权限约束：需要 `--allow-import`（或 `allow_all_permissions`/`prompt`）。
 
 English: [README.md](README.md)
 
@@ -10,7 +10,7 @@ English: [README.md](README.md)
 
 ## 特性
 
-- **官方模块图管线**：`npm:`、`jsr:`、远程 `https://`、`node:`、本地文件、JSON、WASM、import map（来自 `deno.json`）、TypeScript 转译，全部由 `deno_graph` + `deno_resolver` 处理。
+- **官方模块图管线**：`npm:`、`jsr:`、远程 `https://`、`node:`、本地文件、JSON、WASM、import map（来自 `deno.json`）、TypeScript 转译，全部由 `deno_graph` + `deno_resolver` 处理。远程（`https:`/`jsr:`）导入需要 `--allow-import`（或 `allow_all_permissions`/`prompt`）——模块加载没有 `--allow-net` 兜底，与 `deno run` 一致。
 - **npm 集成**：自动发现并使用 `node_modules`（BYONM）；没有时按需安装（managed mode）。支持 CJS 包、`.node` 原生插件。npm 生命周期脚本默认不执行（与 deno CLI 2.x 一致）。
 - **`child_process.fork` 支持**：npm 解析快照随子进程传播。
 - **Web Worker**：`new Worker(...)` 嵌套 worker 复用同一模块加载器与快照。
@@ -75,7 +75,7 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `LibdenoOptions.cwd: Option<PathBuf>` | 相对路径（入口、权限、node_modules 发现）解析的工作目录，默认进程当前目录。 |
 | `LibdenoError` | 枚举：`Entry`（入口解析失败）、`Permission`（权限字符串非法 / 空列表未显式选择）、`Runtime`、`Core`（脚本异常）、`Io`。 |
 
-支持的权限标志：`--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`，以及 `-A` / `--allow-all`。
+支持的权限标志：`--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-import[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`，以及 `-A` / `--allow-all`。`--allow-import` 管控远程模块加载（没有 `--allow-net` 兜底）；静态与动态文件导入由 `--allow-read` 管控。
 
 完整 API 文档见 [`docs/api.md`](docs/api.md)（英文）。
 

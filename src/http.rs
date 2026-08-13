@@ -29,6 +29,14 @@ const MAX_RESPONSE_BODY_BYTES: usize = 256 << 20;
 /// registries serve tarballs with an explicit Content-Length, so a response
 /// claiming more than the module cap gets this larger bound. Still bounded,
 /// so a broken/oversized response fails fast instead of OOMing the host.
+///
+/// This cap counts only the downloaded (compressed) bytes; the decompressed
+/// allocation is NOT size-checked. Upstream tarball_extract reserves space
+/// from the gzip stream's ISIZE header, which is written by the publisher —
+/// a malicious registry can serve a small tarball (under this cap) whose
+/// ISIZE claims ~4GiB, triggering a try_reserve of that size and OOM risk.
+/// The registry must therefore be trusted; a hardened build would need to
+/// pre-validate ISIZE against a post-decompression budget.
 const MAX_TARBALL_BODY_BYTES: usize = 1 << 30;
 
 #[derive(Debug, Clone)]

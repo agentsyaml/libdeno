@@ -139,10 +139,38 @@ fn build_web_worker_factory(
         // same per-run state and the same already-initialized resolvers, so
         // this call cannot fail (no script-reachable error path, no panic).
         let nested_cb = build_web_worker_factory(shared.clone());
-        let module_loader: Rc<dyn deno_core::ModuleLoader> = Rc::new(GraphModuleLoader::new(
-            runtime.clone(),
-            worker_permissions.clone(),
+        // The worker's static imports must be adjudicated by the worker's OWN
+        // permissions container, not the main run's: the shared
+        // `runtime.graph_loader` carries the main run's container (built in
+        // RuntimeServices::new), so reusing it here would let the main run's
+        // --allow-read scope leak to a worker that declared narrower
+        // permissions. Build a dedicated graph loader bound to
+        // `worker_permissions` — everything it needs (file fetcher, caches,
+        // the in-npm-package checker cloned in the fallible factory phase) is
+        // at hand, so this stays infallible. Residual (documented): the module
+        // graph itself is shared with the main run, so a module the main run
+        // already fetched is served from that graph without a re-check; a
+        // per-worker graph would close it, deferred as the shared graph is a
+        // deliberate performance design.
+        let worker_graph_loader = Arc::new(deno_resolver::file_fetcher::DenoGraphLoader::new(
+            runtime.file_fetcher.clone(),
+            runtime.shared.global_http_cache.clone(),
+            in_npm_pkg_checker.clone(),
+            runtime.shared.sys.clone(),
+            deno_resolver::file_fetcher::DenoGraphLoaderOptions {
+                file_header_overrides: Default::default(),
+                include_npm_sources: false,
+                permissions: Some(worker_permissions.clone()),
+                file_permission_api_name: Some("import"),
+                reporter: None,
+            },
         ));
+        let module_loader: Rc<dyn deno_core::ModuleLoader> =
+            Rc::new(GraphModuleLoader::with_graph_loader(
+                runtime.clone(),
+                worker_permissions.clone(),
+                worker_graph_loader,
+            ));
         let node_require_loader: deno_runtime::deno_node::NodeRequireLoaderRc = Rc::new(
             SimpleNodeRequireLoader::new(cjs_tracker.clone(), in_npm_pkg_checker.clone()),
         );
@@ -168,22 +196,16 @@ fn build_web_worker_factory(
                 npm_process_state_provider: Some(runtime.shared.npm_process_state_provider.clone()),
                 // Op-level checks use the worker's own permissions container
                 // (args.permissions), as deno_runtime expects. The worker's
-                // GraphModuleLoader above (lines 142-145) is also built with
-                // that container, but only its own permission-gated reads
-                // (CJS analysis) see it: prepare_load -> build_graph runs on
-                // the shared per-run graph via `runtime.graph_loader`, which
-                // is bound to the MAIN run's permissions container
-                // (services.rs RuntimeServices::new).
-                // Currently safe: the graph loader's file reads carry no
-                // permission gate (file_permission_api_name = None), the
-                // `--allow-import` flag is explicitly rejected in
-                // permissions.rs, and remote module fetches are not gated —
-                // so the asymmetry is not exploitable today. If a future
-                // change enables file_permission_api_name or an allow-import
-                // gate, worker-triggered graph builds MUST switch to a loader
-                // bound to the worker's own container, or a worker with fewer
-                // grants than the main run becomes a real privilege
-                // escalation.
+                // GraphModuleLoader above is built with that same container,
+                // including its own graph loader (DenoGraphLoader bound to
+                // worker_permissions), so worker-triggered graph builds gate
+                // static/dynamic file imports (file_permission_api_name =
+                // "import") with the worker's grants — the main run's scope
+                // cannot leak into a worker that declared narrower
+                // permissions. Residual: the module graph is shared with the
+                // main run, so modules the main run already fetched are served
+                // from the graph without a re-check; a per-worker graph would
+                // close that.
                 permissions: args.permissions,
                 root_cert_store_provider: None,
                 shared_array_buffer_store: None,

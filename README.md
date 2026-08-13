@@ -6,7 +6,7 @@
 
 > Embed the Deno runtime in Rust with direct `npm:` specifier support.
 
-libdeno is a Rust crate that embeds a full Deno runtime (V8 + the official module graph pipeline) inside your program. Your JS/TS code can `import` npm packages, remote modules, `jsr:` and `node:` builtins directly, all handled by the official Deno resolver stack — the same behavior as `deno run`, but running inside your process.
+libdeno is a Rust crate that embeds a full Deno runtime (V8 + the official module graph pipeline) inside your program. Your JS/TS code can `import` npm packages, remote modules, `jsr:` and `node:` builtins directly, all handled by the official Deno resolver stack — the same behavior as `deno run`, but running inside your process. Remote (`https:`/`jsr:`) module loading is permission-gated exactly like the CLI: it needs `--allow-import` (or `allow_all_permissions` / `prompt`).
 
 中文版文档：[README.zh-CN.md](README.zh-CN.md)
 
@@ -14,7 +14,7 @@ libdeno is a Rust crate that embeds a full Deno runtime (V8 + the official modul
 
 ## Features
 
-- **Official module graph pipeline**: `npm:`, `jsr:`, remote `https://`, `node:`, local files, JSON, WASM, import maps (from `deno.json`), and TypeScript transpilation are all handled by `deno_graph` + `deno_resolver`.
+- **Official module graph pipeline**: `npm:`, `jsr:`, remote `https://`, `node:`, local files, JSON, WASM, import maps (from `deno.json`), and TypeScript transpilation are all handled by `deno_graph` + `deno_resolver`. Remote (`https:`/`jsr:`) imports require `--allow-import` (or `allow_all_permissions`/`prompt`) — there is no `--allow-net` fallback for module loading, matching `deno run`.
 - **npm integration**: automatically discovers and uses an existing `node_modules` (BYONM); installs on demand otherwise (managed mode). Supports CJS packages and `.node` native addons. npm lifecycle scripts do not run by default (matching deno CLI 2.x).
 - **`child_process.fork` support**: the npm resolution snapshot propagates to child processes.
 - **Web Workers**: `new Worker(...)` nested workers reuse the same module loader and snapshot.
@@ -95,9 +95,9 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `LibdenoOptions.cwd: Option<PathBuf>` | Working directory that relative paths (entry, permissions, `node_modules` discovery) resolve against. Defaults to the process current directory. |
 | `LibdenoOptions.max_heap_bytes: Option<usize>` | Hard cap on the V8 old-generation heap in bytes; V8 aborts with OOM when hit. Applies to the main worker **and** web workers spawned via `new Worker(...)`. |
 | `LibdenoOptions.execution_deadline: Option<Duration>` | Hard wall-clock limit; on expiry the isolate is force-terminated and the run fails with `LibdenoError::Timeout`. Does **not** interrupt blocking system calls (NFS-hung file reads, synchronous `Deno.Command` waits) — those unwind only when the syscall itself returns, so the run can exceed the deadline by the syscall's duration. |
-| `LibdenoError` | Enum: `Entry` (entry resolution failed), `Permission` (invalid permission flags / empty list without opt-in), `Runtime`, `Core` (script exception), `Io`, `Timeout` (deadline exceeded, isolate terminated). |
+| `LibdenoError` | Enum: `Entry` (entry resolution failed), `Permission` (invalid permission flags / empty list without opt-in), `Runtime`, `Core` (script exception), `Io`, `Timeout` (deadline exceeded / subprocess handshake timed out; the message says which). |
 
-Supported permission flags: `--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`, plus `-A` / `--allow-all`.
+Supported permission flags: `--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-import[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`, plus `-A` / `--allow-all`. `--allow-import` gates remote module loading (there is no `--allow-net` fallback); static and dynamic file imports are gated by `--allow-read`.
 
 Full API documentation: [`docs/api.md`](docs/api.md).
 

@@ -57,10 +57,28 @@ pub struct GraphModuleLoader {
 
 impl GraphModuleLoader {
     pub fn new(runtime: Arc<RuntimeServices>, permissions: PermissionsContainer) -> Self {
+        let graph_loader = runtime.graph_loader.clone();
+        Self::with_graph_loader(runtime, permissions, graph_loader)
+    }
+
+    /// Like [`new`], but binds graph builds to `graph_loader` instead of the
+    /// run's loader. Web workers pass a loader built from their OWN
+    /// permissions container, so a worker-triggered graph build is gated by
+    /// the worker's grants, not the main run's — otherwise the main run's
+    /// `--allow-read` scope leaks to workers that declared narrower
+    /// permissions. (Residual: modules the main run already fetched stay
+    /// cached in the shared per-run graph and are served to the worker
+    /// without a re-check — a per-worker graph would be required to close
+    /// that, see worker_factory.rs.)
+    pub fn with_graph_loader(
+        runtime: Arc<RuntimeServices>,
+        permissions: PermissionsContainer,
+        graph_loader: Arc<RealGraphLoader>,
+    ) -> Self {
         Self {
             shared: runtime.shared.clone(),
             file_fetcher: runtime.file_fetcher.clone(),
-            graph_loader: runtime.graph_loader.clone(),
+            graph_loader,
             graph: runtime.graph.clone(),
             permissions,
         }

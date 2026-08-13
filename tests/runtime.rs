@@ -129,12 +129,11 @@ fn run_with_does_not_leak_permissions_between_runs() {
     // with restricted grants on the same LibdenoRuntime — the permission-bound
     // file fetcher / graph loader are rebuilt per run.
     //
-    // Local imports (static *and* dynamic) are not read-gated by --allow-read:
-    // deno_permissions treats file:// imports as part of the program body. The
-    // gating operation is a runtime read API instead: run 1 (allow-all) loads
-    // the external module via dynamic import and reads it; run 2 restricted to
-    // `--allow-read=<sub>` must be denied that read — proving run 1's grants
-    // did not leak into run 2.
+    // File imports are read-gated by --allow-read (the graph loader checks
+    // each file against the run's container), so run 2's dynamic import of
+    // shared.js (outside `--allow-read=<sub>`) is denied at module load —
+    // proving run 1's grants did not leak into run 2. The runtime read API
+    // that follows is the same check; either denial counts.
     let dir = temp_dir("perm-isolation");
     fs::create_dir_all(dir.join("sub")).unwrap();
     fs::write(dir.join("shared.js"), "export const secret = 'leaked';").unwrap();

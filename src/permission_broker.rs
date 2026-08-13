@@ -38,6 +38,11 @@ pub struct PermissionRequest {
 /// [`crate::run`] in-process, or any op that consults permissions) deadlocks
 /// the process: the upstream check path blocks on the bridge while the bridge
 /// thread is inside the hook waiting for that same check.
+///
+/// A blocked hook also defeats `execution_deadline`: the permission-check
+/// thread is parked in the bridge read, so `terminate_execution` has no JS
+/// stack to throw into and the event loop (and its timers) are never polled.
+/// The run keeps going past the deadline until the hook returns.
 pub type PermissionPrompt = Arc<dyn Fn(&PermissionRequest) -> bool + Send + Sync>;
 
 /// Serializes broker installation: both install functions check `has_broker()`
@@ -68,6 +73,9 @@ pub fn install_permission_broker(path: impl AsRef<Path>) -> Result<(), LibdenoEr
     }
     // NOTE: PermissionBroker::new exits the process (code 87) if it cannot
     // connect to `path` — upstream deno_permissions behavior, not ours.
+    // Callers should probe the socket's existence first (e.g. via the
+    // process-wide `has_broker()` guard after a successful connect, or by
+    // checking the path before installing) to fail cleanly instead.
     let broker = PermissionBroker::new(path.as_ref());
     set_broker(broker);
     Ok(())
@@ -83,6 +91,14 @@ static HOOK: OnceLock<PermissionPrompt> = OnceLock::new();
 ///
 /// Unix only for now; on Windows use [`install_permission_broker`] with an
 /// external broker process.
+///
+/// # Safety (fork)
+///
+/// Forking after installation without an immediate exec is unsafe: the child
+/// inherits the installed broker state and the socket fd, but has no bridge
+/// thread serving it, so the child's first permission check hangs forever.
+/// The same applies to an external broker (both endpoints inherited, no
+/// reader). Re-install the hook/broker in the child (or exec immediately).
 pub fn install_permission_hook(hook: PermissionPrompt) -> Result<(), LibdenoError> {
     #[cfg(not(unix))]
     {

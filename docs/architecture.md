@@ -72,9 +72,10 @@ Unstable APIs require two synchronized gates:
    is exposed.
 
 Enabling only one yields `Deno.openKv is not a function`. libdeno enables
-`kv`, `cron`, `ffi`, `webgpu` by filtering
+`kv`, `cron`, `ffi`, `webgpu`, `worker-options` by filtering
 `deno_features::UNSTABLE_FEATURES` by name and collecting the IDs, keeping
 both layers in sync from a single list (`ENABLED_FEATURES` in `lib.rs`).
+`worker-options` gates the `deno.permissions` options in `new Worker(...)`.
 
 ## Module loading (`module_loader.rs`)
 
@@ -109,7 +110,11 @@ both layers in sync from a single list (`ENABLED_FEATURES` in `lib.rs`).
 own Rc-based loader/node services from the shared `Arc<SharedServices>` —
 nothing non-Send crosses threads. The factory is recursive, so nested workers
 work. Workers reuse the same snapshot, residual sources, blob store, and
-broadcast channel.
+broadcast channel. Each worker builds its own `DenoGraphLoader` bound to the
+worker's permissions container, so a worker's module loads are gated by its
+own grants, not the main run's; the module *graph* itself stays shared (a
+module the main run already fetched is served to the worker without a
+re-check).
 
 ## HTTP client (`http.rs`)
 
