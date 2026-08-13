@@ -24,8 +24,12 @@ use crate::CWD_LOCK;
 /// project root and its ancestors), so long-lived hosts serving the same
 /// project skip the per-run factory construction entirely.
 ///
-/// `Send + Sync` is guaranteed by the compiler: the only state is the
-/// `Arc<SharedServices>` resolver stack plus its config fingerprint.
+/// The runtime is single-threaded by design: the module loader stack is
+/// `Rc<dyn ModuleLoader>`-based and every run executes on a fresh
+/// current-thread tokio runtime. `LibdenoRuntime` itself is `Clone` + `Send` +
+/// `Sync` (its only state is an `Arc<Mutex<RuntimeState>>` around the resolver
+/// stack), so it can be shared across host threads and serialized by
+/// [`run_with`]'s cwd lock.
 #[derive(Clone)]
 pub struct LibdenoRuntime {
     cwd: PathBuf,
@@ -74,6 +78,11 @@ impl LibdenoRuntime {
 ///
 /// The script runs in the runtime's cwd; `LibdenoOptions.cwd` is ignored
 /// (the resolver stack is scoped to the runtime's directory).
+///
+/// The async/sync split is deliberate: [`LibdenoRuntime::new`] is async
+/// because resolver stack construction needs a tokio context, while `run_with`
+/// is sync and rejects being called from inside a tokio runtime — it does its
+/// own `block_on` on a fresh current-thread runtime.
 pub fn run_with(
     runtime: &LibdenoRuntime,
     entry: impl AsRef<Path>,

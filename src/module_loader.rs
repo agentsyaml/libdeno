@@ -320,6 +320,13 @@ async fn build_graph(
     // failure would otherwise poison the module for the rest of the run and
     // every worker sharing the graph. Retry only when the node exists without
     // an error for this specifier.
+    // ponytail: this only checks the ROOT specifier's own error-table entry.
+    // If the root already exists but one of its DEPENDENCIES failed to load
+    // earlier, we skip the rebuild and return Ok; the dependency error then
+    // still surfaces on the later load() through the graph error table
+    // (self-healing on the next build). A full reachable-dependency error
+    // scan is too costly for this hot path; revisit only if stale dependency
+    // failures show up in practice.
     if graph.get(specifier).is_some() {
         let failed = graph.module_errors().any(|e| e.specifier() == specifier);
         if !failed {

@@ -25,11 +25,15 @@ security boundary against memory-unsafety in the interpreter.
 
 ## Dependency Pin Trade-off
 
-libdeno depends on the deno stack with **caret ranges** (e.g. `deno_graph
-^0.110.1`) to preserve downstream resolution flexibility — this was
-deliberately relaxed after a downstream version conflict. Stricter supply-chain
-practices (exact pins, `cargo-vet`, `cargo-deny`) are therefore a
-**downstream-consumer decision**, made at the consumer's lockfile level.
+Since **v0.2.0**, the crates whose types cross the libdeno/deno stack
+boundary directly — `deno_error`, `deno_graph`, `deno_semver`,
+`deno_media_type` — are **exact-pinned** to match the deno stack's own
+internal pins (e.g. `deno_resolver` 0.88.0 pins `deno_graph` =0.110.1 and
+`deno_semver` =0.10.1; `deno_core`/`deno_runtime` pin `deno_error` =0.7.1).
+Without the exact pin, a `cargo update` can resolve a second version of one
+of these crates, and the duplicated types produce unlocatable
+trait-mismatch compile errors. All other deno dependencies keep caret
+ranges to preserve downstream resolution flexibility.
 
 libdeno's own guardrails are:
 
@@ -41,6 +45,39 @@ libdeno's own guardrails are:
 
 If you need stronger guarantees, pin your own lockfile and run `cargo-vet` /
 `cargo-deny` in your own pipeline.
+
+## Permission Defaults — v0.2.0 Breaking Change
+
+Since **v0.2.0**, an **empty** `LibdenoOptions.permissions` list **no longer
+implicitly grants all permissions**: `run` / `run_with` /
+`run_in_subprocess` return a permission error instead.
+
+Embedders must do one of the following:
+
+- pass explicit `--allow-*` capability strings in `permissions` (e.g.
+  `["--allow-read", "--allow-env"]`), or
+- set `LibdenoOptions.allow_all_permissions = true` (the `-A` /
+  `--allow-all` capability string remains equivalent).
+
+This closes the "forgot to pass permissions and silently got everything
+open" footgun. Releases ≤0.1.4 defaulted to allowing everything. See
+[docs/permissions.md](docs/permissions.md) for details.
+
+Beyond the default stance, libdeno also exposes:
+
+- `LibdenoOptions.prompt` — mirrors `deno run`'s interactive prompts:
+  non-granted checks print to stderr and read allow/deny from stdin; an empty
+  `permissions` list with `prompt: true` asks for every access instead of
+  erroring.
+- `install_permission_broker` / `install_permission_hook` — install a
+  process-global permission decision hook (install-once). Once installed it is
+  the **sole authority** for all permission checks in the process, overriding
+  the flags. Hooks are closures and cannot be passed across a subprocess
+  boundary; cross-process decision-making uses the filesystem-socket broker
+  instead.
+
+None of these change the core conclusion above: permissions are not a
+memory-safety boundary.
 
 ## Known Upstream-Tracked Advisories
 

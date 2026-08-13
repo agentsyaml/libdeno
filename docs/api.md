@@ -19,6 +19,13 @@ Behavior notes:
 - The call blocks until the script finishes (module execution + event loop +
   lifecycle events: `load`, `beforeunload`, `unload`, `process.beforeExit`,
   `process.exit`).
+- Since v0.2.0 a directory/`package.json` entry whose `main` field escapes
+  the package directory (absolute path, or `..` walking above it) is rejected
+  with `LibdenoError::Entry`; `..` that stays inside (e.g. `src/../lib/index.js`)
+  is still accepted.
+- Since v0.2.0 every remote module fetch is capped at 256 MiB regardless of
+  the declared `Content-Length`; the 1 GiB tier applies only to npm registry
+  (tarball) downloads.
 
 ## `LibdenoOptions`
 
@@ -26,8 +33,12 @@ Behavior notes:
 #[derive(Debug, Clone, Default)]
 pub struct LibdenoOptions {
   pub permissions: Vec<String>,
+  pub allow_all_permissions: bool,
+  pub prompt: bool,
   pub args: Vec<String>,
   pub cwd: Option<PathBuf>,
+  pub max_heap_bytes: Option<usize>,
+  pub execution_deadline: Option<Duration>,
 }
 ```
 
@@ -35,7 +46,9 @@ pub struct LibdenoOptions {
 
 Permission capability strings in CLI `--allow-*` format.
 
-- An empty list grants everything (the default).
+- Since v0.2.0 an **empty list is a construction error** — it grants nothing
+  and `run` returns `LibdenoError::Permission`. To run with every capability,
+  either set `allow_all_permissions: true` or pass `-A`/`--allow-all`.
 - Passing any entry restricts the runtime to the declared capabilities.
 - A flag without a value allows that capability globally
   (`--allow-read` == read anywhere).
@@ -53,7 +66,35 @@ Supported flags:
 | `--allow-run` | executable names |
 | `--allow-ffi` | `.so`/`.dylib` paths |
 | `--allow-sys` | system API names |
-| `-A` / `--allow-all` | — (allow everything, the default stance) |
+| `-A` / `--allow-all` | — (equivalent to `allow_all_permissions`) |
+
+### `allow_all_permissions`
+
+Grants every capability (`-A` equivalent). Required to run scripts with an
+empty `permissions` list — since v0.2.0 that is a construction error unless
+this flag is set. Use it only for code you trust (see SECURITY.md).
+
+### `prompt`
+
+Interactive permission prompting for non-granted queries, mirroring `deno run`'s
+default behavior: a check prints to stderr and reads allow/deny from stdin,
+blocking the run while it waits. The upstream prompter requires a terminal
+stdin (`is_terminal()`); a headless host without one sees every such query
+denied without reading.
+
+The three combinations:
+
+| `permissions` | `prompt` | Behavior |
+|---|---|---|
+| empty | `false` | construction error (the v0.2.0 default) |
+| empty | `true` | every access is asked interactively |
+| flags | `true` | flags grant, everything else is asked |
+| flags | `false` | flags grant, everything else is denied |
+
+In subprocess mode (`run_in_subprocess`) the child's stdin is a pipe (consumed
+by the request JSON), so the prompter's terminal check denies without reading —
+`prompt: true` in a child is equivalent to fail-closed deny; real interaction
+only makes sense for in-process `run`.
 
 ### `args`
 
@@ -70,15 +111,15 @@ discovery) resolve against. Defaults to the process current directory.
 #[derive(Debug, thiserror::Error)]
 pub enum LibdenoError {
   Entry(AnyError),                       // entry module resolution failed
-  Permission(String),                    // invalid permission flag
+  Permission(String),                    // invalid permission flags / empty list without opt-in
   Runtime(AnyError),                     // runtime startup / script failure
   Core(deno_core::error::CoreError),     // JS exception escaped event loop
-  Js(Box<deno_core::error::JsError>),    // JS exception in lifecycle dispatch
   Io(std::io::Error),                    // host I/O failure (e.g. cwd)
+  Timeout(Duration),                     // execution deadline exceeded, isolate terminated
 }
 ```
 
-All variants implement `std::error::Error`; `Runtime`, `Core`, `Js`, and `Io`
+All variants implement `std::error::Error`; `Runtime`, `Core`, and `Io`
 use `#[from]` so `?` works naturally.
 
 ## `run_in_subprocess`
@@ -130,6 +171,62 @@ fn main() {
   // ... normal host logic ...
 }
 ```
+
+## `install_permission_broker`
+
+```rust
+pub fn install_permission_broker(path: impl AsRef<Path>) -> Result<(), LibdenoError>
+```
+
+Installs an external permission broker process at `path` (raw deno_permissions
+capability): a Unix socket (or Windows named pipe) serving the JSON-line
+protocol — a request `{v, pid, id, datetime, permission, value}` line, a
+response `{id, result: "allow"|"deny", reason}` line.
+
+- Process-global and install-once; a second install returns
+  `LibdenoError::Permission`. Once installed, the broker is the **sole
+  authority** for every permission check in the process — granted or not — so
+  local `--allow-*` flags are no longer consulted (upstream deno semantics).
+- Checks are synchronous and blocking: the run stalls until the broker answers
+  each query.
+- `PermissionBroker::new` exits the process (code 87) if it cannot connect to
+  `path` — upstream deno_permissions behavior, not libdeno's. Install at
+  startup so a bad socket fails loudly.
+- Works across `run_in_subprocess` children when the host binary installs it in
+  `main()` before `maybe_handle_child_mode()`.
+
+## `install_permission_hook`
+
+```rust
+pub type PermissionPrompt = Arc<dyn Fn(&PermissionRequest) -> bool + Send + Sync>;
+
+pub fn install_permission_hook(hook: PermissionPrompt) -> Result<(), LibdenoError>
+```
+
+Installs an in-process permission hook (Unix only; on Windows use
+`install_permission_broker` with an external broker process). Return `true` to
+allow, `false` to deny.
+
+- Same semantics as `install_permission_broker`: process-global, install-once,
+  the sole authority for every permission check once installed, and mutually
+  exclusive with `install_permission_broker`.
+- The hook is served on an internal thread through a temp-dir Unix socket
+  (private 0700 dir, unlinked once the connection is established). The
+  `PermissionRequest` carries the capability name (`"read"`, `"net"`, ...) and
+  the stringified access value (path, host, env name, ...; `None` for unary
+  checks).
+- The hook must return quickly and must not block: checks are synchronous and
+  blocking, so a stalled hook stalls every permission check in the process. A
+  panicking hook terminates the process (upstream broker error path).
+- The hook decides checks, not construction: an empty `permissions` list still
+  fails at `run` construction time unless `prompt: true` (or flags /
+  `allow_all_permissions`) is set — the minimal hook configuration is hook +
+  `prompt: true` (the all-Prompt container routes every check to the hook).
+
+## Permission decision priority
+
+broker/hook (if installed, the sole authority) → flag grants → interactive
+prompt when `prompt: true` → deny.
 
 ## Example host binary
 

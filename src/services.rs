@@ -57,6 +57,11 @@ enum NpmProcessStateKind {
     Byonm,
 }
 
+/// Serialized npm resolution state handed to npm subprocesses (spawned via
+/// child_process.fork). WARNING: when the registry URL is of the form
+/// `https://user:pass@host/`, those credentials ride along in this serialized
+/// string. The hand-off is same-process/same-user (not a privilege boundary),
+/// but the string must never be logged or shipped across machines.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct NpmProcessState {
     kind: NpmProcessStateKind,
@@ -146,7 +151,10 @@ impl deno_npm_installer::lifecycle_scripts::LifecycleScriptsExecutor
 }
 
 /// Builds the provider from the resolver factory's npm resolver, matching
-/// deno_lib::npm::create_npm_process_state_provider.
+/// deno_lib::npm::create_npm_process_state_provider. The serialized snapshot
+/// (see `NpmProcessState`) may embed registry credentials — the resulting
+/// string is handed to forked npm child processes, so it must never be logged
+/// or sent off-machine.
 pub fn create_npm_process_state_provider(
     resolver_factory: &Arc<ResolverFactory<RealSys>>,
 ) -> deno_core::anyhow::Result<deno_runtime::deno_process::NpmProcessStateProviderRc> {

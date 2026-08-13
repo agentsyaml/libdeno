@@ -167,11 +167,23 @@ fn build_web_worker_factory(
                 }),
                 npm_process_state_provider: Some(runtime.shared.npm_process_state_provider.clone()),
                 // Op-level checks use the worker's own permissions container
-                // (args.permissions), as deno_runtime expects.
-                // Residual: worker-triggered graph fetches are checked against
-                // the shared live parent container (matches the CLI's
-                // shared-graph behavior; a module already fetched into the
-                // graph is not re-checked per worker).
+                // (args.permissions), as deno_runtime expects. The worker's
+                // GraphModuleLoader above (lines 142-145) is also built with
+                // that container, but only its own permission-gated reads
+                // (CJS analysis) see it: prepare_load -> build_graph runs on
+                // the shared per-run graph via `runtime.graph_loader`, which
+                // is bound to the MAIN run's permissions container
+                // (services.rs RuntimeServices::new).
+                // Currently safe: the graph loader's file reads carry no
+                // permission gate (file_permission_api_name = None), the
+                // `--allow-import` flag is explicitly rejected in
+                // permissions.rs, and remote module fetches are not gated —
+                // so the asymmetry is not exploitable today. If a future
+                // change enables file_permission_api_name or an allow-import
+                // gate, worker-triggered graph builds MUST switch to a loader
+                // bound to the worker's own container, or a worker with fewer
+                // grants than the main run becomes a real privilege
+                // escalation.
                 permissions: args.permissions,
                 root_cert_store_provider: None,
                 shared_array_buffer_store: None,

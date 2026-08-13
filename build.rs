@@ -38,6 +38,21 @@ fn main() {
 
     #[cfg(not(feature = "snapshot"))]
     {
+        // Guard: a no-default-features build produces an empty snapshot and
+        // residual tables — the crate compiles but every run panics. The only
+        // legitimate consumer of this branch is docs.rs (which only rustdoc's
+        // the lib). Fail the build for everyone else so "forgot the snapshot
+        // feature" surfaces at compile time instead of at the first run.
+        // Presence check (not equality against "1"): the tree convention —
+        // v8's own build script included — is `var_os("DOCS_RS").is_some()`.
+        if env::var_os("DOCS_RS").is_none() {
+            panic!(
+                "libdeno requires the `snapshot` feature (enabled by default) to build \
+                 a runnable crate; the no-default-features build exists only for \
+                 docs.rs documentation builds (DOCS_RS)"
+            );
+        }
+
         // Placeholder build for docs.rs. The snapshot pipeline links the Deno
         // runtime (and thus V8) into the build script binary; docs.rs builds
         // offline, and the v8 crate skips emitting its static library under
@@ -65,6 +80,14 @@ fn create_cli_snapshot(snapshot_path: &Path, residual_path: &Path, out_dir: &Pat
     // Source of truth: the deno repo's cli/snapshot/shared.rs TS_VERSION at
     // the tag for deno_runtime 0.265.0 (v2.9.5) — update in lockstep with the
     // deno_runtime bump (see the format assertion below).
+    //
+    // There is no public constant to machine-check this against, so syncing
+    // it stays a manual step: when bumping deno_runtime, copy TS_VERSION by
+    // hand from the corresponding deno tag's cli/snapshot/shared.rs. The
+    // format assertion below only catches malformed values — it cannot catch
+    // a well-formed but wrong version. A CI check comparing this value to the
+    // deno tag could close that gap; left for a future change (out of scope
+    // here).
     const TS_VERSION: &str = "6.0.3";
     // Sanity check: TS_VERSION must be a bare x.y.z version. This only
     // catches malformed values, not a wrong-but-well-formed one; upgrading

@@ -297,6 +297,7 @@ fn first_run_requires_the_registry() {
     let entry = dir.join("main.js");
     let options = LibdenoOptions {
         cwd: Some(dir.clone()),
+        allow_all_permissions: true,
         ..Default::default()
     };
     let err = run(&entry, &options).unwrap_err();
@@ -333,6 +334,7 @@ fn cached_snapshot_skips_network_on_second_run() {
     let entry = dir.join("main.js");
     let options = LibdenoOptions {
         cwd: Some(dir.clone()),
+        allow_all_permissions: true,
         ..Default::default()
     };
 

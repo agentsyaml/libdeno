@@ -11,12 +11,26 @@ use crate::LibdenoError;
 
 /// Builds the permission container from `--allow-*` capability strings.
 ///
-/// An empty list allows everything (the default, matching the CLI's `-A`).
-/// Passing any `--allow-*` flag restricts the runtime to the declared
-/// capabilities, e.g. `--allow-read=.` only allows reads under `.`. A flag
-/// without a value allows that capability globally (`--allow-read` == read
-/// anywhere); with a comma-separated value only the listed descriptors are
-/// allowed (`--allow-read=./src,./public`).
+/// The default stance is opt-in: an empty `permission_args` list is a
+/// construction error (`LibdenoError::Permission`) unless `allow_all` is set
+/// (equivalent to the CLI's `-A`), which grants every capability. The
+/// `-A`/`--allow-all` strings in `permission_args` remain valid and are
+/// equivalent to setting `allow_all`. Passing any other `--allow-*` flag
+/// restricts the runtime to the declared capabilities, e.g. `--allow-read=.`
+/// only allows reads under `.`. A flag without a value allows that capability
+/// globally (`--allow-read` == read anywhere); with a comma-separated value
+/// only the listed descriptors are allowed (`--allow-read=./src,./public`).
+///
+/// `prompt` mirrors `deno run`'s default interactive mode. The three
+/// combinations:
+///
+/// - `prompt: false` + empty args: construction error (the v0.2.0 default).
+/// - `prompt: true` + empty args: no error — every capability starts in the
+///   Prompt state, so each access is asked interactively (`deno run` with no
+///   `--allow-*` flags).
+/// - `prompt: true` + flags: the flags grant, everything else is asked.
+///
+/// With `prompt: false`, anything not granted is denied.
 ///
 /// Relative path values (`--allow-read=./src`) resolve against `cwd` (the
 /// `LibdenoOptions.cwd` working directory), not the host process's current
@@ -24,11 +38,17 @@ use crate::LibdenoError;
 /// embedder runs from.
 pub fn build_permissions(
     permission_args: &[String],
+    allow_all: bool,
+    prompt: bool,
     parser: Arc<deno_runtime::deno_permissions::RuntimePermissionDescriptorParser<RealSys>>,
     cwd: &Path,
 ) -> Result<PermissionsContainer, LibdenoError> {
     use deno_runtime::deno_permissions::Permissions;
     use deno_runtime::deno_permissions::PermissionsOptions;
+
+    if allow_all {
+        return Ok(PermissionsContainer::allow_all(parser));
+    }
 
     let mut opts = PermissionsOptions {
         allow_env: None,
@@ -49,7 +69,7 @@ pub fn build_permissions(
         deny_write: None,
         allow_import: None,
         deny_import: None,
-        prompt: false,
+        prompt,
     };
     let mut has_allow = false;
     for arg in permission_args {
@@ -146,7 +166,20 @@ pub fn build_permissions(
         }
     }
     if !has_allow {
-        return Ok(PermissionsContainer::allow_all(parser));
+        if prompt {
+            // Empty list + prompt: every capability starts in Prompt state,
+            // exactly like `deno run` with no --allow flags — each access is
+            // asked interactively instead of erroring or granting.
+            let perms = Permissions::from_options(&*parser, &opts)
+                .map_err(|e| LibdenoError::Permission(e.to_string()))?;
+            return Ok(PermissionsContainer::new(parser, perms));
+        }
+        return Err(LibdenoError::Permission(
+            "no permission flags provided; pass --allow-* capability flags, set \
+             LibdenoOptions.prompt = true for interactive prompting, or set \
+             LibdenoOptions.allow_all_permissions = true to grant all capabilities"
+                .to_string(),
+        ));
     }
     let perms = Permissions::from_options(&*parser, &opts)
         .map_err(|e| LibdenoError::Permission(e.to_string()))?;
@@ -162,14 +195,73 @@ mod tests {
         Arc::new(deno_runtime::deno_permissions::RuntimePermissionDescriptorParser::new(RealSys))
     }
 
-    fn perms(args: &[&str]) -> PermissionsContainer {
+    fn perms(args: &[&str], allow_all: bool, prompt: bool) -> PermissionsContainer {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        build_permissions(&args, parser(), std::env::current_dir().unwrap().as_path()).unwrap()
+        build_permissions(
+            &args,
+            allow_all,
+            prompt,
+            parser(),
+            std::env::current_dir().unwrap().as_path(),
+        )
+        .unwrap()
     }
 
     #[test]
-    fn empty_permissions_allow_everything() {
-        let p = perms(&[]);
+    fn empty_permissions_without_opt_in_are_rejected() {
+        let args: Vec<String> = vec![];
+        let err = build_permissions(
+            &args,
+            false,
+            false,
+            parser(),
+            std::env::current_dir().unwrap().as_path(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, LibdenoError::Permission(_)),
+            "expected permission error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn empty_permissions_with_prompt_are_all_prompt_state() {
+        // Empty list + prompt: no construction error — every capability starts
+        // in the Prompt state, so each access is asked interactively (the
+        // v0.2.0 empty-list error does not apply with prompt: true).
+        let p = perms(&[], false, true);
+        assert_eq!(
+            p.query_read(Some("/etc/passwd")).unwrap(),
+            PermissionState::Prompt
+        );
+        assert_eq!(
+            p.query_net(Some("example.com")).unwrap(),
+            PermissionState::Prompt
+        );
+    }
+
+    #[test]
+    fn prompt_keeps_flag_grants_and_prompts_the_rest() {
+        // Flags still grant with prompt: true; everything outside them is left
+        // in the Prompt state for interactive asking instead of being denied.
+        let p = perms(&["--allow-read=./src"], false, true);
+        assert_eq!(
+            p.query_read(Some("./src/lib.rs")).unwrap(),
+            PermissionState::Granted
+        );
+        assert_eq!(
+            p.query_read(Some("./target/x")).unwrap(),
+            PermissionState::Prompt
+        );
+        assert_eq!(
+            p.query_net(Some("example.com")).unwrap(),
+            PermissionState::Prompt
+        );
+    }
+
+    #[test]
+    fn allow_all_opt_in_grants_everything() {
+        let p = perms(&[], true, false);
         assert_eq!(
             p.query_read(Some("/etc/passwd")).unwrap(),
             PermissionState::Granted
@@ -182,8 +274,24 @@ mod tests {
     }
 
     #[test]
+    fn allow_all_opt_in_wins_over_flags() {
+        // The opt-in is checked before flag parsing: with allow_all set, any
+        // flags are ignored and everything is granted (documented precedence,
+        // so embedders cannot accidentally combine opt-in with restrictions).
+        let p = perms(&["--allow-read=./src"], true, false);
+        assert_eq!(
+            p.query_read(Some("/etc/passwd")).unwrap(),
+            PermissionState::Granted
+        );
+        assert_eq!(
+            p.query_net(Some("example.com")).unwrap(),
+            PermissionState::Granted
+        );
+    }
+
+    #[test]
     fn allow_all_flag_grants_everything() {
-        let p = perms(&["-A"]);
+        let p = perms(&["-A"], false, false);
         assert_eq!(
             p.query_read(Some("/etc/passwd")).unwrap(),
             PermissionState::Granted
@@ -199,8 +307,14 @@ mod tests {
         for bad in ["-A=anything", "--allow-all=x"] {
             let args = vec![bad.to_string()];
             assert!(
-                build_permissions(&args, parser(), std::env::current_dir().unwrap().as_path())
-                    .is_err(),
+                build_permissions(
+                    &args,
+                    false,
+                    false,
+                    parser(),
+                    std::env::current_dir().unwrap().as_path()
+                )
+                .is_err(),
                 "`{bad}` must be rejected, not grant allow-all"
             );
         }
@@ -209,14 +323,19 @@ mod tests {
     #[test]
     fn allow_import_is_rejected() {
         let args = vec!["--allow-import=https://x".to_string()];
-        assert!(
-            build_permissions(&args, parser(), std::env::current_dir().unwrap().as_path()).is_err()
-        );
+        assert!(build_permissions(
+            &args,
+            false,
+            false,
+            parser(),
+            std::env::current_dir().unwrap().as_path()
+        )
+        .is_err());
     }
 
     #[test]
     fn explicit_flags_restrict_read_to_paths() {
-        let p = perms(&["--allow-read=./src,./public"]);
+        let p = perms(&["--allow-read=./src,./public"], false, false);
         assert_eq!(
             p.query_read(Some("./src/lib.rs")).unwrap(),
             PermissionState::Granted
@@ -237,7 +356,7 @@ mod tests {
 
     #[test]
     fn flag_without_value_allows_capability_globally() {
-        let p = perms(&["--allow-net"]);
+        let p = perms(&["--allow-net"], false, false);
         assert_eq!(
             p.query_net(Some("example.com")).unwrap(),
             PermissionState::Granted
@@ -250,7 +369,7 @@ mod tests {
 
     #[test]
     fn net_flag_restricts_to_hosts() {
-        let p = perms(&["--allow-net=example.com:8080"]);
+        let p = perms(&["--allow-net=example.com:8080"], false, false);
         assert_eq!(
             p.query_net(Some("example.com:8080")).unwrap(),
             PermissionState::Granted
@@ -267,7 +386,7 @@ mod tests {
 
     #[test]
     fn env_flag_restricts_to_names() {
-        let p = perms(&["--allow-env=HOME,PATH"]);
+        let p = perms(&["--allow-env=HOME,PATH"], false, false);
         assert_eq!(p.query_env(Some("HOME")), PermissionState::Granted);
         assert_eq!(p.query_env(Some("PATH")), PermissionState::Granted);
         assert_eq!(p.query_env(Some("SECRET")), PermissionState::Prompt);
@@ -276,8 +395,14 @@ mod tests {
     #[test]
     fn unknown_flags_are_rejected() {
         let args = vec!["--allow-read=.".to_string(), "--bogus-flag".to_string()];
-        let err = build_permissions(&args, parser(), std::env::current_dir().unwrap().as_path())
-            .unwrap_err();
+        let err = build_permissions(
+            &args,
+            false,
+            false,
+            parser(),
+            std::env::current_dir().unwrap().as_path(),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, LibdenoError::Permission(_)),
             "expected permission error, got {err:?}"
@@ -289,22 +414,36 @@ mod tests {
         // A typo like `--allow-raed=/etc` must error, not silently fall back to
         // allow-all (the previous behavior).
         let args = vec!["--allow-raed=/etc".to_string()];
-        assert!(
-            build_permissions(&args, parser(), std::env::current_dir().unwrap().as_path()).is_err()
-        );
+        assert!(build_permissions(
+            &args,
+            false,
+            false,
+            parser(),
+            std::env::current_dir().unwrap().as_path()
+        )
+        .is_err());
     }
 
     #[test]
     fn empty_flag_value_is_rejected() {
         let args = vec!["--allow-read=".to_string()];
-        assert!(
-            build_permissions(&args, parser(), std::env::current_dir().unwrap().as_path()).is_err()
-        );
+        assert!(build_permissions(
+            &args,
+            false,
+            false,
+            parser(),
+            std::env::current_dir().unwrap().as_path()
+        )
+        .is_err());
     }
 
     #[test]
     fn repeated_flags_accumulate() {
-        let p = perms(&["--allow-read=./src", "--allow-read=./public"]);
+        let p = perms(
+            &["--allow-read=./src", "--allow-read=./public"],
+            false,
+            false,
+        );
         assert_eq!(
             p.query_read(Some("./src/lib.rs")).unwrap(),
             PermissionState::Granted

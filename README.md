@@ -18,7 +18,7 @@ libdeno is a Rust crate that embeds a full Deno runtime (V8 + the official modul
 - **npm integration**: automatically discovers and uses an existing `node_modules` (BYONM); installs on demand otherwise (managed mode). Supports CJS packages and `.node` native addons. npm lifecycle scripts do not run by default (matching deno CLI 2.x).
 - **`child_process.fork` support**: the npm resolution snapshot propagates to child processes.
 - **Web Workers**: `new Worker(...)` nested workers reuse the same module loader and snapshot.
-- **Permission model**: CLI-style `--allow-*` capability strings; an empty list allows everything by default.
+- **Permission model**: CLI-style `--allow-*` capability strings; permissions are opt-in — an empty list is a construction error unless `allow_all_permissions` is set.
 - **Unstable APIs enabled out of the box**: `Deno.openKv`, cron, FFI, WebGPU, etc. (an "everything enabled" stance, like `deno run --unstable`).
 - **Prebuilt V8 snapshot**: runtime extensions are compiled into a snapshot at build time for faster cold start.
 
@@ -51,7 +51,7 @@ let exit_code = run("app.js", &options).unwrap();
 use libdeno::{LibdenoRuntime, LibdenoOptions, run_with};
 
 let runtime = LibdenoRuntime::new("./my-app").await.unwrap();
-let options = LibdenoOptions::default();
+let options = LibdenoOptions { allow_all_permissions: true, ..Default::default() };
 let exit_code = run_with(&runtime, "app.js", &options).unwrap();
 ```
 
@@ -89,12 +89,13 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `run_with(&runtime, entry, &options) -> Result<i32, LibdenoError>` | Like `run`, but reuses `runtime`'s resolver stack. Semantics identical to `run` (cwd lock, tokio re-entry check, exit codes, deadlines); the script runs in the runtime's cwd and permission-bound components are rebuilt per call. |
 | `run_in_subprocess(entry, &options) -> Result<i32, LibdenoError>` | Runs the entry in a child process. `Deno.exit(n)` then terminates only the child; the host stays alive and observes `n`. The host must call `maybe_handle_child_mode()` at the start of `main()`. |
 | `maybe_handle_child_mode() -> bool` | Services `run_in_subprocess` child requests. Returns `false` on a normal host launch; in child mode it executes the script and exits with its code. |
-| `LibdenoOptions.permissions: Vec<String>` | `--allow-*` capability strings. An empty list allows everything; passing any entry restricts the runtime to the declared capabilities. |
+| `LibdenoOptions.permissions: Vec<String>` | `--allow-*` capability strings. An empty list is a construction error (`LibdenoError::Permission`) — pass capability flags or set `allow_all_permissions`; passing any entry restricts the runtime to the declared capabilities. |
+| `LibdenoOptions.allow_all_permissions: bool` | Grants every capability (`-A` equivalent). Required to run scripts with an empty `permissions` list. Use only for code you trust (see SECURITY.md). |
 | `LibdenoOptions.args: Vec<String>` | Arguments exposed to the script via `process.argv` (after argv[0]). |
 | `LibdenoOptions.cwd: Option<PathBuf>` | Working directory that relative paths (entry, permissions, `node_modules` discovery) resolve against. Defaults to the process current directory. |
 | `LibdenoOptions.max_heap_bytes: Option<usize>` | Hard cap on the V8 old-generation heap in bytes; V8 aborts with OOM when hit. Applies to the main worker **and** web workers spawned via `new Worker(...)`. |
 | `LibdenoOptions.execution_deadline: Option<Duration>` | Hard wall-clock limit; on expiry the isolate is force-terminated and the run fails with `LibdenoError::Timeout`. Does **not** interrupt blocking system calls (NFS-hung file reads, synchronous `Deno.Command` waits) — those unwind only when the syscall itself returns, so the run can exceed the deadline by the syscall's duration. |
-| `LibdenoError` | Enum: `Entry` (entry resolution failed), `Permission` (invalid permission flag), `Runtime`, `Core`, `Js` (script exception), `Io`, `Timeout` (deadline exceeded, isolate terminated). |
+| `LibdenoError` | Enum: `Entry` (entry resolution failed), `Permission` (invalid permission flags / empty list without opt-in), `Runtime`, `Core` (script exception), `Io`, `Timeout` (deadline exceeded, isolate terminated). |
 
 Supported permission flags: `--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`, plus `-A` / `--allow-all`.
 

@@ -52,8 +52,13 @@ fn main() {
         .cloned()
         .collect();
 
+    // Since v0.2.0 an empty permission list is a construction error, not
+    // allow-all. Grant everything only when the user passed no --allow-*
+    // flags; explicit flags keep their restrictive meaning.
+    let allow_all = permissions.is_empty();
     let options = LibdenoOptions {
         permissions,
+        allow_all_permissions: allow_all,
         args: script_args,
         cwd: None,
         ..Default::default()
@@ -73,7 +78,6 @@ fn print_error(e: &LibdenoError) {
         LibdenoError::Permission(e) => eprintln!("permission error: {e}"),
         LibdenoError::Runtime(e) => eprintln!("error: {e}"),
         LibdenoError::Core(e) => eprintln!("runtime error: {e}"),
-        LibdenoError::Js(e) => eprintln!("script error: {e}"),
         LibdenoError::Io(e) => eprintln!("io error: {e}"),
         LibdenoError::Timeout(d) => eprintln!("execution deadline exceeded: {d:?}"),
     }

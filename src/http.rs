@@ -59,17 +59,15 @@ impl ReqwestHttpClient {
 }
 
 /// Reads the full (already auto-decompressed) response body into a Vec,
-/// failing once the accumulated size exceeds the per-request cap instead of
-/// buffering an unbounded response. The cap is chosen from the declared
-/// Content-Length: a response claiming more than the module cap is a
-/// tarball-sized download (npm packages) and gets the larger tarball bound;
-/// everything else — and every chunked response without Content-Length —
-/// stays on the module cap. Over-limit is an error, never a retry.
-async fn read_body_limited(response: &mut reqwest::Response) -> Result<Vec<u8>, String> {
-    let limit = match response.content_length() {
-        Some(len) if len as usize > MAX_RESPONSE_BODY_BYTES => MAX_TARBALL_BODY_BYTES,
-        _ => MAX_RESPONSE_BODY_BYTES,
-    };
+/// failing once the accumulated size exceeds the caller-supplied `limit`
+/// instead of buffering an unbounded response. The caller picks the bound:
+/// module fetches pin the module cap, npm registry downloads tier by declared
+/// Content-Length via [`npm_body_limit`]. Over-limit is an error, never a
+/// retry.
+async fn read_body_limited(
+    response: &mut reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -82,6 +80,23 @@ async fn read_body_limited(response: &mut reqwest::Response) -> Result<Vec<u8>, 
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Body cap for npm registry downloads: responses declaring more than the
+/// module cap are tarball-sized and get the larger tarball bound; everything
+/// else — and every chunked response without Content-Length — stays on the
+/// module cap.
+///
+/// ponytail: still trusts the *declared* Content-Length for tiering — a
+/// malicious or compromised registry can claim a huge length on any response
+/// (metadata included) and win the 1 GiB budget, so a decompression bomb up
+/// to 1 GiB remains possible. The cap itself is never exceeded. Tighten to
+/// tarball-path checks only if this is abused in practice.
+fn npm_body_limit(content_length: Option<u64>) -> usize {
+    match content_length {
+        Some(len) if len as usize > MAX_RESPONSE_BODY_BYTES => MAX_TARBALL_BODY_BYTES,
+        _ => MAX_RESPONSE_BODY_BYTES,
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -127,7 +142,10 @@ impl HttpClient for ReqwestHttpClient {
                     if status.is_success() {
                         let headers = response.headers().clone();
                         let mut response = response;
-                        let body = read_body_limited(&mut response)
+                        // Module fetches are pinned to the module cap: a
+                        // malicious module server declaring a huge
+                        // Content-Length must not buy a larger budget.
+                        let body = read_body_limited(&mut response, MAX_RESPONSE_BODY_BYTES)
                             .await
                             .map_err(|e| SendError::Failed(e.into()))?;
                         return Ok(SendResponse::Success(headers, body));
@@ -221,7 +239,8 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
                             .and_then(|v| v.to_str().ok())
                             .map(String::from);
                         let mut response = response;
-                        let bytes = read_body_limited(&mut response).await.map_err(|e| {
+                        let limit = npm_body_limit(response.content_length());
+                        let bytes = read_body_limited(&mut response, limit).await.map_err(|e| {
                             err(None, format!("failed to read npm registry response: {e}"))
                         })?;
                         return Ok(NpmCacheHttpClientResponse::Bytes(
@@ -427,13 +446,11 @@ mod tests {
 
     #[test]
     fn body_over_module_cap_is_an_error() {
-        // P2: a response whose declared length is unknown (stream-backed body,
-        // as chunked responses arrive on the wire) is bounded by the module
-        // cap; an oversized stream trips the limit without transferring
-        // 256MiB+ over a socket. Note: reqwest::Response::from infers
-        // content_length from the concrete body size, so a Vec body always
-        // reports its real length and lands on the tarball branch — a stream
-        // (unknown length) is required to exercise the module-cap branch.
+        // P2: an oversized stream (unknown length, as chunked responses
+        // arrive on the wire) trips the module cap without transferring
+        // 256MiB+ over a socket. reqwest::Response::from infers
+        // content_length from a concrete Vec body, so the stream keeps the
+        // test honest about the chunked (no Content-Length) case.
         use futures_util::stream;
         use reqwest::Body;
         let oversized = http::Response::builder()
@@ -444,25 +461,51 @@ mod tests {
             .unwrap();
         let mut response = reqwest::Response::from(oversized);
         runtime().block_on(async {
-            let err = read_body_limited(&mut response).await.unwrap_err();
+            let err = read_body_limited(&mut response, MAX_RESPONSE_BODY_BYTES)
+                .await
+                .unwrap_err();
             assert!(err.contains("limit"), "unexpected error: {err}");
         });
     }
 
     #[test]
     fn declared_large_content_length_gets_tarball_cap() {
-        // P2: Content-Length above the module cap selects the 1GiB tarball
-        // bound, so a 257MiB body that would trip the module cap is accepted.
-        let size = (256 << 20) + 1;
-        let declared = http::Response::builder()
+        // P2: Content-Length tiering now lives only in `npm_body_limit`, for
+        // npm registry downloads: a response claiming more than the module cap
+        // gets the 1GiB tarball bound, everything else — and every chunked
+        // response without Content-Length — stays on the module cap.
+        //
+        // `npm_body_limit` takes the raw content length because
+        // `reqwest::Response::from` re-derives it from a concrete Vec body and
+        // drops a declared header (a stream body yields None), so no mock
+        // response can carry an arbitrary declared length into the helper.
+        //
+        // The module-fetch path no longer reads Content-Length to pick its
+        // bound: `send_no_follow` pins every module request to the module cap,
+        // so a malicious module server declaring a huge Content-Length cannot
+        // buy itself a 1GiB budget. A network test proving that pin would need
+        // to push >256MiB over a socket, so it is asserted here structurally
+        // (the fixed call site) instead.
+        let size = ((256 << 20) + 1) as u64;
+        assert_eq!(npm_body_limit(Some(size)), MAX_TARBALL_BODY_BYTES);
+        // A module-cap-sized declaration stays on the module cap.
+        assert_eq!(npm_body_limit(Some(1024)), MAX_RESPONSE_BODY_BYTES);
+        // Chunked (no Content-Length) stays on the module cap.
+        assert_eq!(npm_body_limit(None), MAX_RESPONSE_BODY_BYTES);
+    }
+
+    #[test]
+    fn read_body_limited_respects_the_passed_limit() {
+        // The limit is a caller-provided parameter now (module fetches and npm
+        // downloads diverge): a small custom limit must trip on a small body.
+        let small = http::Response::builder()
             .status(200)
-            .header("Content-Length", size as u64)
-            .body(reqwest::Body::from(vec![0u8; size]))
+            .body(reqwest::Body::from(vec![0u8; 16]))
             .unwrap();
-        let mut response = reqwest::Response::from(declared);
+        let mut response = reqwest::Response::from(small);
         runtime().block_on(async {
-            let body = read_body_limited(&mut response).await.unwrap();
-            assert_eq!(body.len(), size);
+            let err = read_body_limited(&mut response, 4).await.unwrap_err();
+            assert!(err.contains("limit"), "unexpected error: {err}");
         });
     }
 

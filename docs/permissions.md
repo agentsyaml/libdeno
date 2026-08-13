@@ -5,12 +5,15 @@ libdeno's permission model mirrors the Deno CLI: capability strings in
 
 ## Default stance
 
-An **empty** `permissions` list grants **everything**. This matches the
-CLI's `-A`/`--allow-all` and is intentional for an embedded runtime: you opt
-into restrictions.
+Since v0.2.0 the model is **explicit opt-in**: an **empty** `permissions`
+list is a **construction error** (`LibdenoError::Permission`) — it grants
+nothing. To run with every capability, either set
+`LibdenoOptions.allow_all_permissions = true` (the `-A` equivalent) or pass
+`-A`/`--allow-all` in the `permissions` list. Use the allow-all escape hatch
+only for code you trust (see SECURITY.md).
 
-Passing **any** entry restricts the runtime to the declared capabilities.
-A flag without a value allows that capability globally
+Passing **any** other entry restricts the runtime to the declared
+capabilities. A flag without a value allows that capability globally
 (`--allow-read` == read anywhere); with a comma-separated value only the
 listed descriptors are allowed (`--allow-read=./src,./public`).
 
@@ -25,23 +28,63 @@ listed descriptors are allowed (`--allow-read=./src,./public`).
 | `--allow-run` | executable names | `--allow-run=git` |
 | `--allow-ffi` | native library paths | `--allow-ffi=./libfoo.so` |
 | `--allow-sys` | system API names | `--allow-sys=getpid` |
-| `-A` / `--allow-all` | — | allow everything (the default) |
+| `-A` / `--allow-all` | — | allow everything (same as `allow_all_permissions: true`) |
 
 Deny/ignore forms (`--deny-*`, `--ignore-*`) are not currently exposed, and
 any unrecognized flag is rejected with a permission error rather than silently
 ignored (an unknown flag must never silently widen the granted scope).
-`prompt` is always off (no interactive prompts in an embedded runtime).
+
+## Interactive prompting (`prompt`)
+
+By default `prompt` is off: anything not granted is denied. Set
+`LibdenoOptions.prompt = true` to mirror `deno run`'s default interactive
+behavior: a non-granted check prints to stderr and reads allow/deny from
+stdin, blocking the run while it waits. The upstream prompter requires a
+terminal stdin (`is_terminal()`); a headless host without one sees every such
+query denied without reading.
+
+Three combinations:
+
+| `permissions` | `prompt` | Behavior |
+|---|---|---|
+| empty | `false` | construction error (the v0.2.0 default) |
+| empty | `true` | every access is asked interactively |
+| flags | `true` | flags grant, everything else is asked |
+| flags | `false` | flags grant, everything else is denied |
+
+In subprocess mode (`run_in_subprocess`) the child's stdin is a pipe (consumed
+by the request JSON), so the prompter's terminal check denies without reading —
+`prompt: true` in a child is equivalent to fail-closed deny; real interaction
+only makes sense for in-process `run`.
 
 Repeated flags accumulate like the CLI: `--allow-read=./a --allow-read=./b`
 grants both paths. A flag with an empty value (`--allow-read=`) is an error,
 not a silent grant.
 
+## Broker hooks
+
+`install_permission_broker(path)` and `install_permission_hook(hook)` install a
+process-global, install-once permission decision hook (see
+[docs/api.md](api.md)). Once installed, the broker/hook is the **sole
+authority** for every permission check in the process — including
+already-granted capabilities — so local flags are no longer consulted (upstream
+deno semantics). `install_permission_broker` talks to an external process over
+a Unix socket / Windows named pipe (the JSON-line protocol deno uses for
+jupyter/LSP); `install_permission_hook` serves an in-process closure the same
+way (Unix only). The two are mutually exclusive, and neither can be installed
+more than once per process.
+
+Decision priority: broker/hook (if installed) → flag grants → interactive
+prompt when `prompt: true` → deny.
+
 ## How it works
 
 `build_permissions` (`src/permissions.rs`) splits each flag on `=`, parses the
-comma-separated value, and fills a `PermissionsOptions` struct. If no
-`--allow-*` flag was seen, it returns
-`PermissionsContainer::allow_all`. Otherwise it constructs a
+comma-separated value, and fills a `PermissionsOptions` struct. If
+`LibdenoOptions.allow_all_permissions` is set (or the `-A`/`--allow-all`
+string appears), it returns `PermissionsContainer::allow_all` immediately.
+If no `--allow-*` flag was seen, it returns a permission error — an empty
+list no longer silently grants everything. Otherwise it constructs a
 `Permissions` from the options and wraps it.
 
 The parsed container is:

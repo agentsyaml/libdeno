@@ -120,9 +120,14 @@ fn stat_fingerprint(path: &Path) -> Option<(u64, u64)> {
     Some((mtime, meta.len()))
 }
 
-/// Content hash of a small file, None when absent or unreadable. The cache is
-/// process-local, so DefaultHasher (no cross-process stability guarantee) is
-/// fine here. Reused by the runtime's config fingerprint (runtime.rs).
+/// Content hash of a small file, None when absent or unreadable.
+///
+/// DefaultHasher is non-cryptographic and its output is not guaranteed stable
+/// across Rust versions or platforms, so this value is only comparable within
+/// a single process. That is safe today: it is used solely for in-process
+/// config fingerprint comparison (runtime.rs's config_fingerprint). If the
+/// fingerprint is ever persisted to disk or compared across processes, switch
+/// to a stable hash (e.g. xxh3 or sha256).
 pub(crate) fn content_hash(path: &Path) -> Option<u64> {
     let bytes = std::fs::read(path).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();

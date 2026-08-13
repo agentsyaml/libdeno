@@ -23,6 +23,7 @@ mod limits;
 mod module_loader;
 mod node_loader;
 mod npm_cache;
+mod permission_broker;
 mod permissions;
 mod runtime;
 mod services;
@@ -46,6 +47,9 @@ use deno_runtime::worker::WorkerOptions;
 use deno_runtime::worker::WorkerServiceOptions;
 use deno_runtime::BootstrapOptions;
 
+pub use permission_broker::{
+    install_permission_broker, install_permission_hook, PermissionPrompt, PermissionRequest,
+};
 pub use runtime::{run_with, LibdenoRuntime};
 pub use subprocess::{maybe_handle_child_mode, run_in_subprocess};
 
@@ -115,10 +119,27 @@ pub struct LibdenoOptions {
     /// Permission capability strings in `--allow-*` CLI format, e.g.
     /// `"--allow-read=./src"`, `"--allow-net=example.com:8080"`.
     ///
-    /// An empty list grants everything (the default). Passing any entry
-    /// restricts the runtime to the declared capabilities; a flag without a
-    /// value allows that capability globally.
+    /// Since v0.2.0 an empty list is a construction error — it no longer
+    /// grants anything — unless [`Self::allow_all_permissions`] is set.
+    /// Passing any entry restricts the runtime to the declared capabilities; a
+    /// flag without a value allows that capability globally. `-A`/`--allow-all`
+    /// is equivalent to `allow_all_permissions`.
     pub permissions: Vec<String>,
+    /// Explicitly grant every capability (`-A` equivalent). Required to run
+    /// scripts with an empty `permissions` list — since v0.2.0 an empty list
+    /// no longer grants anything; it is a construction error unless this flag
+    /// is set. Use it only for code you trust (see SECURITY.md).
+    pub allow_all_permissions: bool,
+    /// Interactive permission prompting for non-granted queries, mirroring
+    /// `deno run`'s default behavior: the check prints to stderr and reads
+    /// allow/deny from stdin (blocking the run while it waits — the upstream
+    /// prompter requires a terminal stdin, so headless hosts see every such
+    /// query denied without reading).
+    ///
+    /// With `prompt: true` and an empty `permissions` list, every access is
+    /// asked interactively (the v0.2.0 empty-list error does not apply);
+    /// with flags, flags grant and everything else is asked.
+    pub prompt: bool,
     /// Arguments exposed to the script via `process.argv` (after `argv[0]`).
     pub args: Vec<String>,
     /// Working directory that relative paths (entry, permissions, node_modules
@@ -151,9 +172,6 @@ pub enum LibdenoError {
     /// A JS exception escaped the event loop (module execution / event loop).
     #[error("{0}")]
     Core(#[from] deno_core::error::CoreError),
-    /// A JS exception escaped one of the lifecycle event dispatches.
-    #[error("{0}")]
-    Js(#[from] Box<deno_core::error::JsError>),
     /// I/O failure in the host (cwd resolution).
     #[error("{0}")]
     Io(#[from] std::io::Error),
@@ -161,6 +179,15 @@ pub enum LibdenoError {
     /// was force-terminated.
     #[error("execution deadline of {0:?} exceeded; isolate terminated")]
     Timeout(std::time::Duration),
+}
+
+// The lifecycle event dispatches (`dispatch_load_event` and friends) return
+// `Result<_, Box<JsError>>`; funnel those through the Runtime variant via
+// anyhow instead of keeping a dedicated (never-constructed) enum variant.
+impl From<Box<deno_core::error::JsError>> for LibdenoError {
+    fn from(e: Box<deno_core::error::JsError>) -> Self {
+        LibdenoError::Runtime(deno_core::anyhow::Error::new(e))
+    }
 }
 
 /// Runs `entry` (a file, a directory, or a package.json) to completion and
@@ -201,6 +228,10 @@ async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, Libden
     // Deno.cwd() (canonical) from relative grants/entry (aliased).
     let cwd_raw = options.cwd.clone().unwrap_or(std::env::current_dir()?);
     let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
+    // Deliberately keep this guard: `run_with` goes straight into
+    // `run_inner_with` (which sets a second guard), and `run_inner` builds
+    // SharedServices while this guard is in effect. The double guard is
+    // redundant but correct — merging them is not worth the micro-refactor.
     let _cwd_guard = CwdGuard::set(&cwd);
     let main_module = resolve_entry(entry, &cwd).map_err(LibdenoError::Entry)?;
     let config_start_paths = main_module
@@ -223,17 +254,28 @@ pub(crate) async fn run_inner_with(
     options: &LibdenoOptions,
 ) -> Result<i32, LibdenoError> {
     // rustls needs an explicit CryptoProvider (aws-lc-rs and ring are both
-    // enabled in the dep graph); the deno CLI does the same.
-    let _ = deno_runtime::deno_tls::rustls::crypto::CryptoProvider::install_default(
-        deno_runtime::deno_tls::rustls::crypto::aws_lc_rs::default_provider(),
-    );
+    // enabled in the dep graph); the deno CLI does the same. Only install when
+    // the host has not already set one — install_default returns Err exactly
+    // when a provider is already installed, so with this guard the result can
+    // no longer fail silently.
+    if deno_runtime::deno_tls::rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = deno_runtime::deno_tls::rustls::crypto::CryptoProvider::install_default(
+            deno_runtime::deno_tls::rustls::crypto::aws_lc_rs::default_provider(),
+        );
+    }
     let _cwd_guard = CwdGuard::set(&cwd);
     let main_module = resolve_entry(entry, &cwd).map_err(LibdenoError::Entry)?;
 
     let fs: Arc<dyn FileSystem> = Arc::new(RealFs);
     let permission_parser =
         Arc::new(deno_runtime::deno_permissions::RuntimePermissionDescriptorParser::new(RealSys));
-    let permissions = build_permissions(&options.permissions, permission_parser.clone(), &cwd)?;
+    let permissions = build_permissions(
+        &options.permissions,
+        options.allow_all_permissions,
+        options.prompt,
+        permission_parser.clone(),
+        &cwd,
+    )?;
     let services = Arc::new(
         RuntimeServices::new(shared, cwd, permissions.clone()).map_err(LibdenoError::Runtime)?,
     );
@@ -429,7 +471,47 @@ fn package_main(pkg_path: &Path) -> Result<PathBuf, AnyError> {
         .get("main")
         .and_then(|v| v.as_str())
         .unwrap_or("index.js");
-    Ok(pkg_path.parent().unwrap_or(Path::new(".")).join(main))
+    let dir = pkg_path.parent().unwrap_or(Path::new("."));
+    let main_path = dir.join(main);
+    // Reject `main` values that escape the package directory. `Path::join`
+    // replaces the base for absolute paths (strip_prefix fails, caught
+    // directly); relative `..` components are normalized lexically — a `..`
+    // that walks back into the package (`lib/../index.js`) is fine, one that
+    // pops above `dir` (`../escape.js`) is not. (Symlinked components are not
+    // resolved: the entry directory is host-selected, so this is a sanity
+    // guard, not a boundary.)
+    use std::path::Component;
+    let escaped = match main_path.strip_prefix(dir) {
+        Err(_) => true,
+        Ok(rest) => {
+            let mut depth: i64 = 0;
+            let mut escaped = false;
+            for c in rest.components() {
+                match c {
+                    Component::Normal(_) => depth += 1,
+                    Component::CurDir => {}
+                    Component::ParentDir => {
+                        if depth == 0 {
+                            escaped = true;
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    Component::RootDir | Component::Prefix(_) => {
+                        escaped = true;
+                        break;
+                    }
+                }
+            }
+            escaped
+        }
+    };
+    if escaped {
+        return Err(deno_core::anyhow::anyhow!(
+            "package.json `main` field {main:?} escapes the package directory"
+        ));
+    }
+    Ok(main_path)
 }
 
 #[cfg(test)]
@@ -494,6 +576,53 @@ mod tests {
         std::fs::write(dir.join("app.ts"), "").unwrap();
         let spec = resolve_entry(Path::new("app.ts"), &dir).unwrap();
         assert_eq!(spec.to_file_path().unwrap(), dir.join("app.ts"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn package_main_escaping_the_package_dir_is_rejected() {
+        let dir = temp_dir("pkg-escape");
+        std::fs::write(dir.join("package.json"), r#"{"main":"../escape.js"}"#).unwrap();
+        let err = resolve_entry(&dir, &dir).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes"),
+            "expected an escape rejection, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn package_main_internal_dotdot_is_allowed() {
+        // A `..` that normalizes back inside the package (`src/../lib/index.js`)
+        // is not an escape: the guard rejects only paths that pop above the
+        // package directory, not every ParentDir component.
+        let dir = temp_dir("pkg-internal-dotdot");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"main":"src/../lib/index.js"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/index.js"), "").unwrap();
+        let spec = resolve_entry(&dir, &dir).unwrap();
+        assert_eq!(
+            spec.to_file_path().unwrap(),
+            dir.join("src/../lib/index.js")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn package_main_absolute_main_is_rejected() {
+        // `Path::join` replaces the base for absolute paths, so an absolute
+        // `main` must be rejected as an escape (strip_prefix fails).
+        let dir = temp_dir("pkg-abs-main");
+        std::fs::write(dir.join("package.json"), r#"{"main":"/etc/passwd"}"#).unwrap();
+        let err = resolve_entry(&dir, &dir).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes"),
+            "expected an escape rejection, got: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -33,10 +33,35 @@ fn run_with_happy_path_returns_exit_code() {
     let entry = dir.join("main.js");
     fs::write(&entry, "Deno.writeTextFileSync('out.txt', Deno.cwd());").unwrap();
     let runtime = build_runtime(&dir);
-    let code = run_with(&runtime, &entry, &LibdenoOptions::default()).unwrap();
+    let code = run_with(
+        &runtime,
+        &entry,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(code, 0);
     let expected = fs::canonicalize(&dir).unwrap().display().to_string();
     assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), expected);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_with_default_permissions_is_rejected() {
+    // The v0.2.0 default-permission semantics apply through the reusable
+    // runtime entry point too: empty permissions without the opt-in must fail
+    // with a Permission error, never silently allow-all.
+    let dir = temp_dir("default-perm");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('never runs');").unwrap();
+    let runtime = build_runtime(&dir);
+    let err = run_with(&runtime, &entry, &LibdenoOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, libdeno::LibdenoError::Permission(_)),
+        "expected a permission error, got: {err}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -48,7 +73,10 @@ fn run_with_reuse_produces_identical_results() {
     let entry = dir.join("main.js");
     fs::write(&entry, "Deno.writeTextFileSync('out.txt', 'same-result');").unwrap();
     let runtime = build_runtime(&dir);
-    let options = LibdenoOptions::default();
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
     assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
     assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
     assert_eq!(
@@ -83,7 +111,10 @@ fn run_with_rebuilds_when_config_changes() {
     };
     write_config("a");
     let runtime = build_runtime(&dir);
-    let options = LibdenoOptions::default();
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
     assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
     assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), "a");
     write_config("b");
@@ -118,9 +149,17 @@ fn run_with_does_not_leak_permissions_between_runs() {
     )
     .unwrap();
     let runtime = build_runtime(&dir);
-    // Run 1: allow-all (empty permission list) -> the external module loads
-    // and reads.
-    let code = run_with(&runtime, &entry, &LibdenoOptions::default()).unwrap();
+    // Run 1: allow-all (allow_all_permissions opt-in) -> the external module
+    // loads and reads.
+    let code = run_with(
+        &runtime,
+        &entry,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(code, 0);
     // Run 2: read granted only inside sub/ -> the read of shared.js (outside
     // sub/) must be denied (permission state is rebuilt per run, never leaked).

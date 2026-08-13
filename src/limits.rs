@@ -47,19 +47,38 @@ pub(crate) fn isolate_create_params(max_heap_bytes: Option<usize>) -> Option<v8:
 /// seam instead (module_loader.rs), which is out of scope here.
 const CODE_CACHE_MAX_ENTRIES: usize = 1024;
 
+/// Process-wide byte ceiling for compiled code cache entries; combined with
+/// the entry-count cap so a script evaling many distinct large sources cannot
+/// pin unbounded memory in the process (the cache lives in a process-wide
+/// OnceLock for the lifetime of the host).
+const CODE_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+
 /// (specifier, cache type, source hash) -> compiled script bytes.
 type CodeCacheKey = (String, CodeCacheType, u64);
 type CodeCacheEntry = (CodeCacheKey, Vec<u8>);
 
 struct InMemoryCodeCache {
-    /// FIFO vec (oldest first); the entry cap doubles as the eviction order.
-    entries: Mutex<Vec<CodeCacheEntry>>,
+    /// (entries FIFO oldest-first, total byte size of all entries).
+    state: Mutex<(Vec<CodeCacheEntry>, usize)>,
+    /// (max entries, max total bytes); tuned small in tests via `with_limits`.
+    limits: (usize, usize),
 }
 
 impl Default for InMemoryCodeCache {
     fn default() -> Self {
         Self {
-            entries: Mutex::new(Vec::new()),
+            state: Mutex::new((Vec::new(), 0)),
+            limits: (CODE_CACHE_MAX_ENTRIES, CODE_CACHE_MAX_BYTES),
+        }
+    }
+}
+
+#[cfg(test)]
+impl InMemoryCodeCache {
+    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            limits: (max_entries, max_bytes),
+            ..Default::default()
         }
     }
 }
@@ -72,9 +91,10 @@ impl CodeCache for InMemoryCodeCache {
         source_hash: u64,
     ) -> Option<Vec<u8>> {
         let key = (specifier.as_str().to_owned(), code_cache_type, source_hash);
-        self.entries
+        self.state
             .lock()
             .unwrap()
+            .0
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, data)| data.clone())
@@ -88,14 +108,29 @@ impl CodeCache for InMemoryCodeCache {
         data: &[u8],
     ) {
         let key = (specifier.as_str().to_owned(), code_cache_type, source_hash);
-        let mut entries = self.entries.lock().unwrap();
+        let (max_entries, max_bytes) = self.limits;
+        let mut state = self.state.lock().unwrap();
+        let (entries, total) = &mut *state;
         if let Some(entry) = entries.iter_mut().find(|(k, _)| *k == key) {
+            // Replacing an existing key adjusts the running byte total — and
+            // falls through to the eviction loop: a larger replacement could
+            // push the total past the byte cap, and the invariant "total <=
+            // max_bytes" must hold on every path out of set_sync. (Today the
+            // key includes the source hash, so same key ⇒ same size; keeping
+            // the loop uniform costs nothing and makes the cap unconditional.)
+            *total = *total - entry.1.len() + data.len();
             entry.1 = data.to_vec();
-            return;
+        } else {
+            entries.push((key, data.to_vec()));
+            *total += data.len();
         }
-        entries.push((key, data.to_vec()));
-        if entries.len() > CODE_CACHE_MAX_ENTRIES {
-            entries.remove(0);
+        // Evict oldest-first past either the entry cap or the byte cap. A
+        // single entry larger than max_bytes is evicted by its own insert
+        // (uncacheable scripts simply never cache) — intended: the cap is
+        // unconditional on every path out of set_sync.
+        while !entries.is_empty() && (entries.len() > max_entries || *total > max_bytes) {
+            let removed = entries.remove(0);
+            *total -= removed.1.len();
         }
     }
 }
@@ -175,6 +210,12 @@ where
     // `result` alone cannot tell whether the future unwound because the script
     // finished or because the deadline interrupted it; the flag set by the
     // terminator disambiguates for the caller's timeout error.
+    //
+    // Known small race: a script that completes exactly at the deadline can be
+    // reported as timed out if the terminator thread set `fired` in the
+    // instant before the completed result was observed. Safety-biased (a false
+    // timeout is observable by the caller; a missed deadline is not) and
+    // accepted.
     if fired.load(Ordering::SeqCst) {
         Err(deadline)
     } else {
@@ -224,6 +265,10 @@ static NODE_IPC_MARKER: OnceLock<bool> = OnceLock::new();
 /// IPC channel. Called from [`crate::run`] under CWD_LOCK, which serializes
 /// the env write (edition 2021: `set_var` is safe; concurrent runs in one
 /// process are already excluded).
+///
+/// Known tradeoff: the write also means ordinary subprocesses the host spawns
+/// afterwards inherit LIBDENO_SPAWNED_IPC=1; the entry-time capture (never a
+/// live read) still blocks the mainstream misuse of a foreign NODE_CHANNEL_FD.
 pub(crate) fn capture_spawned_ipc_marker() {
     NODE_IPC_MARKER.get_or_init(|| {
         let spawned = std::env::var(LIBDENO_SPAWNED_IPC).as_deref() == Ok("1");
@@ -329,6 +374,49 @@ mod tests {
         assert_eq!(
             cache.get_sync(&spec, CodeCacheType::EsModule, 1).unwrap(),
             b"esm"
+        );
+    }
+
+    #[test]
+    fn code_cache_byte_cap_evicts_oldest() {
+        // P2-3: the byte ceiling must evict oldest-first, exactly like the
+        // entry cap — a script evaling many distinct large sources cannot pin
+        // unbounded memory in the process-wide cache. Keys differ per round by
+        // source_hash (i), so each insert is a new entry.
+        let cache = InMemoryCodeCache::with_limits(1024, 100);
+        let spec = |i: u64| {
+            ModuleSpecifier::parse(&format!("file:///libdeno-byte-cap-test/{i}.js")).unwrap()
+        };
+        for i in 0..10 {
+            cache.set_sync(spec(i), CodeCacheType::Script, i, &[i as u8; 20]);
+        }
+        // 每条约 20 字节，100 字节上限只能容纳约 5 条；最旧条目必须被逐出。
+        assert!(cache.get_sync(&spec(0), CodeCacheType::Script, 0).is_none());
+        assert!(cache.get_sync(&spec(9), CodeCacheType::Script, 9).is_some());
+    }
+
+    #[test]
+    fn code_cache_replace_still_enforces_byte_cap() {
+        // Regression: the replace path used to return before the eviction
+        // loop, so growing a same-key entry could leave the total above the
+        // byte cap. The invariant "total <= max_bytes" must hold on every
+        // path out of set_sync.
+        let cache = InMemoryCodeCache::with_limits(1024, 100);
+        let spec = |i: u64| {
+            ModuleSpecifier::parse(&format!("file:///libdeno-replace-cap-test/{i}.js")).unwrap()
+        };
+        // 5 × 20 bytes = exactly 100 (the cap).
+        for i in 0..5 {
+            cache.set_sync(spec(i), CodeCacheType::Script, i, &[i as u8; 20]);
+        }
+        // Replacing the newest entry with a 60-byte value pushes the total to
+        // 140: the oldest entries must be evicted until it fits again.
+        cache.set_sync(spec(4), CodeCacheType::Script, 4, &[4u8; 60]);
+        assert!(cache.get_sync(&spec(0), CodeCacheType::Script, 0).is_none());
+        assert!(cache.get_sync(&spec(1), CodeCacheType::Script, 1).is_none());
+        assert_eq!(
+            cache.get_sync(&spec(4), CodeCacheType::Script, 4).unwrap(),
+            vec![4u8; 60]
         );
     }
 

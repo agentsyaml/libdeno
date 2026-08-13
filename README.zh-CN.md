@@ -14,7 +14,7 @@ English: [README.md](README.md)
 - **npm 集成**：自动发现并使用 `node_modules`（BYONM）；没有时按需安装（managed mode）。支持 CJS 包、`.node` 原生插件。npm 生命周期脚本默认不执行（与 deno CLI 2.x 一致）。
 - **`child_process.fork` 支持**：npm 解析快照随子进程传播。
 - **Web Worker**：`new Worker(...)` 嵌套 worker 复用同一模块加载器与快照。
-- **权限模型**：与 CLI 一致的 `--allow-*` 能力字符串；空列表默认放行一切。
+- **权限模型**：与 CLI 一致的 `--allow-*` 能力字符串；权限为显式选择——空列表是构造错误，除非设置 `allow_all_permissions`。
 - **开箱即用的 unstable API**：`Deno.openKv`、cron、FFI、WebGPU 等默认启用（匹配 `deno run --unstable` 的"全开"立场）。
 - **预构建 V8 快照**：构建时把运行时扩展编译进快照，冷启动更快。
 
@@ -69,10 +69,11 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `run(entry, &options) -> Result<i32, LibdenoError>` | 运行入口到完成，返回脚本请求的退出码。每次调用构建独立的 current-thread 运行时与 worker，多次调用完全隔离。 |
 | `run_in_subprocess(entry, &options) -> Result<i32, LibdenoError>` | 在子进程中运行入口。此时 `Deno.exit(n)` 只会终止子进程；宿主进程保持存活并拿到 `n`。宿主需在 `main()` 开头调用 `maybe_handle_child_mode()`。 |
 | `maybe_handle_child_mode() -> bool` | 服务 `run_in_subprocess` 的子进程请求。正常宿主启动时立即返回 `false`；子进程模式下执行脚本并以脚本退出码退出进程。 |
-| `LibdenoOptions.permissions: Vec<String>` | `--allow-*` 能力字符串。空列表 = 全部放行；传任意项则只放行声明的能力。 |
+| `LibdenoOptions.permissions: Vec<String>` | `--allow-*` 能力字符串。空列表是构造错误（`LibdenoError::Permission`）——请传入能力标志或设置 `allow_all_permissions`；传任意项则只放行声明的能力。 |
+| `LibdenoOptions.allow_all_permissions: bool` | 放行一切能力（等价于 `-A`）。空 `permissions` 列表要运行脚本必须设置它。只用于你信任的代码（见 SECURITY.md）。 |
 | `LibdenoOptions.args: Vec<String>` | 通过 `process.argv`（argv[0] 之后）暴露给脚本的参数。 |
 | `LibdenoOptions.cwd: Option<PathBuf>` | 相对路径（入口、权限、node_modules 发现）解析的工作目录，默认进程当前目录。 |
-| `LibdenoError` | 枚举：`Entry`（入口解析失败）、`Permission`（权限字符串非法）、`Runtime`、`Core`、`Js`（脚本异常）、`Io`。 |
+| `LibdenoError` | 枚举：`Entry`（入口解析失败）、`Permission`（权限字符串非法 / 空列表未显式选择）、`Runtime`、`Core`（脚本异常）、`Io`。 |
 
 支持的权限标志：`--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`，以及 `-A` / `--allow-all`。
 
