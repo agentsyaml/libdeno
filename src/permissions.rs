@@ -178,10 +178,12 @@ pub fn build_permissions(
                 .map_err(|e| LibdenoError::Permission(e.to_string()))?;
             return Ok(PermissionsContainer::new(parser, perms));
         }
-        return Err(LibdenoError::Permission(
-            "no permission flags provided; pass --allow-* capability flags, set \
-             LibdenoOptions.prompt = true for interactive prompting, or set \
-             LibdenoOptions.allow_all_permissions = true to grant all capabilities"
+        return Err(LibdenoError::Configuration(
+            "no permission flags provided; since v0.2.0 an empty list grants \
+             nothing (it was allow-all before v0.2.0). Pass --allow-* capability \
+             flags, set LibdenoOptions.prompt = true for interactive prompting, \
+             or set LibdenoOptions.allow_all_permissions = true to grant all \
+             capabilities"
                 .to_string(),
         ));
     }
@@ -223,8 +225,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, LibdenoError::Permission(_)),
-            "expected permission error, got {err:?}"
+            matches!(err, LibdenoError::Configuration(_)),
+            "expected configuration error, got {err:?}"
         );
     }
 

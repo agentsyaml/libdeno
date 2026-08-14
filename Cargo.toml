@@ -1,6 +1,6 @@
 [package]
 name = "libdeno"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 # Matches the toolchain pinned by deno v2.9.5 (rust-toolchain.toml); the deno
 # stack publishes no rust-version, and the v8 crate requires edition 2024.
@@ -60,6 +60,9 @@ tokio = { version = "1", features = ["rt", "time", "sync", "process"] }
 deno_fs = "0.167.0"
 deno_features = "0.54.0"
 thiserror = "2"
+# fd-level stdout/stderr redirection for output capture (already in the tree
+# via the deno stack).
+libc = "0.2"
 
 [build-dependencies]
 # The snapshot pipeline needs the runtime and the v8 backend linked into the
@@ -108,3 +111,5 @@ strip = true
 futures-util = "0.3"
 # Compiles the minimal .node fixture for the native-addon E2E tests.
 cc = "1"
+# For the tokio-context embedding regression test (run() from an async task).
+tokio = { version = "1", features = ["rt"] }

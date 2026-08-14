@@ -141,15 +141,15 @@ fn permissions_restrict_fs_reads() {
 #[test]
 fn default_permissions_are_rejected() {
     // v0.2.0 breaking change: an empty permission list is no longer allow-all.
-    // `LibdenoOptions::default()` must fail with a Permission error instead of
-    // silently running the script with every capability.
+    // `LibdenoOptions::default()` must fail with a Configuration error instead
+    // of silently running the script with every capability.
     let dir = temp_dir("default-perm");
     let entry = dir.join("main.js");
     fs::write(&entry, "console.log('never runs');").unwrap();
     let err = run(&entry, &LibdenoOptions::default()).unwrap_err();
     assert!(
-        matches!(err, libdeno::LibdenoError::Permission(_)),
-        "expected a permission error, got: {err}"
+        matches!(err, libdeno::LibdenoError::Configuration(_)),
+        "expected a configuration error, got: {err}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

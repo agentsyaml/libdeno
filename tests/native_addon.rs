@@ -63,10 +63,13 @@ fn build_addon(dir: &Path) -> PathBuf {
             .arg(&src)
             .arg(format!("/Fe:{}", addon.display()));
     } else {
-        cmd.args(["-shared", "-fPIC"])
-            .arg(&src)
-            .arg("-o")
-            .arg(&addon);
+        let mut cc_args: Vec<&str> = vec!["-shared", "-fPIC"];
+        // macOS's two-level namespace requires undefined napi_* symbols
+        // (resolved from the host at dlopen time) to be allowed at link time,
+        // exactly like real node-gyp addons build.
+        #[cfg(target_os = "macos")]
+        cc_args.extend(["-undefined", "dynamic_lookup"]);
+        cmd.args(cc_args).arg(&src).arg("-o").arg(&addon);
     }
     let out = cmd.output().expect("failed to spawn C compiler");
     assert!(
@@ -102,8 +105,9 @@ fn node_addon_requires_and_loads() {
     fs::write(
         &entry,
         "const m = require('./addon.node');\n\
-         if (typeof m !== 'object' || m === null) throw new Error('bad exports');\n\
-         console.log('addon loaded');",
+         if (typeof m.add !== 'function') throw new Error('add not exported');\n\
+         if (m.add(2, 3) !== 5) throw new Error('add(2, 3) !== 5');\n\
+         console.log('addon works');",
     )
     .unwrap();
     let options = LibdenoOptions {

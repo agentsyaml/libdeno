@@ -76,6 +76,7 @@ fn print_error(e: &LibdenoError) {
     match e {
         LibdenoError::Entry(e) => eprintln!("entry error: {e}"),
         LibdenoError::Permission(e) => eprintln!("permission error: {e}"),
+        LibdenoError::Configuration(e) => eprintln!("configuration error: {e}"),
         LibdenoError::Runtime(e) => eprintln!("error: {e}"),
         LibdenoError::Core(e) => eprintln!("runtime error: {e}"),
         LibdenoError::Io(e) => eprintln!("io error: {e}"),

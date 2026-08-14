@@ -52,15 +52,15 @@ fn run_with_happy_path_returns_exit_code() {
 fn run_with_default_permissions_is_rejected() {
     // The v0.2.0 default-permission semantics apply through the reusable
     // runtime entry point too: empty permissions without the opt-in must fail
-    // with a Permission error, never silently allow-all.
+    // with a Configuration error, never silently allow-all.
     let dir = temp_dir("default-perm");
     let entry = dir.join("main.js");
     fs::write(&entry, "console.log('never runs');").unwrap();
     let runtime = build_runtime(&dir);
     let err = run_with(&runtime, &entry, &LibdenoOptions::default()).unwrap_err();
     assert!(
-        matches!(err, libdeno::LibdenoError::Permission(_)),
-        "expected a permission error, got: {err}"
+        matches!(err, libdeno::LibdenoError::Configuration(_)),
+        "expected a configuration error, got: {err}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

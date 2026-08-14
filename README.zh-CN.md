@@ -66,18 +66,40 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 
 | 项 | 说明 |
 |---|---|
-| `run(entry, &options) -> Result<i32, LibdenoError>` | 运行入口到完成，返回脚本请求的退出码。每次调用构建独立的 current-thread 运行时与 worker，多次调用完全隔离。 |
+| `run(entry, &options) -> Result<i32, LibdenoError>` | 运行入口到完成，返回脚本请求的退出码。每次调用构建独立的 current-thread 运行时与 worker，多次调用完全隔离。可在 tokio 运行时内安全调用——自动在独立线程上执行（见下文）。 |
+| `run_with_output(entry, &options) -> Result<RunOutput, LibdenoError>` | 同 `run`，但当 `capture_stdout` / `capture_stderr` 开启时把脚本的 stdout/stderr 捕获进 `RunOutput`。 |
 | `run_in_subprocess(entry, &options) -> Result<i32, LibdenoError>` | 在子进程中运行入口。此时 `Deno.exit(n)` 只会终止子进程；宿主进程保持存活并拿到 `n`。宿主需在 `main()` 开头调用 `maybe_handle_child_mode()`。 |
 | `maybe_handle_child_mode() -> bool` | 服务 `run_in_subprocess` 的子进程请求。正常宿主启动时立即返回 `false`；子进程模式下执行脚本并以脚本退出码退出进程。 |
-| `LibdenoOptions.permissions: Vec<String>` | `--allow-*` 能力字符串。空列表是构造错误（`LibdenoError::Permission`）——请传入能力标志或设置 `allow_all_permissions`；传任意项则只放行声明的能力。 |
+| `LibdenoOptions.permissions: Vec<String>` | `--allow-*` 能力字符串。空列表是构造错误（`LibdenoError::Configuration`）——自 v0.2.0 起空列表不再放行任何能力；请传入能力标志、设置 `allow_all_permissions`，或设置 `prompt: true`。 |
 | `LibdenoOptions.allow_all_permissions: bool` | 放行一切能力（等价于 `-A`）。空 `permissions` 列表要运行脚本必须设置它。只用于你信任的代码（见 SECURITY.md）。 |
+| `LibdenoOptions.capture_stdout` / `capture_stderr: bool` | 把脚本的 stdout/stderr（fd 1/2）重定向进 `RunOutput` 而非宿主终端。捕获期间是进程级全局重定向：运行期间宿主其他线程的打印也会被捕获（运行内部串行）。 |
 | `LibdenoOptions.args: Vec<String>` | 通过 `process.argv`（argv[0] 之后）暴露给脚本的参数。 |
 | `LibdenoOptions.cwd: Option<PathBuf>` | 相对路径（入口、权限、node_modules 发现）解析的工作目录，默认进程当前目录。 |
-| `LibdenoError` | 枚举：`Entry`（入口解析失败）、`Permission`（权限字符串非法 / 空列表未显式选择）、`Runtime`、`Core`（脚本异常）、`Io`。 |
+| `LibdenoError` | 枚举：`Entry`（入口解析失败）、`Permission`（权限字符串非法）、`Configuration`（选项无法构成合法配置，如 v0.2.0 起空权限列表未显式选择）、`Runtime`、`Core`（脚本异常）、`Io`、`Timeout`（超时；消息说明具体原因）。 |
 
 支持的权限标志：`--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-import[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`，以及 `-A` / `--allow-all`。`--allow-import` 管控远程模块加载（没有 `--allow-net` 兜底）；静态与动态文件导入由 `--allow-read` 管控。
 
-完整 API 文档见 [`docs/api.md`](docs/api.md)（英文）。
+### 异步宿主（tokio/axum）
+
+`run()` / `run_with()` / `run_with_output()` 可在 tokio 运行时内安全调用：tokio 禁止在同一线程再起一个运行时，因此运行会在独立线程执行并 join 回来。注意调用方的线程在整个运行期间被阻塞（这是同步调用）；单线程 runtime 上其他任务会同时停摆，多线程 runtime 上每次并发运行会占用一个 worker。运行仍在内部 cwd 锁上串行，不会重叠。
+
+### 输出捕获
+
+```rust
+let out = libdeno::run_with_output(&entry, &LibdenoOptions {
+    allow_all_permissions: true,
+    capture_stdout: true,
+    capture_stderr: true,
+    ..Default::default()
+})?;
+println!("exit={} stdout={:?}", out.exit_code, out.stdout);
+```
+
+捕获是 fd 级：`console.log` / `console.error` / `Deno.stderr.write` 及任何直接 fd 写入都会进入 `RunOutput`。注意：捕获运行期间，宿主其他线程写到 stdout/stderr 的内容也会被捕获。
+
+输出捕获仅限 unix：Windows 上 Rust std 的 stdout/stderr 绕过被重定向的 CRT fd，因此 `capture_stdout`/`capture_stderr` 在那里会以 `LibdenoError::Configuration` 错误失败（请改用 `run_in_subprocess` 并接管子进程输出）。`run_with` 不支持捕获——请用 `run_with_output`。
+
+完整 API 文档见 [`docs/api.md`](docs/api.md)（英文）。常见嵌入形态（npm 插件 + 输出捕获）的端到端示例见 [`examples/npm-plugin.md`](examples/npm-plugin.md)（英文）。
 
 ---
 

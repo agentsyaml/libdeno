@@ -26,6 +26,31 @@ Behavior notes:
 - Since v0.2.0 every remote module fetch is capped at 256 MiB regardless of
   the declared `Content-Length`; the 1 GiB tier applies only to npm registry
   (tarball) downloads.
+- Safe to call from inside a tokio runtime: the run executes on a fresh
+  thread (tokio forbids nested runtimes) and joins back. Same for
+  `run_with_output` and `run_with`.
+
+## `run_with_output`
+
+```rust
+pub fn run_with_output(
+  entry: impl AsRef<Path>,
+  options: &LibdenoOptions,
+) -> Result<RunOutput, LibdenoError>
+
+pub struct RunOutput {
+  pub exit_code: i32,
+  pub stdout: Vec<u8>, // populated only when options.capture_stdout is set
+  pub stderr: Vec<u8>, // populated only when options.capture_stderr is set
+}
+```
+
+Like `run`, but captures the script's stdout/stderr into `RunOutput` when
+`LibdenoOptions.capture_stdout` / `capture_stderr` are set. The capture is
+fd-level (deno_core's print op has no injectable writer), so `console.log`,
+`console.error`, `Deno.stderr.write` and direct fd writes all land in the
+buffer. Caveat: while captured, *other host threads* printing to stdout/stderr
+during the run are captured too (runs are serialized internally).
 
 ## `LibdenoOptions`
 
@@ -47,8 +72,9 @@ pub struct LibdenoOptions {
 Permission capability strings in CLI `--allow-*` format.
 
 - Since v0.2.0 an **empty list is a construction error** — it grants nothing
-  and `run` returns `LibdenoError::Permission`. To run with every capability,
-  either set `allow_all_permissions: true` or pass `-A`/`--allow-all`.
+  and `run` returns `LibdenoError::Configuration` (the message spells out the
+  v0.2.0 semantic change and the migration options). To run with every
+  capability, either set `allow_all_permissions: true` or pass `-A`/`--allow-all`.
 - Passing any entry restricts the runtime to the declared capabilities.
 - A flag without a value allows that capability globally
   (`--allow-read` == read anywhere).
@@ -115,10 +141,11 @@ discovery) resolve against. Defaults to the process current directory.
 #[derive(Debug, thiserror::Error)]
 pub enum LibdenoError {
   Entry(AnyError),                       // entry module resolution failed
-  Permission(String),                    // invalid permission flags / empty list without opt-in
+  Permission(String),                    // invalid permission flag strings
+  Configuration(String),                 // options cannot form a valid configuration (e.g. empty permission list without opt-in since v0.2.0)
   Runtime(AnyError),                     // runtime startup / script failure
   Core(deno_core::error::CoreError),     // JS exception escaped event loop
-  Io(std::io::Error),                    // host I/O failure (e.g. cwd)
+  Io(std::io::Error),                    // host I/O failure (e.g. cwd, output capture setup)
   Timeout(String),                     // deadline exceeded / subprocess handshake timed out (message explains which)
 }
 ```

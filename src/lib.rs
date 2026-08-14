@@ -23,6 +23,7 @@ mod limits;
 mod module_loader;
 mod node_loader;
 mod npm_cache;
+mod output;
 mod permission_broker;
 mod permissions;
 mod runtime;
@@ -155,6 +156,31 @@ pub struct LibdenoOptions {
     /// Hard wall-clock limit; on expiry the isolate is force-terminated and
     /// the run fails with [`LibdenoError::Timeout`].
     pub execution_deadline: Option<std::time::Duration>,
+    /// Redirect the script's stdout (fd 1, e.g. `console.log`) into
+    /// [`RunOutput::stdout`] instead of the host's terminal. Off by default
+    /// (output passes through). While active the redirection is
+    /// process-global: other host threads printing to stdout during the run
+    /// are captured too (runs are serialized on the internal cwd lock).
+    pub capture_stdout: bool,
+    /// Redirect the script's stderr (fd 2, e.g. `console.error`) into
+    /// [`RunOutput::stderr`]; same semantics and caveats as
+    /// [`Self::capture_stdout`].
+    pub capture_stderr: bool,
+}
+
+/// The result of a [`run_with_output`] invocation.
+#[derive(Debug, Clone, Default)]
+pub struct RunOutput {
+    /// The exit code the script requested (0 on normal completion).
+    pub exit_code: i32,
+    /// Captured stdout bytes; empty unless [`LibdenoOptions::capture_stdout`]
+    /// was set. Unbounded: a verbose or hostile script grows this without
+    /// limit for the run's duration — bound the script, or set
+    /// [`LibdenoOptions::execution_deadline`].
+    pub stdout: Vec<u8>,
+    /// Captured stderr bytes; empty unless [`LibdenoOptions::capture_stderr`]
+    /// was set. Same unbounded-growth caveat as [`Self::stdout`].
+    pub stderr: Vec<u8>,
 }
 
 /// Errors from a [`run`] invocation.
@@ -166,6 +192,13 @@ pub enum LibdenoError {
     /// Permission capability strings could not be parsed.
     #[error("invalid permission flags: {0}")]
     Permission(String),
+    /// Host/configuration-level problems: options that cannot be turned into a
+    /// valid runtime configuration as given (e.g. an empty permission list
+    /// without `allow_all_permissions`, which since v0.2.0 grants nothing).
+    /// Distinguished from [`Self::Permission`] so embedders can tell "fix your
+    /// option values" apart from "the dependency environment is broken".
+    #[error("{0}")]
+    Configuration(String),
     /// The runtime failed to start or the script failed.
     #[error("{0}")]
     Runtime(#[from] AnyError),
@@ -202,25 +235,78 @@ impl From<Box<deno_core::error::JsError>> for LibdenoError {
 /// scripts observe a consistent working directory. [`run_in_subprocess`] does
 /// not take the cwd lock (it pins the child's cwd at spawn instead).
 pub fn run(entry: impl AsRef<Path>, options: &LibdenoOptions) -> Result<i32, LibdenoError> {
+    run_with_output(entry, options).map(|o| o.exit_code)
+}
+
+/// Runs `entry` to completion, returning the exit code together with the
+/// script's stdout/stderr when [`LibdenoOptions::capture_stdout`] /
+/// [`LibdenoOptions::capture_stderr`] are set.
+///
+/// Semantics match [`run`], including the tokio re-entry handling: building a
+/// tokio runtime inside a tokio runtime panics, so when called from inside a
+/// tokio context the run executes on a fresh thread (exactly the
+/// `std::thread::spawn + join` escape async hosts previously had to build
+/// themselves). The internal cwd lock is held across that thread's lifetime,
+/// so concurrent runs remain serialized.
+pub fn run_with_output(
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+) -> Result<RunOutput, LibdenoError> {
     // The process cwd is process-global; serialize so a concurrent run cannot
     // observe another run's cwd (see CWD_LOCK).
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Capture the entry-time child-IPC marker (and write it back so fork children inherit it).
     limits::capture_spawned_ipc_marker();
-    // Building a runtime inside a tokio runtime panics; report instead of
-    // taking down the host. Embedders calling run() from an async task should
-    // use run_in_subprocess (or spawn a thread).
+    let entry = entry.as_ref().to_path_buf();
+    let options = options.clone();
     if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-            "libdeno::run() cannot be called from inside a tokio runtime; \
-             call it from a non-async context or use run_in_subprocess"
-        )));
+        std::thread::spawn(move || run_sync_output(&entry, &options))
+            .join()
+            .map_err(|_| {
+                LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                    "libdeno::run() worker thread panicked"
+                ))
+            })?
+    } else {
+        run_sync_output(&entry, &options)
     }
+}
+
+fn run_sync_output(entry: &Path, options: &LibdenoOptions) -> Result<RunOutput, LibdenoError> {
+    // Windows: Rust std's stdout/stderr write via GetStdHandle, bypassing the
+    // CRT fd that dup2 redirects, so console output cannot be captured
+    // in-process there. Report a clean error instead of silently returning
+    // empty buffers.
+    #[cfg(windows)]
+    if options.capture_stdout || options.capture_stderr {
+        return Err(LibdenoError::Configuration(
+            "output capture is not supported on Windows (std stdout/stderr \
+             bypass the redirected CRT fd); use run_in_subprocess and pipe \
+             the child's output instead"
+                .to_string(),
+        ));
+    }
+    let capture = output::OutputCapture::new(options.capture_stdout, options.capture_stderr)
+        .map_err(LibdenoError::Io)?;
+    let result = run_sync(entry, options);
+    let (stdout, stderr) = capture.finish();
+    Ok(RunOutput {
+        exit_code: result?,
+        stdout,
+        stderr,
+    })
+}
+
+/// The actual run: a fresh current-thread runtime and the run lifecycle. Must
+/// not be called from inside a tokio runtime (tokio panics on nested
+/// runtimes); [`run_with_output`] routes such callers onto a fresh thread
+/// first.
+fn run_sync(entry: &Path, options: &LibdenoOptions) -> Result<i32, LibdenoError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
-    runtime.block_on(run_inner(entry.as_ref(), options))
+    runtime.block_on(run_inner(entry, options))
 }
 
 async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, LibdenoError> {

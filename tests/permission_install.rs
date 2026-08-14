@@ -41,13 +41,13 @@ fn hook_install_is_install_once_and_excludes_the_broker() {
     );
 
     // A hook (or broker) decides checks, not construction: an empty
-    // permissions list still fails at run-construction time with a Permission
-    // error before any check could reach the hook.
+    // permissions list still fails at run-construction time with a
+    // Configuration error before any check could reach the hook.
     let entry = dir.join("main.js");
     fs::write(&entry, "console.log('never runs');").unwrap();
     let err = run(&entry, &LibdenoOptions::default()).unwrap_err();
     assert!(
-        matches!(err, LibdenoError::Permission(_)),
+        matches!(err, LibdenoError::Configuration(_)),
         "a hook must not decide construction, got: {err:?}"
     );
 

@@ -71,18 +71,22 @@ impl LibdenoRuntime {
 /// Runs `entry` through a prebuilt [`LibdenoRuntime`]'s resolver stack.
 ///
 /// Semantics match [`crate::run`]: the run is serialized on the process cwd
-/// lock, tokio re-entry is rejected, `Deno.exit(n)` / exit codes / deadlines
-/// behave identically, and the run's permissions come from `options` — each
-/// run rebuilds its permission-bound file fetcher / graph loader / graph, so
-/// one run's grants can never leak into another.
+/// lock, tokio re-entry is handled automatically (the run executes on a
+/// fresh thread when called from inside a tokio runtime), `Deno.exit(n)` /
+/// exit codes / deadlines behave identically, and the run's permissions come
+/// from `options` — each run rebuilds its permission-bound file fetcher /
+/// graph loader / graph, so one run's grants can never leak into another.
 ///
 /// The script runs in the runtime's cwd; `LibdenoOptions.cwd` is ignored
 /// (the resolver stack is scoped to the runtime's directory).
 ///
+/// `LibdenoOptions.capture_stdout` / `capture_stderr` are **not** honored by
+/// `run_with` (it returns only the exit code); use [`crate::run_with_output`]
+/// for capture. Setting them here is a silent no-op.
+///
 /// The async/sync split is deliberate: [`LibdenoRuntime::new`] is async
 /// because resolver stack construction needs a tokio context, while `run_with`
-/// is sync and rejects being called from inside a tokio runtime — it does its
-/// own `block_on` on a fresh current-thread runtime.
+/// is sync and does its own `block_on` on a fresh current-thread runtime.
 pub fn run_with(
     runtime: &LibdenoRuntime,
     entry: impl AsRef<Path>,
@@ -92,12 +96,33 @@ pub fn run_with(
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Capture the entry-time child-IPC marker (fork children inherit it).
     crate::limits::capture_spawned_ipc_marker();
+    let entry = entry.as_ref().to_path_buf();
+    let options = options.clone();
+    let runtime = runtime.clone();
+    // Same tokio re-entry handling as run(): building a runtime inside a
+    // tokio runtime panics, so run on a fresh thread instead of rejecting
+    // async hosts.
     if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-            "libdeno::run_with() cannot be called from inside a tokio runtime; \
-             call it from a non-async context or use run_in_subprocess"
-        )));
+        std::thread::spawn(move || run_with_sync(&runtime, &entry, &options))
+            .join()
+            .map_err(|_| {
+                LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                    "libdeno::run_with() worker thread panicked"
+                ))
+            })?
+    } else {
+        run_with_sync(&runtime, &entry, &options)
     }
+}
+
+/// The actual run against a prebuilt resolver stack: its own block_on on a
+/// fresh current-thread runtime. Must not be called from inside a tokio
+/// runtime; [`run_with`] routes such callers onto a fresh thread first.
+fn run_with_sync(
+    runtime: &LibdenoRuntime,
+    entry: &Path,
+    options: &LibdenoOptions,
+) -> Result<i32, LibdenoError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -130,7 +155,7 @@ pub fn run_with(
                     .clone()
             }
         };
-        crate::run_inner_with(shared, runtime.cwd.clone(), entry.as_ref(), options).await
+        crate::run_inner_with(shared, runtime.cwd.clone(), entry, options).await
     })
 }
 
