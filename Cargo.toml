@@ -106,3 +106,5 @@ strip = true
 # Already in the tree via reqwest; needed to build a stream-backed response
 # body (unknown content length) in http tests.
 futures-util = "0.3"
+# Compiles the minimal .node fixture for the native-addon E2E tests.
+cc = "1"

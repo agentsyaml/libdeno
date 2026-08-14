@@ -4805,6 +4805,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "cc",
  "deno_cache_dir",
  "deno_config",
  "deno_core",
