@@ -11,7 +11,9 @@
 //! `run` calls are serialized on CWD_LOCK, so libdeno runs never overlap,
 //! but host-side concurrent printing is a documented caveat.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+// Fds are plain libc::c_int (CRT fds) on every platform: libc's pipe/dup/
+// dup2/read/close all speak CRT fds, and std::os::fd (OwnedFd) does not exist
+// on Windows. Closing is explicit at the two exit points (finish / Drop).
 
 /// Redirects fd 1 (stdout) and/or fd 2 (stderr) to pipes for the lifetime of
 /// the guard; [`finish`](Self::finish) restores them and returns the bytes.
@@ -55,15 +57,15 @@ impl Drop for OutputCapture {
 
 struct StreamCapture {
     /// The fd being redirected (1 = stdout, 2 = stderr).
-    target: RawFd,
+    target: libc::c_int,
     /// The original fd, kept open so it can be restored on finish.
-    saved: OwnedFd,
+    saved: libc::c_int,
     /// Captured blocks from the (detached) reader thread.
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
 }
 
 impl StreamCapture {
-    fn new(fd: RawFd) -> Result<Self, std::io::Error> {
+    fn new(fd: libc::c_int) -> Result<Self, std::io::Error> {
         let mut fds = [0; 2];
         let rc = unsafe {
             #[cfg(unix)]
@@ -113,7 +115,7 @@ impl StreamCapture {
             }
             return Err(err);
         }
-        let saved = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+        let saved = dup_fd;
         if unsafe { libc::dup2(write_fd, fd) } < 0 {
             let err = std::io::Error::last_os_error();
             unsafe {
@@ -137,7 +139,6 @@ impl StreamCapture {
         // The thread ends on its own once EOF arrives or the receiver
         // disconnects.
         let _ = std::thread::spawn(move || {
-            let read = unsafe { OwnedFd::from_raw_fd(read_fd) };
             let mut buf = [0u8; 8192];
             loop {
                 // read()'s count type differs per platform: size_t on unix,
@@ -147,13 +148,8 @@ impl StreamCapture {
                 let count = buf.len();
                 #[cfg(windows)]
                 let count = buf.len() as libc::c_uint;
-                let n = unsafe {
-                    libc::read(
-                        read.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        count,
-                    )
-                };
+                let n =
+                    unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, count) };
                 if n < 0
                     && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
                 {
@@ -165,6 +161,9 @@ impl StreamCapture {
                 if tx.send(buf[..n as usize].to_vec()).is_err() {
                     break; // receiver gave up (finish timeout); stop reading
                 }
+            }
+            unsafe {
+                libc::close(read_fd);
             }
         });
         Ok(Self {
@@ -190,13 +189,18 @@ impl StreamCapture {
         // SAFETY: `saved` is a valid open fd; failure to restore leaves the
         // host's fd 1/2 pointed at the pipe, so report it rather than
         // silently swallowing.
-        let restored = unsafe { libc::dup2(self.saved.as_raw_fd(), self.target) };
+        let restored = unsafe { libc::dup2(self.saved, self.target) };
         if restored < 0 {
             eprintln!(
                 "libdeno: failed to restore fd {} after output capture: {}",
                 self.target,
                 std::io::Error::last_os_error()
             );
+        }
+        // The original fd's content was copied back to `target`; the spare
+        // copy is no longer needed.
+        unsafe {
+            libc::close(self.saved);
         }
         // Collect blocks until EOF (channel closed) or the cap expires. The
         // cap only fires when a spawned child holds the write end open; on
@@ -223,7 +227,8 @@ impl Drop for StreamCapture {
         // outlives its capture. Harmless when finish() already ran (its
         // dup2 restored the same fd; saved was closed with self).
         unsafe {
-            libc::dup2(self.saved.as_raw_fd(), self.target);
+            libc::dup2(self.saved, self.target);
+            libc::close(self.saved);
         }
     }
 }

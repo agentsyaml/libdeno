@@ -63,12 +63,13 @@ fn build_addon(dir: &Path) -> PathBuf {
             .arg(&src)
             .arg(format!("/Fe:{}", addon.display()));
     } else {
-        let mut cc_args: Vec<&str> = vec!["-shared", "-fPIC"];
         // macOS's two-level namespace requires undefined napi_* symbols
         // (resolved from the host at dlopen time) to be allowed at link time,
         // exactly like real node-gyp addons build.
         #[cfg(target_os = "macos")]
-        cc_args.extend(["-undefined", "dynamic_lookup"]);
+        let cc_args = vec!["-shared", "-fPIC", "-undefined", "dynamic_lookup"];
+        #[cfg(not(target_os = "macos"))]
+        let cc_args = vec!["-shared", "-fPIC"];
         cmd.args(cc_args).arg(&src).arg("-o").arg(&addon);
     }
     let out = cmd.output().expect("failed to spawn C compiler");
