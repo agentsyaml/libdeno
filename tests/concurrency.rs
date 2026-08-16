@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use libdeno::{run, run_with_output, LibdenoError, LibdenoOptions};
+use libdeno::{run, LibdenoOptions};
+#[cfg(not(windows))]
+use libdeno::{run_with_output, LibdenoError};
 
 /// The three tests in this file must not overlap each other: the captured
 /// run's exclusivity lease rejects any concurrent run, and the capture test
