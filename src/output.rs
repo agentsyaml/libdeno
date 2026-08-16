@@ -8,8 +8,10 @@
 //!
 //! The redirection is process-global while active: other threads of the host
 //! that print to fd 1/2 during the run land in the captured buffer too.
-//! `run` calls are serialized on CWD_LOCK, so libdeno runs never overlap,
-//! but host-side concurrent printing is a documented caveat.
+//! The run holds the exclusivity lease ([`crate::RunLease`]) — any concurrent
+//! run is rejected with `Configuration` rather than letting the capture
+//! reader steal its output; host-side concurrent printing is a documented
+//! caveat.
 
 // Fds are plain libc::c_int (CRT fds) on every platform: libc's pipe/dup/
 // dup2/read/close all speak CRT fds, and std::os::fd (OwnedFd) does not exist

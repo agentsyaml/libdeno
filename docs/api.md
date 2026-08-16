@@ -14,8 +14,10 @@ returns the exit code the script requested (`0` on normal completion).
 
 Behavior notes:
 
-- Each call builds its own current-thread tokio runtime and worker, so
-  multiple invocations are fully independent.
+- Each call builds its own current-thread tokio runtime and worker. Ordinary
+  runs execute **in parallel** — each has its own thread, isolate, and graph,
+  sharing nothing mutable. The one exception: output capture (see below) is
+  exclusive, so a captured run rejects any overlapping run.
 - The call blocks until the script finishes (module execution + event loop +
   lifecycle events: `load`, `beforeunload`, `unload`, `process.beforeExit`,
   `process.exit`).
@@ -51,7 +53,11 @@ Like `run`, but captures the script's stdout/stderr into `RunOutput` when
 fd-level (deno_core's print op has no injectable writer), so `console.log`,
 `console.error`, `Deno.stderr.write` and direct fd writes all land in the
 buffer. Caveat: while captured, *other host threads* printing to stdout/stderr
-during the run are captured too (runs are serialized internally).
+during the run are captured too. Capture is fd-level process-global
+redirection, so a captured run is **exclusive**: any overlapping run (captured
+or not) is rejected with `LibdenoError::Configuration`. For captured runs
+alongside parallel execution use `run_in_subprocess`, where each process has
+its own fds.
 
 ## `LibdenoRuntime` / `run_with` / `run_with_output`
 
@@ -86,24 +92,26 @@ builds the permission-free half of that stack once and `run_with` /
   (deno.json / deno.jsonc / import_map.json / package.json / .npmrc /
   node_modules at the project root and its ancestors): `run_with` recomputes
   a fingerprint and swaps the stack when it diverges.
-- `run_with` semantics match `run` — serialized on the process cwd lock,
-  tokio re-entry handled automatically (fresh thread inside a tokio runtime),
+- `run_with` semantics match `run` — ordinary runs are fully parallel, tokio
+  re-entry handled automatically (fresh thread inside a tokio runtime),
   `Deno.exit(n)` / exit codes / deadlines identical. The script runs in the
-  runtime's cwd; `LibdenoOptions.cwd` is **ignored** (the stack is scoped to
-  the runtime's directory). Permissions come from `options` per run: the
-  permission-bound file fetcher / graph loader / graph are rebuilt each call,
-  so one run's grants never leak into another.
+  host's cwd; `LibdenoOptions.cwd` is **ignored** as a resolution base (the
+  stack is scoped to the runtime's directory), and the process cwd is never
+  switched. Permissions come from `options` per run: the permission-bound
+  file fetcher / graph loader / graph are rebuilt each call, so one run's
+  grants never leak into another.
 - `run_with` does **not** honor `capture_stdout` / `capture_stderr` (it
   returns only the exit code). Use `run_with_output(&runtime, ...)` for
   capture on the reusable stack; everything else matches `run_with_output`
   (`LibdenoOptions.cwd` ignored, permissions per run, fd-level capture with
-  the same Windows rejection and per-stream byte cap).
+  the same exclusivity lease, Windows rejection and per-stream byte cap).
 - `LibdenoRuntime` is `Clone` + `Send` + `Sync`, so it can be shared across
-  host threads; runs still serialize on the cwd lock. It is single-threaded
-  by design: the module loader stack is `Rc<...>`-based and every run
-  executes on a fresh current-thread tokio runtime. The async/sync split is
-  deliberate — `new` is async, `run_with` is sync and does its own `block_on`
-  on that fresh runtime.
+  host threads; ordinary runs through it are fully parallel (only a captured
+  run is exclusive — see `run_with_output`). It is single-threaded by design:
+  the module loader stack is `Rc<...>`-based and every run executes on a
+  fresh current-thread tokio runtime. The async/sync split is deliberate —
+  `new` is async, `run_with` is sync and does its own `block_on` on that
+  fresh runtime.
 
 ## `LibdenoOptions`
 
@@ -189,8 +197,15 @@ Arguments exposed to the script via `process.argv` (after argv[0]).
 
 ### `cwd`
 
-Working directory that relative paths (entry, permissions, `node_modules`
+Resolution base that relative paths (entry, permissions, `node_modules`
 discovery) resolve against. Defaults to the process current directory.
+
+The process cwd is **never switched** (chdir is process-global and would
+serialize or corrupt concurrent runs, which are otherwise fully parallel). The
+script observes the host's cwd: `Deno.cwd()` and relative filesystem
+operations inside the script resolve against it. Scripts that need a specific
+working directory should use absolute paths or `run_in_subprocess` (the
+child's cwd is pinned at spawn).
 
 ### `capture_stdout` / `capture_stderr`
 
@@ -198,7 +213,10 @@ Redirect the script's stdout (fd 1, e.g. `console.log`) / stderr (fd 2, e.g.
 `console.error`) into `RunOutput::stdout` / `RunOutput::stderr` instead of the
 host's terminal. Off by default (output passes through). While active the
 redirection is fd-level and process-global: other host threads printing to
-stdout/stderr during the run are captured too (runs are serialized internally).
+stdout/stderr during the run are captured too, and the run is **exclusive** —
+any concurrent run (captured or not) is rejected with
+`LibdenoError::Configuration`. For captured runs alongside parallel execution
+use `run_in_subprocess`, where each process has its own fds.
 
 ### `max_capture_bytes`
 
@@ -258,8 +276,17 @@ Requirements:
 - The host binary must call `maybe_handle_child_mode()` at the very start of
   its `main()` so child requests are serviced.
 - The child inherits stdout/stderr, so script output still appears.
+- The child's cwd is pinned to `options.cwd` at spawn (via
+  `Command::current_dir`), so the script sees it as its working directory —
+  unlike in-process runs, where the script observes the host's cwd.
 - Entry, permissions, args, and cwd are passed over the child's stdin as
   JSON; relative entry paths resolve against `options.cwd`.
+- `features`, `max_heap_bytes`, and `execution_deadline` are forwarded to
+  the child verbatim: a host that bounds or shrinks an untrusted script gets
+  the same bounds in child mode (the child never silently runs unbounded on
+  the full unstable surface). The capture flags are not forwarded — the
+  child writes to the inherited fds, so capture the parent side instead
+  (redirect the host's own fds around the call).
 
 `LIBDENO_HOST_EXE` overrides the executable spawned (defaults to
 `current_exe()`); integration tests use this to point at a dedicated host.

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::services::SharedServices;
 use crate::LibdenoError;
 use crate::LibdenoOptions;
-use crate::CWD_LOCK;
+use crate::RunLease;
 
 /// A reusable resolver stack scoped to a project directory.
 ///
@@ -28,8 +28,9 @@ use crate::CWD_LOCK;
 /// `Rc<dyn ModuleLoader>`-based and every run executes on a fresh
 /// current-thread tokio runtime. `LibdenoRuntime` itself is `Clone` + `Send` +
 /// `Sync` (its only state is an `Arc<Mutex<RuntimeState>>` around the resolver
-/// stack), so it can be shared across host threads and serialized by
-/// [`run_with`]'s cwd lock.
+/// stack), so it can be shared across host threads and used concurrently —
+/// ordinary runs are fully parallel; only a captured run is exclusive (see
+/// [`crate::RunLease`]).
 #[derive(Clone)]
 pub struct LibdenoRuntime {
     cwd: PathBuf,
@@ -70,15 +71,17 @@ impl LibdenoRuntime {
 
 /// Runs `entry` through a prebuilt [`LibdenoRuntime`]'s resolver stack.
 ///
-/// Semantics match [`crate::run`]: the run is serialized on the process cwd
-/// lock, tokio re-entry is handled automatically (the run executes on a
+/// Semantics match [`crate::run`]: the run observes the host cwd (never
+/// switched), tokio re-entry is handled automatically (the run executes on a
 /// fresh thread when called from inside a tokio runtime), `Deno.exit(n)` /
 /// exit codes / deadlines behave identically, and the run's permissions come
 /// from `options` — each run rebuilds its permission-bound file fetcher /
 /// graph loader / graph, so one run's grants can never leak into another.
 ///
-/// The script runs in the runtime's cwd; `LibdenoOptions.cwd` is ignored
-/// (the resolver stack is scoped to the runtime's directory).
+/// The script runs in the host's cwd; `LibdenoOptions.cwd` is ignored (the
+/// resolver stack is scoped to the runtime's directory) — same semantics as
+/// [`crate::run`], where `cwd` is a resolution base only and the process
+/// cwd is never switched.
 ///
 /// `LibdenoOptions.capture_stdout` / `capture_stderr` are **not** honored by
 /// `run_with` (it returns only the exit code); use [`run_with_output`] for
@@ -92,8 +95,12 @@ pub fn run_with(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<i32, LibdenoError> {
-    // The process cwd is process-global; serialize like run() (see CWD_LOCK).
-    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Take the capture-exclusivity lease before the run starts (see
+    // RunLease); ordinary runs are otherwise fully parallel. run_with never
+    // captures (capture flags are not honored here), so the lease is taken
+    // as a plain parallel run — capture flags must not buy exclusivity they
+    // don't use.
+    let _lease = RunLease::acquire(false)?;
     // Capture the entry-time child-IPC marker (fork children inherit it).
     crate::limits::capture_spawned_ipc_marker();
     let entry = entry.as_ref().to_path_buf();
@@ -119,16 +126,17 @@ pub fn run_with(
 /// long-lived-host equivalent of [`crate::run_with_output`] (which rebuilds
 /// the resolver stack on every call).
 ///
-/// Everything else matches [`run_with`]: serialized on the cwd lock, tokio
-/// re-entry handled automatically, `LibdenoOptions.cwd` ignored, permissions
-/// per-run. Capture semantics (fd-level redirection, byte cap, Windows
-/// rejection) are identical to [`crate::run_with_output`].
+/// Everything else matches [`run_with`]: the capture-exclusivity lease (see
+/// [`crate::RunLease`]), tokio re-entry handled automatically,
+/// `LibdenoOptions.cwd` ignored, permissions per-run. Capture semantics
+/// (fd-level redirection, byte cap, Windows rejection) are identical to
+/// [`crate::run_with_output`].
 pub fn run_with_output(
     runtime: &LibdenoRuntime,
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<crate::RunOutput, LibdenoError> {
-    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lease = RunLease::acquire(options.capture_stdout || options.capture_stderr)?;
     crate::limits::capture_spawned_ipc_marker();
     let entry = entry.as_ref().to_path_buf();
     let options = options.clone();
@@ -191,7 +199,8 @@ fn run_with_sync(
     rt.block_on(async {
         // Fresh fingerprint of the config discovery chain. The swap lock
         // covers only the check and the swap, never the rebuild: a slow
-        // factory rebuild must not be serialized behind anything but CWD_LOCK.
+        // factory rebuild must not be serialized behind anything but the
+        // capture-exclusivity lease.
         let fp = config_fingerprint(&runtime.cwd);
         let shared = {
             let stale = {

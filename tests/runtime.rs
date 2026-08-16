@@ -27,11 +27,18 @@ fn build_runtime(cwd: &std::path::Path) -> LibdenoRuntime {
 
 #[test]
 fn run_with_happy_path_returns_exit_code() {
-    // Wave 2 basic usability: a plain script runs to completion with exit 0
-    // and sees the runtime's cwd (Deno.cwd must match the project dir).
+    // Wave 2 basic usability: a plain script runs to completion with exit 0.
+    // The process cwd is never switched (cwd is a resolution base only), so
+    // the script observes the host's cwd via Deno.cwd().
     let dir = temp_dir("happy");
     let entry = dir.join("main.js");
-    fs::write(&entry, "Deno.writeTextFileSync('out.txt', Deno.cwd());").unwrap();
+    fs::write(
+        &entry,
+        // Absolute path via import.meta.url: relative paths would resolve
+        // against the host cwd, not the project dir.
+        "Deno.writeTextFileSync(new URL('./out.txt', import.meta.url), Deno.cwd());",
+    )
+    .unwrap();
     let runtime = build_runtime(&dir);
     let code = run_with(
         &runtime,
@@ -43,8 +50,11 @@ fn run_with_happy_path_returns_exit_code() {
     )
     .unwrap();
     assert_eq!(code, 0);
-    let expected = fs::canonicalize(&dir).unwrap().display().to_string();
-    assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), expected);
+    let host_cwd = fs::canonicalize(std::env::current_dir().unwrap())
+        .unwrap()
+        .display()
+        .to_string();
+    assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), host_cwd);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -71,7 +81,11 @@ fn run_with_reuse_produces_identical_results() {
     // same script on the same runtime must behave identically.
     let dir = temp_dir("reuse");
     let entry = dir.join("main.js");
-    fs::write(&entry, "Deno.writeTextFileSync('out.txt', 'same-result');").unwrap();
+    fs::write(
+        &entry,
+        "Deno.writeTextFileSync(new URL('./out.txt', import.meta.url), 'same-result');",
+    )
+    .unwrap();
     let runtime = build_runtime(&dir);
     let options = LibdenoOptions {
         allow_all_permissions: true,
@@ -97,7 +111,7 @@ fn run_with_rebuilds_when_config_changes() {
     let entry = dir.join("main.js");
     fs::write(
         &entry,
-        "import { marker } from '#mod';\nDeno.writeTextFileSync('out.txt', marker);",
+        "import { marker } from '#mod';\nDeno.writeTextFileSync(new URL('./out.txt', import.meta.url), marker);",
     )
     .unwrap();
     let write_config = |target: &str| {

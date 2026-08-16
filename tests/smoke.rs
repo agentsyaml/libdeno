@@ -207,9 +207,10 @@ fn require_traversal_outside_granted_dir_is_denied() {
 }
 
 #[test]
-fn cwd_option_sets_process_cwd_for_script() {
-    // options.cwd must be what the script observes (Deno.cwd/process.cwd),
-    // not the host process's cwd, and the host cwd must be restored after.
+fn cwd_option_is_resolution_base_not_process_cwd() {
+    // options.cwd is a resolution base only: the process cwd is never
+    // switched, so the script observes the host's cwd (Deno.cwd/process.cwd)
+    // and the host cwd is untouched throughout.
     let dir = temp_dir("cwd-opt");
     fs::create_dir_all(&dir).unwrap();
     let original_cwd = std::env::current_dir().unwrap();
@@ -217,10 +218,13 @@ fn cwd_option_sets_process_cwd_for_script() {
     // Canonicalize: Deno.cwd()/process.cwd() come from getcwd, which resolves
     // symlinks (e.g. /var -> /private/var on macOS), while temp_dir() paths
     // are not canonicalized.
-    let expected = fs::canonicalize(&dir).unwrap().display().to_string();
+    let host_cwd = fs::canonicalize(&original_cwd)
+        .unwrap()
+        .display()
+        .to_string();
     fs::write(
         &entry,
-        format!("if (Deno.cwd() !== {expected:?}) throw new Error('cwd mismatch');"),
+        format!("if (Deno.cwd() !== {host_cwd:?}) throw new Error('cwd mismatch');"),
     )
     .unwrap();
     let options = LibdenoOptions {
@@ -310,6 +314,66 @@ fn subprocess_mode_passes_args() {
     };
     let code = libdeno::run_in_subprocess(&entry, &options).unwrap();
     assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn subprocess_mode_forwards_features() {
+    // Safety options must reach the child: a host that shrinks `features`
+    // for an untrusted plugin gets the same shrink in child mode, not the
+    // full default unstable surface.
+    let dir = temp_dir("subproc-features");
+    let entry = dir.join("main.js");
+    // kv is not in the ["ffi"] set: openKv must be absent in the child.
+    fs::write(
+        &entry,
+        "if (typeof Deno.openKv !== 'undefined') throw new Error('kv unexpectedly enabled');",
+    )
+    .unwrap();
+    let _host_exe = set_host_exe(env!("CARGO_BIN_EXE_child_host"));
+    let options = LibdenoOptions {
+        features: Some(vec!["ffi".into()]),
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    assert_eq!(libdeno::run_in_subprocess(&entry, &options).unwrap(), 0);
+
+    // Default (None) means the full unstable surface: openKv exists.
+    fs::write(
+        &entry,
+        "if (typeof Deno.openKv === 'undefined') throw new Error('kv missing by default');",
+    )
+    .unwrap();
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    assert_eq!(libdeno::run_in_subprocess(&entry, &options).unwrap(), 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn subprocess_mode_forwards_execution_deadline() {
+    // A runaway script in child mode must be cut down by the host's
+    // execution_deadline — the isolation entry point must not run unbounded.
+    let dir = temp_dir("subproc-deadline");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "while (true) {}").unwrap();
+    let _host_exe = set_host_exe(env!("CARGO_BIN_EXE_child_host"));
+    let options = LibdenoOptions {
+        execution_deadline: Some(std::time::Duration::from_secs(1)),
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let start = std::time::Instant::now();
+    // The child times out → its host exits 1 → the parent observes exit 1.
+    let code = libdeno::run_in_subprocess(&entry, &options).unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(code, 1, "deadline child should exit 1, got {code}");
+    assert!(
+        elapsed.as_secs() < 10,
+        "deadline did not cut the child down: {elapsed:?}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -415,8 +479,9 @@ fn non_utf8_entry_in_subprocess_is_an_error() {
 fn subprocess_child_uses_options_cwd() {
     // The child's working directory must be options.cwd (pinned via
     // Command::current_dir at spawn), never the host process's cwd — and
-    // run_in_subprocess must not depend on a process-global cwd lock (a
-    // long-lived child must not block later calls in the same process).
+    // run_in_subprocess must not hold any process-global lock across the
+    // child's lifetime (a long-lived child must not block later calls in
+    // the same process).
     let dir = temp_dir("subproc-cwd");
     fs::create_dir_all(&dir).unwrap();
     let entry = dir.join("main.js");
@@ -726,7 +791,7 @@ fn child_mode_with_wrong_token_is_rejected() {
     // `D:\a\...` and a raw backslash is an invalid JSON escape.
     let json_escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let payload = format!(
-        r#"{{"entry":"{}","permissions":[],"allow_all_permissions":true,"prompt":false,"args":[],"cwd":"{}","token":"00000000000000000000000000000000"}}"#,
+        r#"{{"entry":"{}","permissions":[],"allow_all_permissions":true,"prompt":false,"args":[],"cwd":"{}","token":"00000000000000000000000000000000","features":null,"max_heap_bytes":null,"execution_deadline":null}}"#,
         json_escape(&entry_abs),
         json_escape(&cwd)
     );

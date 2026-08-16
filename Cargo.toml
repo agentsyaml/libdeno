@@ -1,6 +1,6 @@
 [package]
 name = "libdeno"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 # Matches the toolchain pinned by deno v2.9.5 (rust-toolchain.toml); the deno
 # stack publishes no rust-version, and the v8 crate requires edition 2024.
@@ -20,7 +20,7 @@ path = "examples/demo.rs"
 
 [dependencies]
 deno_runtime = { version = "0.265.0", features = ["transpile"] }
-deno_resolver = { version = "0.88.0", features = ["graph", "deno_ast"] }
+deno_resolver = { version = "0.88.0", features = ["graph", "deno_ast", "sync"] }
 node_resolver = "0.95.0"
 # deno_runtime is backend-agnostic; the embedder must enable the v8 backend.
 deno_core = { version = "0.410.0", features = ["v8", "reactor-tokio", "v8_use_custom_libcxx"] }

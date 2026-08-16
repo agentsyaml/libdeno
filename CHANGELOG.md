@@ -5,6 +5,66 @@ breaking changes are highlighted per release with migration notes.
 
 [keep a changelog]: https://keepachangelog.com/en/1.1.0/
 
+## 0.3.0
+
+> **Breaking (runtime behavior)**: the process cwd is never switched anymore
+> and in-process runs are no longer globally serialized. `LibdenoOptions.cwd`
+> is now a resolution base only, and output capture is exclusive — overlapping
+> runs are rejected instead of queued. Both changes are intentional
+> consequences of allowing ordinary runs to execute in parallel; migration
+> notes below.
+
+### Breaking changes (migration guide)
+
+- **The process cwd is never switched.** `CWD_LOCK` and `CwdGuard` are
+  removed. `LibdenoOptions.cwd` is now a **resolution base only**: relative
+  paths for entry resolution, permission grants, and `node_modules` discovery
+  still resolve against it, but the script at runtime observes the host's cwd
+  — `Deno.cwd()` / `process.cwd()` and relative filesystem operations inside
+  the script resolve against the host process's cwd. Migration: scripts that
+  relied on seeing `options.cwd` as their working directory should use
+  absolute paths, or run through `run_in_subprocess` (the child's cwd is
+  pinned at spawn).
+- **Ordinary in-process runs are fully parallel.** Each run owns its thread,
+  isolate, and graph and shares nothing mutable; the old process-global
+  serialization is gone, so runs no longer queue behind each other.
+- **Output capture is exclusive.** Capture is fd-level redirection of the
+  process-global stdout/stderr, so a captured run rejects **any** concurrent
+  run (captured or not) with `LibdenoError::Configuration` instead of letting
+  the capture reader steal its output. Enforced by a lock-free atomic state
+  machine (`RunLease` / `RUN_STATE`) with no spurious serialization; `run` /
+  `run_with_output` / `run_with` / `runtime::run_with_output` all take the
+  lease. Previously overlapping captured runs queued on the mutex. Migration:
+  for captured runs alongside parallel execution use `run_in_subprocess`,
+  where each process has its own fds.
+- **`run_in_subprocess` no longer takes a cwd lock** (it existed only to guard
+  against concurrent chdir, which no longer exists); the child's cwd is still
+  pinned at spawn via `Command::current_dir`. A long-lived child can no longer
+  hold a process-global lock that blocks every other run.
+- **`run_in_subprocess` forwards `features`, `max_heap_bytes`, and
+  `execution_deadline` to the child** (previously silently dropped — the
+  child ran on the full default unstable surface with no bounds). Capture
+  flags are deliberately not forwarded: the child writes to the inherited
+  fds, so capture belongs on the parent side.
+
+### Added
+
+- **`run_async` / `run_with_output_async`**: async entry points that execute
+  the run on the **caller's** tokio runtime — no spawned thread, removing
+  the per-run OS-thread cost of `run()`'s tokio re-entry escape. Must be
+  called from inside a tokio context; the future is not `Send` and must not
+  be interleaved with another `run_async` (a V8 isolate is pinned to its
+  creating thread — v8 0.150 `PinnedRef` — so interleaved runs abort the
+  process); parallel runs use `run()` or `run_in_subprocess`.
+- **deno_resolver `sync` feature** (resolver stack is `Send`-capable, deno
+  CLI parity; behavior-equivalent — this is the enabling step for future
+  async work, no API change).
+- **Concurrency-protocol tests**: parallel ordinary runs overlap in time,
+  captured runs reject concurrent runs (`Configuration`), many parallel runs
+  all succeed, subprocess option forwarding (features / execution_deadline),
+  async entry points on current-thread and multi-thread (`LocalSet`)
+  runtimes.
+
 ## 0.2.2
 
 > **Breaking (source-compat)**: `LibdenoOptions` gained `max_capture_bytes`

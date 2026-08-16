@@ -40,6 +40,18 @@ struct ChildRunRequest {
     cwd: PathBuf,
     /// Per-run auth token, verified against [`LIBDENO_CHILD_TOKEN`].
     token: String,
+    /// Safety options are forwarded verbatim: a host that bounds an
+    /// untrusted script with `max_heap_bytes` / `execution_deadline` (or
+    /// shrinks `features` to the default unstable set) must get the same
+    /// bounds in child mode — the subprocess entry point exists for
+    /// isolation, and silently dropping these would run the child unbounded
+    /// on the full unstable API surface. The capture flags are deliberately
+    /// NOT forwarded: the child inherits the parent's fds, so captured
+    /// output in the child would be computed and discarded — capture
+    /// belongs on the parent side (redirect its own fds around the call).
+    features: Option<Vec<String>>,
+    max_heap_bytes: Option<usize>,
+    execution_deadline: Option<std::time::Duration>,
 }
 
 /// Generates a fresh 32-hex-char auth token for a child run.
@@ -101,16 +113,14 @@ pub fn run_in_subprocess(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<i32, LibdenoError> {
-    // Take CWD_LOCK only around the cwd read + spawn (both fast): a
-    // concurrent in-process run() may switch the process-global cwd
-    // mid-flight, and pinning the child's cwd from a stale read would run it
-    // in the wrong tree. The lock is NOT held across child.wait() — that
-    // would deadlock hosts that run long-lived children (plugins/daemons):
-    // the first child would hold the process-global lock forever and block
-    // every later run_in_subprocess or run() call in the same process.
+    // In-process runs never switch the process cwd (cwd is a resolution base
+    // only), so the child's cwd can be pinned from a plain read with no
+    // synchronization. The lock is NOT held across child.wait() — that would
+    // deadlock hosts that run long-lived children (plugins/daemons): the
+    // first child would hold a process-global lock forever and block every
+    // later run_in_subprocess or run() call in the same process.
     let token = child_token()?;
     let (payload, mut child) = {
-        let _lock = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cwd = options.cwd.clone().unwrap_or(std::env::current_dir()?);
         let request = ChildRunRequest {
             entry: entry.as_ref().to_path_buf(),
@@ -120,6 +130,9 @@ pub fn run_in_subprocess(
             args: options.args.clone(),
             cwd: cwd.clone(),
             token: token.clone(),
+            features: options.features.clone(),
+            max_heap_bytes: options.max_heap_bytes,
+            execution_deadline: options.execution_deadline,
         };
         let payload = deno_core::serde_json::to_vec(&request)
             .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
@@ -292,6 +305,14 @@ pub fn maybe_handle_child_mode() -> bool {
             prompt: request.prompt,
             args: request.args,
             cwd: Some(request.cwd),
+            // Forwarded safety options: the child must run under the same
+            // bounds the host configured (see ChildRunRequest). `Some([])`
+            // (the minimal surface, worker-options only) and `None` (the
+            // full default unstable surface) survive the round-trip
+            // distinctly — serde keeps `[]` vs `null` apart.
+            features: request.features,
+            max_heap_bytes: request.max_heap_bytes,
+            execution_deadline: request.execution_deadline,
             ..Default::default()
         };
         run(&request.entry, &options)

@@ -65,54 +65,82 @@ use services::{RuntimeServices, SharedServices};
 use sys_traits::impls::RealSys;
 use worker_factory::create_web_worker_factory;
 
-/// Switches the process cwd to `LibdenoOptions.cwd` for the duration of a
-/// [`run`], restoring the host's cwd on every exit path (Drop). Without this,
-/// scripts would observe the host's cwd (`process.cwd()`/`Deno.cwd()`,
-/// relative `Deno.readFile`, relative imports) while permissions and entry
-/// resolution use `options.cwd` — a split that silently breaks relative reads
-/// under restricted grants.
+/// Concurrency protocol for in-process runs: ordinary runs are fully
+/// parallel (each runs its own thread + isolate + graph, sharing nothing
+/// mutable), while a captured run is **exclusive** — output capture is
+/// fd-level redirection of the process-global stdout/stderr, so any
+/// concurrent run (captured or not) would have its output stolen by the
+/// capture reader. Rather than serializing everything (the old CWD_LOCK
+/// model, which made all concurrent runs wait on the process mutex for the
+/// full run duration), a run that needs capture is rejected with a
+/// [`LibdenoError::Configuration`] error when any other run is active —
+/// capture belongs in the subprocess model, where each process has its own
+/// fds.
 ///
-/// The cwd is process-global, so all [`run`]/[`run_in_subprocess`] calls are
-/// serialized on [`CWD_LOCK`] while it is in effect.
-struct CwdGuard(Option<PathBuf>);
+/// State machine in one atomic: `0` idle, `usize::MAX` captured-run
+/// exclusive, `n` (1..MAX-1) ordinary runs active. Ordinary runs CAS-count
+/// up (rejected while a captured run holds the marker); a captured run
+/// CAS-swaps 0 → MAX (rejected otherwise). Lock-free, no spurious
+/// serialization.
+const CAPTURE_MARKER: usize = usize::MAX;
+static RUN_STATE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-impl CwdGuard {
-    fn set(cwd: &Path) -> Self {
-        let prev = std::env::current_dir().ok();
-        // Canonicalize so scripts observe a consistent cwd on every platform:
-        // unix getcwd already resolves aliases (e.g. /var -> /private/var),
-        // but Windows GetCurrentDirectory echoes back exactly what was set —
-        // including 8.3 short names (e.g. RUNNER~1) from temp paths — so
-        // canonicalizing first makes Deno.cwd()/process.cwd() match
-        // fs::canonicalize everywhere.
-        let target = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        if std::env::set_current_dir(&target).is_err() {
-            eprintln!(
-                "libdeno: failed to chdir to cwd {}; relative paths resolve against the host cwd",
-                cwd.display()
-            );
-            return Self(None);
+/// RAII lease taken for the duration of a run (before spawning any thread).
+struct RunLease {
+    /// Whether this lease holds the capture marker (must restore to 0).
+    captured: bool,
+}
+
+impl RunLease {
+    fn acquire(captured: bool) -> Result<Self, LibdenoError> {
+        use std::sync::atomic::Ordering::*;
+        if captured {
+            if RUN_STATE
+                .compare_exchange(0, CAPTURE_MARKER, AcqRel, Relaxed)
+                .is_err()
+            {
+                return Err(LibdenoError::Configuration(
+                    "output capture is process-global (fd-level redirection) \
+                     and cannot coexist with any other run — run this script \
+                     through run_in_subprocess instead, where each process \
+                     has its own fds"
+                        .to_string(),
+                ));
+            }
+        } else {
+            loop {
+                let cur = RUN_STATE.load(Acquire);
+                if cur == CAPTURE_MARKER {
+                    return Err(LibdenoError::Configuration(
+                        "a captured run is active; output capture is \
+                         process-global and would steal this run's stdout. \
+                         Run the captured script through run_in_subprocess, \
+                         or wait for the captured run to finish"
+                            .to_string(),
+                    ));
+                }
+                if RUN_STATE
+                    .compare_exchange(cur, cur + 1, AcqRel, Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
         }
-        Self(prev)
+        Ok(Self { captured })
     }
 }
 
-impl Drop for CwdGuard {
+impl Drop for RunLease {
     fn drop(&mut self) {
-        if let Some(prev) = &self.0 {
-            let _ = std::env::set_current_dir(prev);
+        use std::sync::atomic::Ordering::*;
+        if self.captured {
+            RUN_STATE.store(0, Release);
+        } else {
+            RUN_STATE.fetch_sub(1, AcqRel);
         }
     }
 }
-
-/// Serializes in-process [`run`] calls: [`run`] switches the process cwd to
-/// `LibdenoOptions.cwd` for its duration (CwdGuard), and the process cwd is
-/// global, so concurrent runs would stomp each other. [`run_in_subprocess`]
-/// does NOT take this lock — it pins the child's cwd at spawn via
-/// `Command::current_dir`, so a long-lived child can never hold the
-/// process-global lock. Runs are heavyweight anyway, so serialization costs
-/// nothing in practice.
-pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // Generated by build.rs: the V8 snapshot and the residual lazy-load sources.
 include!(concat!(env!("OUT_DIR"), "/EXTENSION_RESIDUAL_SOURCES.rs"));
@@ -150,9 +178,12 @@ pub struct LibdenoOptions {
     /// Working directory that relative paths (entry, permissions, node_modules
     /// discovery) resolve against. Defaults to the process current directory.
     ///
-    /// [`run`] switches the process cwd to this directory for the duration of
-    /// the run (restoring it afterwards), so scripts see it as their working
-    /// directory too. Concurrent runs in the same process are not supported.
+    /// This is a **resolution base only** — the process cwd is never switched
+    /// (chdir is process-global and would serialize or corrupt concurrent
+    /// runs). The script observes the host's cwd: `Deno.cwd()` and relative
+    /// filesystem operations inside the script resolve against it, so script
+    /// authors should use absolute paths (or [`crate::run_in_subprocess`],
+    /// where the child's cwd is pinned at spawn).
     pub cwd: Option<PathBuf>,
     /// Hard cap on the V8 old-generation heap in bytes (the constraint behind
     /// `--v8-flags=--max-old-space-size`); V8 aborts with OOM when hit.
@@ -164,7 +195,10 @@ pub struct LibdenoOptions {
     /// [`RunOutput::stdout`] instead of the host's terminal. Off by default
     /// (output passes through). While active the redirection is
     /// process-global: other host threads printing to stdout during the run
-    /// are captured too (runs are serialized on the internal cwd lock).
+    /// are captured too, and the run is **exclusive** — any concurrent run
+    /// (captured or not) is rejected with [`LibdenoError::Configuration`]
+    /// (see [`RunLease`]). For captured runs alongside parallel execution use
+    /// [`run_in_subprocess`], where each process has its own fds.
     pub capture_stdout: bool,
     /// Redirect the script's stderr (fd 2, e.g. `console.error`) into
     /// [`RunOutput::stderr`]; same semantics and caveats as
@@ -255,11 +289,13 @@ impl From<Box<deno_core::error::JsError>> for LibdenoError {
 /// Runs `entry` (a file, a directory, or a package.json) to completion and
 /// returns the exit code the script requested (0 on normal completion).
 ///
-/// Each call builds its own current-thread runtime and worker. `run` calls
-/// are serialized among themselves: the process cwd is switched to
-/// `options.cwd` for the duration of the run (and restored afterwards), so
-/// scripts observe a consistent working directory. [`run_in_subprocess`] does
-/// not take the cwd lock (it pins the child's cwd at spawn instead).
+/// Each call builds its own current-thread runtime and worker. Ordinary runs
+/// execute **in parallel** — they share nothing mutable. The one exception:
+/// output capture is process-global fd redirection, so a captured run is
+/// exclusive and any overlapping run is rejected with
+/// [`LibdenoError::Configuration`] (see [`RunLease`]); use
+/// [`run_in_subprocess`] for captured runs, where each process has its own
+/// fds.
 pub fn run(entry: impl AsRef<Path>, options: &LibdenoOptions) -> Result<i32, LibdenoError> {
     run_with_output(entry, options).map(|o| o.exit_code)
 }
@@ -272,15 +308,17 @@ pub fn run(entry: impl AsRef<Path>, options: &LibdenoOptions) -> Result<i32, Lib
 /// tokio runtime inside a tokio runtime panics, so when called from inside a
 /// tokio context the run executes on a fresh thread (exactly the
 /// `std::thread::spawn + join` escape async hosts previously had to build
-/// themselves). The internal cwd lock is held across that thread's lifetime,
-/// so concurrent runs remain serialized.
+/// themselves). A captured run holds the exclusivity lease across that
+/// thread's lifetime (see [`RunLease`]).
 pub fn run_with_output(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<RunOutput, LibdenoError> {
-    // The process cwd is process-global; serialize so a concurrent run cannot
-    // observe another run's cwd (see CWD_LOCK).
-    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Capture is process-global (fd-level redirection): take the exclusivity
+    // lease before the run starts so a concurrent run can be rejected cleanly
+    // (see RunLease). Ordinary runs take the lease too — they must not start
+    // while a captured run is active — but otherwise run fully in parallel.
+    let _lease = RunLease::acquire(options.capture_stdout || options.capture_stderr)?;
     // Capture the entry-time child-IPC marker (and write it back so fork children inherit it).
     limits::capture_spawned_ipc_marker();
     let entry = entry.as_ref().to_path_buf();
@@ -296,6 +334,15 @@ pub fn run_with_output(
     }
 }
 
+/// Shared message for the Windows capture rejection (sync and async entry
+/// points both hit it). Only compiled on Windows — the only platform that
+/// references it.
+#[cfg(windows)]
+const CAPTURE_UNSUPPORTED_ON_WINDOWS: &str =
+    "output capture is not supported on Windows (std stdout/stderr \
+     bypass the redirected CRT fd); use run_in_subprocess and pipe \
+     the child's output instead";
+
 fn run_sync_output(entry: &Path, options: &LibdenoOptions) -> Result<RunOutput, LibdenoError> {
     // Windows: Rust std's stdout/stderr write via GetStdHandle, bypassing the
     // CRT fd that dup2 redirects, so console output cannot be captured
@@ -304,10 +351,7 @@ fn run_sync_output(entry: &Path, options: &LibdenoOptions) -> Result<RunOutput, 
     #[cfg(windows)]
     if options.capture_stdout || options.capture_stderr {
         return Err(LibdenoError::Configuration(
-            "output capture is not supported on Windows (std stdout/stderr \
-             bypass the redirected CRT fd); use run_in_subprocess and pipe \
-             the child's output instead"
-                .to_string(),
+            CAPTURE_UNSUPPORTED_ON_WINDOWS.to_string(),
         ));
     }
     let capture = output::OutputCapture::new(
@@ -317,6 +361,127 @@ fn run_sync_output(entry: &Path, options: &LibdenoOptions) -> Result<RunOutput, 
     )
     .map_err(LibdenoError::Io)?;
     let result = run_sync(entry, options);
+    let (stdout, stderr, capture_truncated) = capture.finish();
+    Ok(RunOutput {
+        exit_code: result?,
+        stdout,
+        stderr,
+        capture_truncated,
+    })
+}
+
+/// Runs `entry` on the **caller's** tokio runtime. Identical semantics to
+/// [`run`], but nothing spawns a thread: the run's async chain (resolver
+/// stack build, graph build, event loop) executes on the calling runtime.
+/// For a server host that already has a runtime this removes the per-run
+/// OS-thread cost of [`run`]'s tokio re-entry escape.
+///
+/// Requirements:
+/// - Must be called from inside a tokio runtime context (`tokio::spawn`,
+///   `block_on`, another `async fn`, ...). Outside one, use [`run`].
+/// - The returned future is **not `Send`** and — unlike ordinary [`run`]
+///   calls — `run_async` futures must not be **interleaved** with each other:
+///   a V8 isolate is pinned to the thread that created it (v8 0.150's
+///   `PinnedRef`), and deno's worker stack is `Rc`-based, so two `run_async`
+///   polled alternately on one thread abort the process (`HandleScope`
+///   fatal). Await them strictly one at a time; for parallel runs use
+///   [`run`] (each run gets its own thread + isolate) or
+///   [`run_in_subprocess`]. A single `run_async` may be awaited on a
+///   current-thread runtime directly, or on a multi-thread runtime inside
+///   `tokio::task::LocalSet::block_on` / `spawn_local`.
+/// - Capture, exclusivity, deadlines and every other option behave exactly
+///   as in [`run_with_output`] / [`run`].
+pub async fn run_async(
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+) -> Result<i32, LibdenoError> {
+    run_with_output_async(entry, options)
+        .await
+        .map(|o| o.exit_code)
+}
+
+/// Async equivalent of [`run_with_output`]: same captured-output semantics,
+/// executed on the caller's runtime with no spawned thread. See
+/// [`run_async`] for the tokio-context and non-`Send` requirements.
+pub async fn run_with_output_async(
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+) -> Result<RunOutput, LibdenoError> {
+    // Outside a tokio context the run's async chain would panic deep inside
+    // deno (runtime-context assert) — report it like every other invalid
+    // usage instead.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Err(LibdenoError::Configuration(
+            "run_async must be called from inside a tokio runtime context; \
+             outside one, use run()"
+                .to_string(),
+        ));
+    }
+    // Interleaving two run_async futures on one thread aborts the process
+    // (v8 pins the isolate to its creating thread — see [`run_async`]). The
+    // lease is process-global and cannot see this thread-local hazard, so a
+    // thread-local in-progress guard turns the crash into a recoverable
+    // Configuration error, matching the capture-exclusivity pattern. The
+    // guard is RAII: dropping the future (even mid-run, via cancel/select!)
+    // clears the flag.
+    let _guard = AsyncRunGuard::acquire()?;
+    run_with_output_async_inner(entry, options).await
+}
+
+/// Thread-local guard: one `run_async` at a time per thread (see
+/// [`run_with_output_async`]). RAII so a dropped (cancelled) future clears
+/// the flag on every exit path.
+struct AsyncRunGuard;
+
+thread_local! {
+    static RUN_ASYNC_IN_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl AsyncRunGuard {
+    fn acquire() -> Result<Self, LibdenoError> {
+        if RUN_ASYNC_IN_PROGRESS.with(|in_progress| in_progress.replace(true)) {
+            return Err(LibdenoError::Configuration(
+                "a run_async is already in progress on this thread; run_async \
+                 futures must not be interleaved — await them one at a time, or \
+                 use run() for parallel runs"
+                    .to_string(),
+            ));
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for AsyncRunGuard {
+    fn drop(&mut self) {
+        RUN_ASYNC_IN_PROGRESS.with(|in_progress| in_progress.set(false));
+    }
+}
+
+/// The actual async run, split out so the thread-local guard above always
+/// runs to completion (cleared even on panic paths of the await).
+async fn run_with_output_async_inner(
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+) -> Result<RunOutput, LibdenoError> {
+    // Same lease protocol as the sync path: capture is process-global and
+    // exclusive; the lease is an atomic RAII guard, so it is safe to hold
+    // across awaits.
+    let _lease = RunLease::acquire(options.capture_stdout || options.capture_stderr)?;
+    // Capture the entry-time child-IPC marker (fork children inherit it).
+    limits::capture_spawned_ipc_marker();
+    #[cfg(windows)]
+    if options.capture_stdout || options.capture_stderr {
+        return Err(LibdenoError::Configuration(
+            CAPTURE_UNSUPPORTED_ON_WINDOWS.to_string(),
+        ));
+    }
+    let capture = output::OutputCapture::new(
+        options.capture_stdout,
+        options.capture_stderr,
+        options.max_capture_bytes,
+    )
+    .map_err(LibdenoError::Io)?;
+    let result = run_inner(entry.as_ref(), options).await;
     let (stdout, stderr, capture_truncated) = capture.finish();
     Ok(RunOutput {
         exit_code: result?,
@@ -362,18 +527,14 @@ fn run_sync(entry: &Path, options: &LibdenoOptions) -> Result<i32, LibdenoError>
 }
 
 async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, LibdenoError> {
-    // Canonicalize once so entry resolution, permission grants, node_modules
-    // discovery and the process cwd all agree: unix getcwd already
-    // canonicalizes (e.g. /var -> /private/var) and CwdGuard canonicalizes
-    // before chdir, so a symlinked options.cwd would otherwise split
-    // Deno.cwd() (canonical) from relative grants/entry (aliased).
+    // Canonicalize once so entry resolution, permission grants and
+    // node_modules discovery all agree on the resolution base: unix getcwd
+    // already canonicalizes (e.g. /var -> /private/var), so a symlinked
+    // options.cwd would otherwise split grants/entry (aliased) from the
+    // canonical path. This is a resolution-base only — the process cwd is
+    // never switched (see the module docs: the script observes the host cwd).
     let cwd_raw = options.cwd.clone().unwrap_or(std::env::current_dir()?);
     let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
-    // Deliberately keep this guard: `run_with` goes straight into
-    // `run_inner_with` (which sets a second guard), and `run_inner` builds
-    // SharedServices while this guard is in effect. The double guard is
-    // redundant but correct — merging them is not worth the micro-refactor.
-    let _cwd_guard = CwdGuard::set(&cwd);
     let main_module = resolve_entry(entry, &cwd).map_err(LibdenoError::Entry)?;
     let config_start_paths = main_module
         .to_file_path()
@@ -404,7 +565,6 @@ pub(crate) async fn run_inner_with(
             deno_runtime::deno_tls::rustls::crypto::aws_lc_rs::default_provider(),
         );
     }
-    let _cwd_guard = CwdGuard::set(&cwd);
     let main_module = resolve_entry(entry, &cwd).map_err(LibdenoError::Entry)?;
 
     let fs: Arc<dyn FileSystem> = Arc::new(RealFs);
@@ -598,7 +758,7 @@ pub(crate) async fn run_inner_with(
     .await
     {
         Ok(result) => result,
-        // Deadline fired: isolate terminated; cwd lock releases on return.
+        // Deadline fired: isolate terminated; the run lease releases on return.
         Err(deadline) => {
             return Err(LibdenoError::Timeout(format!(
                 "execution deadline of {deadline:?} exceeded; isolate terminated"

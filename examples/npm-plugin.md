@@ -71,8 +71,11 @@ If the plugin (or its npm dependencies) load a `.node` native addon:
 
 - Output capture is fd-level and process-global for the run's duration:
   other host threads printing during the run land in the captured buffer
-  too (runs are serialized internally).
+  too, and a captured run is exclusive — any concurrent run is rejected
+  with `LibdenoError::Configuration` (capture belongs in the subprocess
+  model).
 - The runtime's console takes the process-global `std::io::stdout()/stderr()`
   locks; don't hold those across an await boundary while calling libdeno.
-- Runs are serialized on an internal cwd lock — for high-frequency small
-  tasks, batch them into one script rather than spawning many `run` calls.
+- Ordinary runs are fully parallel (each has its own isolate + graph); for
+  high-frequency small tasks, batch them into one script rather than
+  spawning many `run` calls — the per-run startup cost dominates.

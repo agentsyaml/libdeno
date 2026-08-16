@@ -276,7 +276,9 @@ fn write_project(dir: &Path) {
         dir.join("main.js"),
         "import pkg from 'npm:mock-pkg';\n\
          if (pkg !== 'hello-from-mock-pkg') throw new Error('unexpected pkg: ' + pkg);\n\
-         Deno.writeTextFileSync('out.txt', pkg);",
+         // Absolute path via import.meta.url: in-process runs never chdir, so\n\
+         // a relative path would resolve against the host cwd.\n\
+         Deno.writeTextFileSync(new URL('./out.txt', import.meta.url), pkg);",
     )
     .unwrap();
 }

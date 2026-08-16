@@ -274,7 +274,7 @@ pub(crate) fn in_process_code_cache() -> Arc<dyn CodeCache> {
 /// polls the task that is currently inside the V8 call. `terminate_execution`
 /// from another thread is the documented V8 mechanism to interrupt running
 /// JavaScript: it throws an uncatchable termination error at the next stack
-/// check, `run_event_loop` returns, the future unwinds and the run's cwd lock
+/// check, `run_event_loop` returns, the future unwinds and the run's lease
 /// is released. The `deadline + GRACE` outer timeout additionally bounds the
 /// case where the event loop was idle (parked on a far-future timer, with no
 /// JS running to throw into); dropping the future then is safe because no JS
@@ -380,9 +380,10 @@ static NODE_IPC_MARKER: OnceLock<bool> = OnceLock::new();
 /// Captures the original [`LIBDENO_SPAWNED_IPC`] marker at process entry,
 /// then writes it into our own environment so `child_process.fork` children
 /// (which inherit the env and carry deno_node's `NODE_CHANNEL_FD`) honor their
-/// IPC channel. Called from [`crate::run`] under CWD_LOCK, which serializes
-/// the env write (edition 2021: `set_var` is safe; concurrent runs in one
-/// process are already excluded).
+/// IPC channel. Called from [`crate::run`] with the run lease held.
+/// The env write (edition 2021: `set_var` is safe; runs are concurrent but
+/// the written value is the constant captured at process entry, and `set_var`
+/// is internally synchronized on the target platforms).
 ///
 /// Known tradeoff: the write also means ordinary subprocesses the host spawns
 /// afterwards inherit LIBDENO_SPAWNED_IPC=1; the entry-time capture (never a

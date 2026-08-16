@@ -19,6 +19,12 @@ use std::path::PathBuf;
 
 use libdeno::{run, run_with_output, LibdenoOptions};
 
+/// Capture is process-global (fd redirection) and exclusive: a captured run
+/// rejects any concurrent run. `cargo test` runs tests in parallel, so every
+/// capture test must take this test-level mutex — the library's own
+/// concurrency rules, enforced at the test-suite level.
+static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("libdeno-cap-{}-{}", std::process::id(), name));
     fs::create_dir_all(&dir).unwrap();
@@ -27,6 +33,7 @@ fn temp_dir(name: &str) -> PathBuf {
 
 #[test]
 fn capture_stdout_gets_console_log() {
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // The redirection is fd-level and process-global, so parallel test-harness
     // reports ("test ... ok") can land in the buffer too; assert the script's
     // line is present rather than exact equality.
@@ -50,6 +57,7 @@ fn capture_stdout_gets_console_log() {
 
 #[test]
 fn capture_stderr_gets_console_error() {
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Same contains-style assertion as the stdout test: the capture is
     // process-global, so in-process harness/panic output can land in it.
     let dir = temp_dir("err");
@@ -72,6 +80,7 @@ fn capture_stderr_gets_console_error() {
 
 #[test]
 fn without_capture_output_is_empty() {
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = temp_dir("nocap");
     let entry = dir.join("main.js");
     fs::write(&entry, "console.log('not captured');").unwrap();
@@ -91,6 +100,7 @@ fn without_capture_output_is_empty() {
 
 #[test]
 fn run_works_from_inside_tokio_context() {
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Regression: run() used to error with "cannot be called from inside a
     // tokio runtime", forcing async hosts to spawn a thread themselves. It
     // now does that internally; the run must still complete and the script's
@@ -122,6 +132,7 @@ fn run_works_from_inside_tokio_context() {
 
 #[test]
 fn run_inside_tokio_keeps_error_reporting() {
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Errors must still surface (not panic) when routed through the tokio path.
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -148,6 +159,7 @@ fn run_inside_tokio_keeps_error_reporting() {
 
 #[test]
 fn capture_truncates_at_max_capture_bytes() {
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // A verbose script must not grow host memory without limit: the byte cap
     // stops capture and flags the truncation instead.
     let dir = temp_dir("cap");
@@ -176,6 +188,7 @@ fn capture_truncates_at_max_capture_bytes() {
 
 #[test]
 fn capture_within_budget_is_not_truncated() {
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = temp_dir("fit");
     let entry = dir.join("main.js");
     fs::write(&entry, "console.log('small');").unwrap();
@@ -198,6 +211,7 @@ fn capture_within_budget_is_not_truncated() {
 
 #[test]
 fn run_with_reuses_stack_and_captures() {
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // The reusable-runtime path must honor capture too: long-lived hosts get
     // both stack reuse and per-run captured output via
     // libdeno::runtime::run_with_output.
