@@ -119,100 +119,123 @@ pub fn run_in_subprocess(
     // deadlock hosts that run long-lived children (plugins/daemons): the
     // first child would hold a process-global lock forever and block every
     // later run_in_subprocess or run() call in the same process.
-    let token = child_token()?;
-    let (payload, mut child) = {
-        let cwd = options.cwd.clone().unwrap_or(std::env::current_dir()?);
-        let request = ChildRunRequest {
-            entry: entry.as_ref().to_path_buf(),
-            permissions: options.permissions.clone(),
-            allow_all_permissions: options.allow_all_permissions,
-            prompt: options.prompt,
-            args: options.args.clone(),
-            cwd: cwd.clone(),
-            token: token.clone(),
-            features: options.features.clone(),
-            max_heap_bytes: options.max_heap_bytes,
-            execution_deadline: options.execution_deadline,
-        };
-        let payload = deno_core::serde_json::to_vec(&request)
-            .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
-        let exe = std::env::var_os(LIBDENO_HOST_EXE)
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_exe()?);
-        let child = std::process::Command::new(exe)
-            .env(LIBDENO_CHILD_MODE, "1")
-            .env(LIBDENO_SPAWNED_IPC, "1")
-            .env(LIBDENO_CHILD_TOKEN, &token)
-            .current_dir(&cwd)
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .map_err(LibdenoError::Io)?;
-        (payload, child)
-    };
-    {
-        use std::io::Write;
-        let write_result = match child.stdin.take() {
-            Some(mut stdin) => {
-                // The payload write can block forever when the host never
-                // services child mode (a host that does not call
-                // maybe_handle_child_mode never reads stdin): once the pipe
-                // buffer (~64 KiB) fills, write_all blocks until the child
-                // reads. Move the blocking write to a detached thread and
-                // bound the wait at 10s (aligned with the child side's own
-                // stdin deadline). On timeout the child is killed (closing its
-                // pipe end, which unblocks the writer) and a Timeout error is
-                // surfaced. The thread is deliberately not joined: after the
-                // kill it can still be blocked inside write_all, and the
-                // process reaps it at exit.
-                let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
-                std::thread::spawn(move || {
-                    let _ = tx.send(stdin.write_all(&payload));
-                });
-                match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(LibdenoError::Io(e)),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(LibdenoError::Timeout(
-                        "subprocess handshake timed out after 10s: \
-                             host did not service child mode (stdin not read)"
-                            .to_string(),
-                    )),
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-                            "child stdin writer terminated unexpectedly"
-                        )))
-                    }
-                }
-            }
-            None => Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-                "child has no stdin"
-            ))),
-        };
-        if let Err(e) = write_result {
-            // Don't leak the child (or a zombie) on this error path: it may be
-            // blocked reading stdin or already dead. If it already exited
-            // (e.g. its 10s stdin deadline fired, or it was killed), the write
-            // failure is downstream of that — surface the child's state
-            // instead of a bare Broken pipe.
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    return Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-                        "child exited with {status} before accepting the run request \
-                         (request write failed: {e})"
-                    )));
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(e);
-                }
-            }
-        }
-    }
+    let (payload, mut child) = spawn_child_request(
+        entry.as_ref(),
+        options,
+        std::process::Stdio::inherit(),
+        std::process::Stdio::inherit(),
+    )?;
+    write_child_request(&mut child, payload)?;
     // The writer thread dropped the last handle to the child's stdin after the
     // payload write, so a script reading process.stdin sees EOF instead of
     // blocking forever on the still-open pipe.
     let status = child.wait().map_err(LibdenoError::Io)?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Spawns the host executable in child mode with the run request payload
+/// ready to write. `stdout`/`stderr` pick the stdio mode: inherit for
+/// [`run_in_subprocess`], piped for [`run_in_subprocess_with_output`].
+///
+/// The child's cwd is pinned from a plain read with no synchronization:
+/// in-process runs never switch the process cwd (cwd is a resolution base
+/// only), and the request payload carries its own cwd for the child side.
+fn spawn_child_request(
+    entry: &Path,
+    options: &LibdenoOptions,
+    stdout: std::process::Stdio,
+    stderr: std::process::Stdio,
+) -> Result<(Vec<u8>, std::process::Child), LibdenoError> {
+    let token = child_token()?;
+    let cwd = options.cwd.clone().unwrap_or(std::env::current_dir()?);
+    let request = ChildRunRequest {
+        entry: entry.to_path_buf(),
+        permissions: options.permissions.clone(),
+        allow_all_permissions: options.allow_all_permissions,
+        prompt: options.prompt,
+        args: options.args.clone(),
+        cwd: cwd.clone(),
+        token: token.clone(),
+        features: options.features.clone(),
+        max_heap_bytes: options.max_heap_bytes,
+        execution_deadline: options.execution_deadline,
+    };
+    let payload = deno_core::serde_json::to_vec(&request)
+        .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
+    let exe = std::env::var_os(LIBDENO_HOST_EXE)
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_exe()?);
+    let child = std::process::Command::new(exe)
+        .env(LIBDENO_CHILD_MODE, "1")
+        .env(LIBDENO_SPAWNED_IPC, "1")
+        .env(LIBDENO_CHILD_TOKEN, &token)
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .map_err(LibdenoError::Io)?;
+    Ok((payload, child))
+}
+
+/// Bounded payload write with the 10s handshake timeout. The payload write
+/// can block forever when the host never services child mode (a host that
+/// does not call maybe_handle_child_mode never reads stdin): once the pipe
+/// buffer (~64 KiB) fills, write_all blocks until the child reads. The
+/// blocking write runs on a detached thread bounded at 10s (aligned with
+/// the child side's own stdin deadline). On timeout the child is killed
+/// (closing its pipe end, which unblocks the writer) and a Timeout error is
+/// surfaced. The thread is deliberately not joined: after the kill it can
+/// still be blocked inside write_all, and the process reaps it at exit.
+///
+/// On write failure the child is not leaked (or left a zombie): it may be
+/// blocked reading stdin or already dead. If it already exited (e.g. its
+/// 10s stdin deadline fired, or it was killed), the write failure is
+/// downstream of that — surface the child's state instead of a bare
+/// Broken pipe.
+fn write_child_request(
+    child: &mut std::process::Child,
+    payload: Vec<u8>,
+) -> Result<(), LibdenoError> {
+    use std::io::Write;
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => {
+            let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+            std::thread::spawn(move || {
+                let _ = tx.send(stdin.write_all(&payload));
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(LibdenoError::Io(e)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(LibdenoError::Timeout(
+                    "subprocess handshake timed out after 10s: \
+                         host did not service child mode (stdin not read)"
+                        .to_string(),
+                )),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(LibdenoError::Runtime(
+                    deno_core::anyhow::anyhow!("child stdin writer terminated unexpectedly"),
+                )),
+            }
+        }
+        None => Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+            "child has no stdin"
+        ))),
+    };
+    if let Err(e) = write_result {
+        match child.try_wait() {
+            Ok(Some(status)) => Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                "child exited with {status} before accepting the run request \
+                 (request write failed: {e})"
+            ))),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(e)
+            }
+        }
+    } else {
+        Ok(())
+    }
 }
 
 /// Runs `entry` in a child process and returns the exit code together with
@@ -237,85 +260,13 @@ pub fn run_in_subprocess_with_output(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<crate::RunOutput, LibdenoError> {
-    let token = child_token()?;
-    let (payload, mut child) = {
-        let cwd = options.cwd.clone().unwrap_or(std::env::current_dir()?);
-        let request = ChildRunRequest {
-            entry: entry.as_ref().to_path_buf(),
-            permissions: options.permissions.clone(),
-            allow_all_permissions: options.allow_all_permissions,
-            prompt: options.prompt,
-            args: options.args.clone(),
-            cwd: cwd.clone(),
-            token: token.clone(),
-            features: options.features.clone(),
-            max_heap_bytes: options.max_heap_bytes,
-            execution_deadline: options.execution_deadline,
-        };
-        let payload = deno_core::serde_json::to_vec(&request)
-            .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
-        let exe = std::env::var_os(LIBDENO_HOST_EXE)
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_exe()?);
-        let child = std::process::Command::new(exe)
-            .env(LIBDENO_CHILD_MODE, "1")
-            .env(LIBDENO_SPAWNED_IPC, "1")
-            .env(LIBDENO_CHILD_TOKEN, &token)
-            .current_dir(&cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(LibdenoError::Io)?;
-        (payload, child)
-    };
-    {
-        use std::io::Write;
-        // Same bounded handshake as run_in_subprocess: a host that never
-        // services child mode would block the payload write forever once the
-        // pipe buffer fills, so the write runs on a detached thread with a
-        // 10s bound, and the child is killed on timeout.
-        let write_result = match child.stdin.take() {
-            Some(mut stdin) => {
-                let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
-                std::thread::spawn(move || {
-                    let _ = tx.send(stdin.write_all(&payload));
-                });
-                match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(LibdenoError::Io(e)),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(LibdenoError::Timeout(
-                        "subprocess handshake timed out after 10s: \
-                             host did not service child mode (stdin not read)"
-                            .to_string(),
-                    )),
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-                            "child stdin writer terminated unexpectedly"
-                        )))
-                    }
-                }
-            }
-            None => Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-                "child has no stdin"
-            ))),
-        };
-        if let Err(e) = write_result {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    return Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-                        "child exited with {status} before accepting the run request \
-                         (request write failed: {e})"
-                    )));
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(e);
-                }
-            }
-        }
-    }
+    let (payload, mut child) = spawn_child_request(
+        entry.as_ref(),
+        options,
+        std::process::Stdio::piped(),
+        std::process::Stdio::piped(),
+    )?;
+    write_child_request(&mut child, payload)?;
     // Drain both pipes concurrently with wait(): a child that fills a pipe
     // buffer blocks on write, so the parent must read while waiting or the
     // run deadlocks. Each stream keeps the first `max_capture_bytes` bytes
