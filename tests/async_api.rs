@@ -8,7 +8,9 @@ use std::fs;
 use std::future::Future;
 use std::path::PathBuf;
 
-use libdeno::{run_async, run_with_output_async, LibdenoOptions};
+use libdeno::{run_async, LibdenoOptions};
+#[cfg(not(windows))]
+use libdeno::run_with_output_async;
 
 /// The capture test's exclusivity lease rejects any concurrent run, so tests
 /// in this file (which cargo test runs in parallel) must take this lock —
