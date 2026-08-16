@@ -54,6 +54,13 @@ fn run_with_happy_path_returns_exit_code() {
         .unwrap()
         .display()
         .to_string();
+    // Windows canonicalize returns a \\?\ verbatim path; Deno.cwd() never
+    // has the prefix — strip it so the comparison is apples-to-apples.
+    #[cfg(windows)]
+    let host_cwd = host_cwd
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&host_cwd)
+        .to_string();
     assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), host_cwd);
     let _ = fs::remove_dir_all(&dir);
 }

@@ -222,6 +222,13 @@ fn cwd_option_is_resolution_base_not_process_cwd() {
         .unwrap()
         .display()
         .to_string();
+    // Windows canonicalize returns a \\?\ verbatim path; Deno.cwd() never
+    // has the prefix — strip it so the comparison is apples-to-apples.
+    #[cfg(windows)]
+    let host_cwd = host_cwd
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&host_cwd)
+        .to_string();
     fs::write(
         &entry,
         format!("if (Deno.cwd() !== {host_cwd:?}) throw new Error('cwd mismatch');"),
