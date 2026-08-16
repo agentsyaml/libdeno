@@ -495,6 +495,13 @@ fn subprocess_child_uses_options_cwd() {
     // Canonicalize: Deno.cwd()/process.cwd() come from getcwd, which resolves
     // symlinks (e.g. /var -> /private/var on macOS).
     let expected = fs::canonicalize(&dir).unwrap().display().to_string();
+    // Windows canonicalize returns a \\?\ verbatim path; Deno.cwd() never
+    // has the prefix — strip it so the comparison is apples-to-apples.
+    #[cfg(windows)]
+    let expected = expected
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&expected)
+        .to_string();
     fs::write(
         &entry,
         format!("if (Deno.cwd() !== {expected:?}) throw new Error('cwd mismatch');"),
