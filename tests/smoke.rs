@@ -325,6 +325,130 @@ fn subprocess_mode_passes_args() {
 }
 
 #[test]
+fn subprocess_child_env_is_clean() {
+    // Child-mode markers must be stripped before the script runs: a script
+    // spawning its own subprocesses (git, compilers, helpers) must not pass
+    // LIBDENO_CHILD_MODE/TOKEN down, or every grandchild would enter child
+    // mode with a consumed stdin and die.
+    let dir = temp_dir("subproc-env-clean");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "if (Deno.env.get('LIBDENO_CHILD_MODE') !== undefined ||\n\
+             Deno.env.get('LIBDENO_CHILD_TOKEN') !== undefined) {\n\
+           throw new Error('child-mode markers leaked into the script env');\n\
+         }",
+    )
+    .unwrap();
+    let _host_exe = set_host_exe(env!("CARGO_BIN_EXE_child_host"));
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let code = libdeno::run_in_subprocess(&entry, &options).unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn subprocess_grandchild_spawns_cleanly() {
+    // End-to-end: a script in child mode spawns its own subprocess and the
+    // grandchild runs normally (would enter child mode and die without the
+    // env strip).
+    let dir = temp_dir("subproc-grandchild");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "const out = new Deno.Command('/bin/echo', { args: ['grandchild-ok'], stdout: 'piped' }).outputSync();\n\
+         if (new TextDecoder().decode(out.stdout).trim() !== 'grandchild-ok') {\n\
+           throw new Error('grandchild did not run cleanly');\n\
+         }",
+    )
+    .unwrap();
+    let _host_exe = set_host_exe(env!("CARGO_BIN_EXE_child_host"));
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let code = libdeno::run_in_subprocess(&entry, &options).unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn subprocess_output_captures_both_streams() {
+    // The subprocess answer to output capture: the child's own fds are
+    // piped, so both streams come back — on every platform, Windows
+    // included (in-process capture is rejected there).
+    let dir = temp_dir("subproc-out-cap");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "console.log('child-out');\nconsole.error('child-err');",
+    )
+    .unwrap();
+    let _host_exe = set_host_exe(env!("CARGO_BIN_EXE_child_host"));
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let output = libdeno::run_in_subprocess_with_output(&entry, &options).unwrap();
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        output.stdout.windows(9).any(|w| w == b"child-out"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        output.stderr.windows(9).any(|w| w == b"child-err"),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.capture_truncated);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn subprocess_output_respects_capture_budget() {
+    // max_capture_bytes caps each stream; excess is drained and dropped so
+    // the child never blocks on a full pipe, and the run still succeeds.
+    let dir = temp_dir("subproc-out-cap-budget");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "console.log('x'.repeat(2000));\nconsole.error('y'.repeat(2000));",
+    )
+    .unwrap();
+    let _host_exe = set_host_exe(env!("CARGO_BIN_EXE_child_host"));
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        max_capture_bytes: Some(64),
+        ..Default::default()
+    };
+    let output = libdeno::run_in_subprocess_with_output(&entry, &options).unwrap();
+    assert_eq!(
+        output.exit_code, 0,
+        "the child must not be blocked by the budget"
+    );
+    assert!(
+        output.capture_truncated,
+        "2000 bytes over a 64-byte budget must truncate"
+    );
+    assert!(
+        output.stdout.len() <= 64,
+        "stdout budget exceeded: {}",
+        output.stdout.len()
+    );
+    assert!(
+        output.stderr.len() <= 64,
+        "stderr budget exceeded: {}",
+        output.stderr.len()
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn subprocess_mode_forwards_features() {
     // Safety options must reach the child: a host that shrinks `features`
     // for an untrusted plugin gets the same shrink in child mode, not the

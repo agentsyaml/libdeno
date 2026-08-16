@@ -215,6 +215,163 @@ pub fn run_in_subprocess(
     Ok(status.code().unwrap_or(1))
 }
 
+/// Runs `entry` in a child process and returns the exit code together with
+/// the child's captured stdout/stderr — the subprocess answer to output
+/// capture.
+///
+/// Unlike in-process capture — which is fd-level redirection of the
+/// process-global stdout/stderr and therefore **exclusive** (any concurrent
+/// run is rejected with `Configuration`, and it does not work on Windows) —
+/// this capture is per-process: the child's own fds are piped back to the
+/// parent and read concurrently with `wait()` (a verbose child can never
+/// deadlock on a full pipe buffer). It runs in parallel with any other run,
+/// on every platform, Windows included.
+///
+/// `capture_stdout` / `capture_stderr` are always implied (both streams are
+/// returned); `max_capture_bytes` caps each stream — excess is dropped (the
+/// reader keeps draining so the child never blocks) and
+/// [`RunOutput::capture_truncated`](crate::RunOutput::capture_truncated) is
+/// set. Every other option (permissions, features, max_heap_bytes,
+/// execution_deadline, ...) behaves exactly as in [`run_in_subprocess`].
+pub fn run_in_subprocess_with_output(
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+) -> Result<crate::RunOutput, LibdenoError> {
+    let token = child_token()?;
+    let (payload, mut child) = {
+        let cwd = options.cwd.clone().unwrap_or(std::env::current_dir()?);
+        let request = ChildRunRequest {
+            entry: entry.as_ref().to_path_buf(),
+            permissions: options.permissions.clone(),
+            allow_all_permissions: options.allow_all_permissions,
+            prompt: options.prompt,
+            args: options.args.clone(),
+            cwd: cwd.clone(),
+            token: token.clone(),
+            features: options.features.clone(),
+            max_heap_bytes: options.max_heap_bytes,
+            execution_deadline: options.execution_deadline,
+        };
+        let payload = deno_core::serde_json::to_vec(&request)
+            .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
+        let exe = std::env::var_os(LIBDENO_HOST_EXE)
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_exe()?);
+        let child = std::process::Command::new(exe)
+            .env(LIBDENO_CHILD_MODE, "1")
+            .env(LIBDENO_SPAWNED_IPC, "1")
+            .env(LIBDENO_CHILD_TOKEN, &token)
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(LibdenoError::Io)?;
+        (payload, child)
+    };
+    {
+        use std::io::Write;
+        // Same bounded handshake as run_in_subprocess: a host that never
+        // services child mode would block the payload write forever once the
+        // pipe buffer fills, so the write runs on a detached thread with a
+        // 10s bound, and the child is killed on timeout.
+        let write_result = match child.stdin.take() {
+            Some(mut stdin) => {
+                let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+                std::thread::spawn(move || {
+                    let _ = tx.send(stdin.write_all(&payload));
+                });
+                match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(LibdenoError::Io(e)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(LibdenoError::Timeout(
+                        "subprocess handshake timed out after 10s: \
+                             host did not service child mode (stdin not read)"
+                            .to_string(),
+                    )),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                            "child stdin writer terminated unexpectedly"
+                        )))
+                    }
+                }
+            }
+            None => Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                "child has no stdin"
+            ))),
+        };
+        if let Err(e) = write_result {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                        "child exited with {status} before accepting the run request \
+                         (request write failed: {e})"
+                    )));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e);
+                }
+            }
+        }
+    }
+    // Drain both pipes concurrently with wait(): a child that fills a pipe
+    // buffer blocks on write, so the parent must read while waiting or the
+    // run deadlocks. Each stream keeps the first `max_capture_bytes` bytes
+    // and keeps draining (dropping) the rest so the child never blocks; a
+    // truncated stream sets the flag, mirroring in-process capture.
+    let max = options.max_capture_bytes.unwrap_or(usize::MAX);
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|pipe| std::thread::spawn(move || drain_pipe(pipe, max)));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|pipe| std::thread::spawn(move || drain_pipe(pipe, max)));
+    let status = child.wait().map_err(LibdenoError::Io)?;
+    let (stdout, stdout_truncated) = stdout_handle
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    let (stderr, stderr_truncated) = stderr_handle
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    Ok(crate::RunOutput {
+        exit_code: status.code().unwrap_or(1),
+        stdout,
+        stderr,
+        capture_truncated: stdout_truncated || stderr_truncated,
+    })
+}
+
+/// Reads a child pipe to EOF, keeping the first `max` bytes; excess is
+/// drained and dropped (a truncated stream still unblocks the child). Read
+/// errors are tolerated (best-effort capture, like in-process capture).
+fn drain_pipe<R: std::io::Read>(mut pipe: R, max: usize) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut truncated = false;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = max.saturating_sub(out.len());
+                let keep = room.min(n);
+                if keep > 0 {
+                    out.extend_from_slice(&buf[..keep]);
+                }
+                if n > keep {
+                    truncated = true;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    (out, truncated)
+}
+
 /// Services a child-run request when this process was spawned by
 /// [`run_in_subprocess`].
 ///
@@ -315,6 +472,14 @@ pub fn maybe_handle_child_mode() -> bool {
             execution_deadline: request.execution_deadline,
             ..Default::default()
         };
+        // The request has been authenticated; strip the child-mode markers
+        // before running so any subprocess the script spawns (Deno.Command,
+        // child_process.spawn, exec) inherits a clean environment. Without
+        // this, every grandchild enters child mode with a consumed stdin and
+        // dies with an unactionable "stdin reader terminated" error — the
+        // exact break that would hit a plugin shelling out to git/compilers.
+        std::env::remove_var(LIBDENO_CHILD_MODE);
+        std::env::remove_var(LIBDENO_CHILD_TOKEN);
         run(&request.entry, &options)
     })();
     match result {

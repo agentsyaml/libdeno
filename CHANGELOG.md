@@ -33,10 +33,11 @@ breaking changes are highlighted per release with migration notes.
   run (captured or not) with `LibdenoError::Configuration` instead of letting
   the capture reader steal its output. Enforced by a lock-free atomic state
   machine (`RunLease` / `RUN_STATE`) with no spurious serialization; `run` /
-  `run_with_output` / `run_with` / `runtime::run_with_output` all take the
-  lease. Previously overlapping captured runs queued on the mutex. Migration:
-  for captured runs alongside parallel execution use `run_in_subprocess`,
-  where each process has its own fds.
+  `run_with_output` / `run_async` / `run_with_output_async` / `run_with` /
+  `runtime::run_with_output` all take the lease. Previously overlapping
+  captured runs queued on the mutex. Migration: for captured runs alongside
+  parallel execution use `run_in_subprocess_with_output`, which pipes the
+  child's own fds back to the parent.
 - **`run_in_subprocess` no longer takes a cwd lock** (it existed only to guard
   against concurrent chdir, which no longer exists); the child's cwd is still
   pinned at spawn via `Command::current_dir`. A long-lived child can no longer
@@ -45,7 +46,13 @@ breaking changes are highlighted per release with migration notes.
   `execution_deadline` to the child** (previously silently dropped — the
   child ran on the full default unstable surface with no bounds). Capture
   flags are deliberately not forwarded: the child writes to the inherited
-  fds, so capture belongs on the parent side.
+  fds; use `run_in_subprocess_with_output` to pipe them back.
+- **`run_with` rejects what it cannot honor** (previously a silent ignore):
+  `capture_stdout` / `capture_stderr` are refused with
+  `LibdenoError::Configuration` (it returns only the exit code — use
+  `runtime::run_with_output`), and a `LibdenoOptions.cwd` that does not match
+  the runtime's directory (canonicalize-aware comparison) is refused the same
+  way; omit `cwd`, or build the runtime for that directory.
 
 ### Added
 
@@ -55,7 +62,21 @@ breaking changes are highlighted per release with migration notes.
   called from inside a tokio context; the future is not `Send` and must not
   be interleaved with another `run_async` (a V8 isolate is pinned to its
   creating thread — v8 0.150 `PinnedRef` — so interleaved runs abort the
-  process); parallel runs use `run()` or `run_in_subprocess`.
+  process; enforced by a thread-local RAII guard that rejects a second
+  `run_async` on one thread with `Configuration`). `execution_deadline`
+  needs the caller runtime's time driver (`enable_time`/`enable_all`);
+  parallel runs use `run()` or `run_in_subprocess`.
+- **`run_in_subprocess_with_output`**: subprocess-mode output capture — the
+  child's own stdout/stderr fds are piped back to the parent and read
+  concurrently with `wait()`. Per-process capture: runs in parallel with any
+  other run (no exclusivity), works on Windows, both streams always returned,
+  `max_capture_bytes` caps each stream (excess drained + dropped,
+  `capture_truncated` set). All other options forward like
+  `run_in_subprocess`.
+- **Child-mode env strip**: `maybe_handle_child_mode` removes
+  `LIBDENO_CHILD_MODE` / `LIBDENO_CHILD_TOKEN` before running the script, so
+  subprocesses the script spawns (git, compilers) inherit a clean environment
+  instead of entering child mode with a consumed stdin.
 - **deno_resolver `sync` feature** (resolver stack is `Send`-capable, deno
   CLI parity; behavior-equivalent — this is the enabling step for future
   async work, no API change).
@@ -64,6 +85,29 @@ breaking changes are highlighted per release with migration notes.
   all succeed, subprocess option forwarding (features / execution_deadline),
   async entry points on current-thread and multi-thread (`LocalSet`)
   runtimes.
+
+### Known limitations
+
+- **Captured output is lost when a run errors**: `run_with_output` /
+  `run_with_output_async` / `run_in_subprocess_with_output` return the
+  captured bytes only on success; on an error the partial output is dropped
+  (an output-on-error API is not shipped yet).
+- **`#[non_exhaustive]` is not applied** to `LibdenoOptions` / `RunOutput`:
+  adding fields in future releases stays a source-breaking change for code
+  using full struct literals or exhaustive matches.
+- **No env-injection option yet**: scripts see the host's environment; there
+  is no per-run `env` setting on `LibdenoOptions`.
+- **The analysis cache clears entirely on overflow** (default 8192 entries,
+  `LIBDENO_ANALYSIS_CACHE_ENTRIES`): a full reset is cheaper and more
+  predictable than an LRU on this hot path, and a clear only costs the next
+  run one rebuild (deliberate — see `src/analysis_cache.rs`).
+- **Disk code cache is untested and keyed with `DefaultHasher`**, whose
+  output is not stable across rustc upgrades: after a toolchain update the
+  on-disk entries are simply recompiled (a wasted compile, never a wrong hit
+  — perf-only).
+- **In-process `features` behavior is untested**; the subprocess forwarding
+  path (`run_in_subprocess` / `run_in_subprocess_with_output`) is covered by
+  tests.
 
 ## 0.2.2
 

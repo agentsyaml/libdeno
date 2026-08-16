@@ -145,6 +145,81 @@ fn run_with_rebuilds_when_config_changes() {
 }
 
 #[test]
+fn run_with_rejects_capture_flags() {
+    // run_with returns only the exit code — capture flags were a silent
+    // no-op (and bought exclusivity rejections on busy hosts for nothing);
+    // they must be rejected like every other unusable option.
+    let dir = temp_dir("reject-cap");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('never captures');").unwrap();
+    let runtime = build_runtime(&dir);
+    let err = run_with(
+        &runtime,
+        &entry,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            capture_stdout: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, libdeno::LibdenoError::Configuration(_)),
+        "expected a configuration error, got: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_with_rejects_mismatched_cwd() {
+    // The resolver stack is scoped to the runtime's directory; a cwd that
+    // resolves elsewhere would silently run against a different base.
+    let dir = temp_dir("reject-cwd");
+    let other = temp_dir("reject-cwd-other");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "1 + 1;").unwrap();
+    let runtime = build_runtime(&dir);
+    let err = run_with(
+        &runtime,
+        &entry,
+        &LibdenoOptions {
+            cwd: Some(other.clone()),
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, libdeno::LibdenoError::Configuration(_)),
+        "expected a configuration error, got: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&other);
+}
+
+#[test]
+fn run_with_accepts_matching_cwd() {
+    // A cwd that resolves to the runtime's directory (same dir, any path
+    // form) is fine.
+    let dir = temp_dir("ok-cwd");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "1 + 1;").unwrap();
+    let runtime = build_runtime(&dir);
+    let code = run_with(
+        &runtime,
+        &entry,
+        &LibdenoOptions {
+            cwd: Some(dir.clone()),
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn run_with_does_not_leak_permissions_between_runs() {
     // Security boundary: run 1's allow-all grants must never leak into run 2
     // with restricted grants on the same LibdenoRuntime — the permission-bound

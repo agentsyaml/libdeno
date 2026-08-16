@@ -78,14 +78,18 @@ impl LibdenoRuntime {
 /// from `options` — each run rebuilds its permission-bound file fetcher /
 /// graph loader / graph, so one run's grants can never leak into another.
 ///
-/// The script runs in the host's cwd; `LibdenoOptions.cwd` is ignored (the
-/// resolver stack is scoped to the runtime's directory) — same semantics as
-/// [`crate::run`], where `cwd` is a resolution base only and the process
-/// cwd is never switched.
+/// The script runs in the host's cwd; the process cwd is never switched —
+/// same semantics as [`crate::run`], where `cwd` is a resolution base only.
+/// Because the resolver stack is scoped to the runtime's directory,
+/// `LibdenoOptions.cwd` is honored only when it matches the runtime's
+/// directory (canonicalize-aware comparison); a mismatched `cwd` is
+/// **rejected** with `LibdenoError::Configuration` instead of silently
+/// resolving against a different directory. Omit `cwd`, or build the runtime
+/// for that directory, to run through the reusable stack.
 ///
-/// `LibdenoOptions.capture_stdout` / `capture_stderr` are **not** honored by
-/// `run_with` (it returns only the exit code); use [`run_with_output`] for
-/// capture on the reusable stack.
+/// `LibdenoOptions.capture_stdout` / `capture_stderr` are **rejected** by
+/// `run_with` with `LibdenoError::Configuration` (it returns only the exit
+/// code); use [`run_with_output`] for capture on the reusable stack.
 ///
 /// The async/sync split is deliberate: [`LibdenoRuntime::new`] is async
 /// because resolver stack construction needs a tokio context, while `run_with`
@@ -95,11 +99,26 @@ pub fn run_with(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<i32, LibdenoError> {
+    // run_with never captures (it returns only the exit code) — reject the
+    // flags instead of silently ignoring them (matching the Windows-capture
+    // rejection pattern; a silent no-op here would also reject concurrent
+    // runs for no benefit under the capture-exclusivity protocol).
+    if options.capture_stdout || options.capture_stderr {
+        return Err(LibdenoError::Configuration(
+            "run_with does not support output capture (it returns only the \
+             exit code); use run_with_output for capture on the reusable \
+             stack"
+                .to_string(),
+        ));
+    }
+    // options.cwd is a resolution base that the reusable stack ignores (it
+    // is scoped to the runtime's directory) — reject a mismatched base
+    // instead of silently resolving against a different directory.
+    reject_unusable_cwd(runtime, options)?;
     // Take the capture-exclusivity lease before the run starts (see
     // RunLease); ordinary runs are otherwise fully parallel. run_with never
-    // captures (capture flags are not honored here), so the lease is taken
-    // as a plain parallel run — capture flags must not buy exclusivity they
-    // don't use.
+    // captures (rejected above), so the lease is taken as a plain parallel
+    // run.
     let _lease = RunLease::acquire(false)?;
     // Capture the entry-time child-IPC marker (fork children inherit it).
     crate::limits::capture_spawned_ipc_marker();
@@ -120,6 +139,30 @@ pub fn run_with(
     }
 }
 
+/// Rejects options the reusable stack cannot honor: `LibdenoOptions.cwd` is
+/// a resolution base the stack ignores (it is scoped to the runtime's
+/// directory), so a cwd that resolves differently would silently run the
+/// script against a different base. Comparison is canonicalize-aware to
+/// avoid path-form false positives; an unresolvable `options.cwd` is
+/// tolerated (the base is unused on this path).
+fn reject_unusable_cwd(
+    runtime: &LibdenoRuntime,
+    options: &LibdenoOptions,
+) -> Result<(), LibdenoError> {
+    if let Some(cwd) = &options.cwd {
+        let resolved = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+        if resolved(cwd) != resolved(&runtime.cwd) {
+            return Err(LibdenoError::Configuration(format!(
+                "run_with ignores LibdenoOptions.cwd (the resolver stack is \
+                 scoped to the runtime's directory {}); build the runtime for \
+                 that directory instead, or omit cwd",
+                runtime.cwd.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Runs `entry` through a prebuilt [`LibdenoRuntime`]'s resolver stack and
 /// returns the exit code together with the captured stdout/stderr when
 /// `LibdenoOptions.capture_stdout` / `capture_stderr` are set — the
@@ -127,8 +170,9 @@ pub fn run_with(
 /// the resolver stack on every call).
 ///
 /// Everything else matches [`run_with`]: the capture-exclusivity lease (see
-/// [`crate::RunLease`]), tokio re-entry handled automatically,
-/// `LibdenoOptions.cwd` ignored, permissions per-run. Capture semantics
+/// [`crate::RunLease`]), tokio re-entry handled automatically, mismatched
+/// `LibdenoOptions.cwd` rejected (matching cwd accepted), permissions
+/// per-run. Capture semantics
 /// (fd-level redirection, byte cap, Windows rejection) are identical to
 /// [`crate::run_with_output`].
 pub fn run_with_output(
@@ -136,6 +180,7 @@ pub fn run_with_output(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<crate::RunOutput, LibdenoError> {
+    reject_unusable_cwd(runtime, options)?;
     let _lease = RunLease::acquire(options.capture_stdout || options.capture_stderr)?;
     crate::limits::capture_spawned_ipc_marker();
     let entry = entry.as_ref().to_path_buf();
@@ -162,10 +207,7 @@ fn run_with_sync_output(
     #[cfg(windows)]
     if options.capture_stdout || options.capture_stderr {
         return Err(LibdenoError::Configuration(
-            "output capture is not supported on Windows (std stdout/stderr \
-             bypass the redirected CRT fd); use run_in_subprocess and pipe \
-             the child's output instead"
-                .to_string(),
+            crate::CAPTURE_UNSUPPORTED_ON_WINDOWS.to_string(),
         ));
     }
     let capture = crate::output::OutputCapture::new(

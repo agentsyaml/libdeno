@@ -61,6 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     permissions: vec!["--allow-read=.".into()],
     args: vec!["--flag".into()],
     cwd: None, // default: process current directory
+    ..Default::default()
   };
   let exit_code = run("app.js", &options)?;
   Ok(())
@@ -83,6 +84,13 @@ so multiple invocations are fully independent.
 
 Relative paths resolve against `LibdenoOptions.cwd`, which defaults to the
 process current directory.
+
+Since v0.3.0 `cwd` is a **resolution base only**: the process cwd is never
+switched, so the script itself observes the host's cwd — `Deno.cwd()` and
+relative filesystem operations inside the script resolve against the host
+process's cwd, not `options.cwd`. Scripts that need a specific working
+directory should use absolute paths, or run through `run_in_subprocess` /
+`run_in_subprocess_with_output`, where the child's cwd is pinned at spawn.
 
 ## Writing your own host binary
 

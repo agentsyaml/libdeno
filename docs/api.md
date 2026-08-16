@@ -56,8 +56,87 @@ buffer. Caveat: while captured, *other host threads* printing to stdout/stderr
 during the run are captured too. Capture is fd-level process-global
 redirection, so a captured run is **exclusive**: any overlapping run (captured
 or not) is rejected with `LibdenoError::Configuration`. For captured runs
-alongside parallel execution use `run_in_subprocess`, where each process has
-its own fds.
+alongside parallel execution use `run_in_subprocess_with_output`, which pipes
+the child's own fds back to the parent.
+
+## `run_async` / `run_with_output_async`
+
+```rust
+pub async fn run_async(
+  entry: impl AsRef<Path>,
+  options: &LibdenoOptions,
+) -> Result<i32, LibdenoError>
+
+pub async fn run_with_output_async(
+  entry: impl AsRef<Path>,
+  options: &LibdenoOptions,
+) -> Result<RunOutput, LibdenoError>
+```
+
+Runs `entry` on the **caller's** tokio runtime. Identical semantics to
+`run` / `run_with_output`, but nothing spawns a thread: the run's async chain
+(resolver stack build, graph build, event loop) executes on the calling
+runtime. For a server host that already has a runtime this removes the
+per-run OS-thread cost of `run`'s tokio re-entry escape.
+
+Constraints:
+
+- Must be called from inside a tokio runtime context (`tokio::spawn`,
+  `block_on`, another `async fn`, ...). Outside one, `run_async` returns
+  `LibdenoError::Configuration` — use `run`.
+- The returned future is **not `Send`**. `run_async` futures must not be
+  **interleaved** with each other on one thread: a V8 isolate is pinned to
+  the thread that created it, so two `run_async` polled alternately abort the
+  process. This is enforced by a thread-local RAII guard that rejects a
+  second `run_async` on the same thread with `LibdenoError::Configuration`
+  (the guard clears on drop, so a cancelled future releases the slot). Await
+  them strictly one at a time; for parallel runs use `run` (each run gets its
+  own thread + isolate) or `run_in_subprocess`. A single `run_async` may be
+  awaited on a current-thread runtime directly, or on a multi-thread runtime
+  inside `tokio::task::LocalSet`.
+- `execution_deadline` runs on tokio's time driver, so the caller's runtime
+  must enable it (`enable_time()` / `enable_all()`); a bare
+  `Builder::new_current_thread().build()` has no time driver and the deadline
+  will not fire.
+- Capture, exclusivity, deadlines and every other option behave exactly as in
+  the sync entry points.
+
+On a multi-thread runtime, pin the `!Send` future to one thread with a
+`LocalSet`:
+
+```rust
+use libdeno::{run_with_output_async, LibdenoOptions};
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), libdeno::LibdenoError> {
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        capture_stdout: true,
+        ..Default::default()
+    };
+    let local = tokio::task::LocalSet::new();
+    let out = local
+        .run_until(run_with_output_async("app.js", &options))
+        .await?;
+    println!("exit={} stdout={:?}", out.exit_code, out.stdout);
+    Ok(())
+}
+```
+
+On a current-thread runtime the future can be awaited directly:
+
+```rust
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), libdeno::LibdenoError> {
+    let out = libdeno::run_with_output_async("app.js", &LibdenoOptions {
+        allow_all_permissions: true,
+        capture_stdout: true,
+        ..Default::default()
+    }).await?;
+    println!("exit={} stdout={:?}", out.exit_code, out.stdout);
+    Ok(())
+}
+```
 
 ## `LibdenoRuntime` / `run_with` / `run_with_output`
 
@@ -95,16 +174,20 @@ builds the permission-free half of that stack once and `run_with` /
 - `run_with` semantics match `run` — ordinary runs are fully parallel, tokio
   re-entry handled automatically (fresh thread inside a tokio runtime),
   `Deno.exit(n)` / exit codes / deadlines identical. The script runs in the
-  host's cwd; `LibdenoOptions.cwd` is **ignored** as a resolution base (the
-  stack is scoped to the runtime's directory), and the process cwd is never
-  switched. Permissions come from `options` per run: the permission-bound
-  file fetcher / graph loader / graph are rebuilt each call, so one run's
-  grants never leak into another.
-- `run_with` does **not** honor `capture_stdout` / `capture_stderr` (it
-  returns only the exit code). Use `run_with_output(&runtime, ...)` for
-  capture on the reusable stack; everything else matches `run_with_output`
-  (`LibdenoOptions.cwd` ignored, permissions per run, fd-level capture with
-  the same exclusivity lease, Windows rejection and per-stream byte cap).
+  host's cwd and the process cwd is never switched. `LibdenoOptions.cwd` is
+  honored only when it matches the runtime's directory (canonicalize-aware
+  comparison); a mismatched `cwd` is **rejected** with
+  `LibdenoError::Configuration` — the stack is scoped to the runtime's
+  directory, so a different base would silently resolve elsewhere. Omit
+  `cwd`, or build the runtime for that directory. Permissions come from
+  `options` per run: the permission-bound file fetcher / graph loader / graph
+  are rebuilt each call, so one run's grants never leak into another.
+- `run_with` **rejects** `capture_stdout` / `capture_stderr` with
+  `LibdenoError::Configuration` (it returns only the exit code). Use
+  `run_with_output(&runtime, ...)` for capture on the reusable stack;
+  everything else matches `run_with_output` (mismatched `cwd` rejected,
+  permissions per run, fd-level capture with the same exclusivity lease,
+  Windows rejection and per-stream byte cap).
 - `LibdenoRuntime` is `Clone` + `Send` + `Sync`, so it can be shared across
   host threads; ordinary runs through it are fully parallel (only a captured
   run is exclusive — see `run_with_output`). It is single-threaded by design:
@@ -216,7 +299,7 @@ redirection is fd-level and process-global: other host threads printing to
 stdout/stderr during the run are captured too, and the run is **exclusive** —
 any concurrent run (captured or not) is rejected with
 `LibdenoError::Configuration`. For captured runs alongside parallel execution
-use `run_in_subprocess`, where each process has its own fds.
+use `run_in_subprocess_with_output`, which pipes the child's own fds back.
 
 ### `max_capture_bytes`
 
@@ -245,7 +328,7 @@ pub enum LibdenoError {
   Permission(String),                    // invalid permission flag strings
   Configuration(String),                 // options cannot form a valid configuration (e.g. empty permission list without opt-in since v0.2.0)
   Runtime(AnyError),                     // runtime startup / script failure
-  Core(deno_core::error::CoreError),     // JS exception escaped event loop
+  Core(deno_core::error::CoreError),     // reserved: script JS exceptions surface as Runtime(AnyError), never constructed for script errors
   Io(std::io::Error),                    // host I/O failure (e.g. cwd, output capture setup)
   Timeout(String),                     // deadline exceeded / subprocess handshake timed out (message explains which)
 }
@@ -285,11 +368,39 @@ Requirements:
   the child verbatim: a host that bounds or shrinks an untrusted script gets
   the same bounds in child mode (the child never silently runs unbounded on
   the full unstable surface). The capture flags are not forwarded — the
-  child writes to the inherited fds, so capture the parent side instead
-  (redirect the host's own fds around the call).
+  child writes to the inherited fds; use `run_in_subprocess_with_output` to
+  pipe the child's own fds back to the parent.
 
 `LIBDENO_HOST_EXE` overrides the executable spawned (defaults to
 `current_exe()`); integration tests use this to point at a dedicated host.
+
+## `run_in_subprocess_with_output`
+
+```rust
+pub fn run_in_subprocess_with_output(
+  entry: impl AsRef<Path>,
+  options: &LibdenoOptions,
+) -> Result<RunOutput, LibdenoError>
+```
+
+Runs `entry` in a **child process** and returns the exit code together with
+the child's captured stdout/stderr — the subprocess answer to output capture.
+
+Unlike in-process capture — which is fd-level redirection of the
+process-global stdout/stderr and therefore **exclusive** (any concurrent run
+is rejected with `Configuration`, and it does not work on Windows) — this
+capture is per-process: the child's own fds are piped back to the parent and
+read concurrently with `wait()` (a verbose child can never deadlock on a full
+pipe buffer). It runs in parallel with any other run, on every platform,
+Windows included.
+
+- `capture_stdout` / `capture_stderr` are always implied — both streams are
+  returned.
+- `max_capture_bytes` caps each stream: excess is drained and dropped (the
+  reader keeps going so the child never blocks) and
+  `RunOutput.capture_truncated` is set.
+- Every other option (permissions, features, `max_heap_bytes`,
+  `execution_deadline`, `cwd`) behaves exactly as in `run_in_subprocess`.
 
 ## `maybe_handle_child_mode`
 

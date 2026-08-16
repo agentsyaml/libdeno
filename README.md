@@ -33,6 +33,7 @@ let options = LibdenoOptions {
   permissions: vec!["--allow-read=.".into(), "--allow-net=example.com".into()],
   args: vec![],
   cwd: None,
+  ..Default::default()
 };
 let exit_code = run("app.js", &options).unwrap();
 ```
@@ -84,34 +85,45 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 
 | Item | Description |
 |---|---|
-| `run(entry, &options) -> Result<i32, LibdenoError>` | Runs the entry to completion and returns the exit code the script requested. Each call builds its own current-thread runtime and worker; ordinary runs execute fully in parallel (own thread, isolate, and graph — the process cwd is never switched), sharing only the on-disk npm/HTTP caches and `DENO_DIR`. Safe to call from inside a tokio runtime — the run executes on a fresh thread there (see below). |
+| `run(entry, &options) -> Result<i32, LibdenoError>` | Runs the entry to completion and returns the exit code the script requested. Each call builds its own current-thread runtime and worker; ordinary runs execute fully in parallel — own thread, isolate, and graph, sharing nothing mutable (the process-global analysis / npm-snapshot / on-disk caches are safe shared state; the process cwd is never switched). Safe to call from inside a tokio runtime — the run executes on a fresh thread there (see below). |
 | `run_with_output(entry, &options) -> Result<RunOutput, LibdenoError>` | Like `run`, but also captures the script's stdout/stderr into `RunOutput` when `capture_stdout` / `capture_stderr` are set. |
+| `run_async(entry, &options) -> Result<i32, LibdenoError>` | Async entry point: runs the script on the **caller's** tokio runtime — no spawned thread. Must be awaited inside a tokio context; the future is not `Send` and a second `run_async` on one thread is rejected with `LibdenoError::Configuration` (interleaved runs would abort the process). Await one at a time — use `run` for parallel runs. |
 | `LibdenoRuntime::new(cwd)` | Builds the resolver stack for a project directory once (async). Reused by `run_with`; rebuilt automatically when the config chain (deno.json / deno.jsonc / import_map.json / package.json / .npmrc / node_modules) changes. |
-| `run_with(&runtime, entry, &options) -> Result<i32, LibdenoError>` | Like `run`, but reuses `runtime`'s resolver stack. Semantics identical to `run` (parallel ordinary runs, tokio re-entry handling, exit codes, deadlines); relative paths resolve against the runtime's cwd and permission-bound components are rebuilt per call. |
+| `run_with(&runtime, entry, &options) -> Result<i32, LibdenoError>` | Like `run`, but reuses `runtime`'s resolver stack. Semantics identical to `run` (parallel ordinary runs, tokio re-entry handling, exit codes, deadlines); relative paths resolve against the runtime's cwd and permission-bound components are rebuilt per call. Capture flags and a mismatched `options.cwd` are rejected with `LibdenoError::Configuration`. |
 | `run_with_output(&runtime, entry, &options) -> Result<RunOutput, LibdenoError>` | Like `run_with`, but also captures the script's stdout/stderr into `RunOutput` when `capture_stdout` / `capture_stderr` are set — the long-lived-host equivalent of `run_with_output` (which rebuilds the resolver stack every call). Same semantics as `run_with` otherwise. |
 | `run_in_subprocess(entry, &options) -> Result<i32, LibdenoError>` | Runs the entry in a child process. `Deno.exit(n)` then terminates only the child; the host stays alive and observes `n`. The host must call `maybe_handle_child_mode()` at the start of `main()`. |
+| `run_in_subprocess_with_output(entry, &options) -> Result<RunOutput, LibdenoError>` | Like `run_in_subprocess`, but pipes the child's own stdout/stderr back into `RunOutput`: per-process capture that runs in parallel with other runs and works on Windows. Both streams are always returned; `max_capture_bytes` caps each stream and `RunOutput.capture_truncated` is set when truncated. |
 | `maybe_handle_child_mode() -> bool` | Services `run_in_subprocess` child requests. Returns `false` on a normal host launch; in child mode it executes the script and exits with its code. |
 | `LibdenoOptions.permissions: Vec<String>` | `--allow-*` capability strings. An empty list is a construction error (`LibdenoError::Configuration`) — since v0.2.0 it grants nothing; pass capability flags, set `allow_all_permissions`, or set `prompt: true`. |
 | `LibdenoOptions.allow_all_permissions: bool` | Grants every capability (`-A` equivalent). Required to run scripts with an empty `permissions` list. Use only for code you trust (see SECURITY.md). |
-| `LibdenoOptions.capture_stdout` / `capture_stderr: bool` | Redirect the script's stdout/stderr (fd 1/2) into `RunOutput` instead of the host's terminal. While active the redirection is process-global: other host threads printing during the run are captured too, and the run is **exclusive** — any concurrent run (captured or not) is rejected with `LibdenoError::Configuration` (use `run_in_subprocess` for capture alongside parallel runs). |
+| `LibdenoOptions.capture_stdout` / `capture_stderr: bool` | Redirect the script's stdout/stderr (fd 1/2) into `RunOutput` instead of the host's terminal. While active the redirection is process-global: other host threads printing during the run are captured too, and the run is **exclusive** — any concurrent run (captured or not) is rejected with `LibdenoError::Configuration` (use `run_in_subprocess_with_output` for capture alongside parallel runs). |
 | `LibdenoOptions.max_capture_bytes: Option<usize>` | Cap on captured output per stream (stdout and stderr each get this budget); when a stream exceeds it, capture stops, the excess is dropped, and `RunOutput.capture_truncated` is set. `None` (default) captures without a bound. |
 | `LibdenoOptions.features: Option<Vec<String>>` | Overrides the default unstable feature set (`kv`, `cron`, `ffi`, `webgpu`, `worker-options`). Feature names must be valid deno unstable-feature names; `None` (default) enables the default set. An embedder running untrusted plugins can shrink the surface; the ops themselves stay permission-gated regardless. |
 | `LibdenoOptions.args: Vec<String>` | Arguments exposed to the script via `process.argv` (after argv[0]). |
 | `LibdenoOptions.cwd: Option<PathBuf>` | Resolution base that relative paths (entry, permissions, `node_modules` discovery) resolve against. Defaults to the process current directory. The process cwd is never switched — scripts observe the host's cwd (`Deno.cwd()`), so use `run_in_subprocess` for a per-run working directory. |
 | `LibdenoOptions.max_heap_bytes: Option<usize>` | Hard cap on the V8 old-generation heap in bytes; V8 aborts with OOM when hit. Applies to the main worker **and** web workers spawned via `new Worker(...)`. |
 | `LibdenoOptions.execution_deadline: Option<Duration>` | Hard wall-clock limit; on expiry the isolate is force-terminated and the run fails with `LibdenoError::Timeout`. Does **not** interrupt blocking system calls (NFS-hung file reads, synchronous `Deno.Command` waits) — those unwind only when the syscall itself returns, so the run can exceed the deadline by the syscall's duration. |
-| `LibdenoError` | Enum: `Entry` (entry resolution failed), `Permission` (invalid permission flags), `Configuration` (options that cannot form a valid configuration, e.g. an empty permission list without opt-in), `Runtime`, `Core` (script exception), `Io`, `Timeout` (deadline exceeded / subprocess handshake timed out; the message says which). |
+| `LibdenoError` | Enum: `Entry` (entry resolution failed), `Permission` (invalid permission flags), `Configuration` (options that cannot form a valid configuration, e.g. an empty permission list without opt-in), `Runtime` (runtime startup / script failure — JS exceptions surface here), `Core` (reserved; never constructed for script errors), `Io`, `Timeout` (deadline exceeded / subprocess handshake timed out; the message says which). |
 
 ### Async hosts (tokio/axum)
 
-`run()` / `run_with()` / `run_with_output()` are safe to call from inside a
-tokio runtime: tokio forbids starting a second runtime on the same thread, so
-the run executes on a fresh thread and joins back. Note the calling task's
-thread is parked for the whole run (it is a synchronous call); on a
-single-threaded runtime every other task is stalled meanwhile, and on
-multi-threaded runtimes each concurrent run parks one worker. Ordinary runs
-proceed fully in parallel; only output capture is exclusive (a captured run
-rejects any overlapping run).
+Prefer `run_async` / `run_with_output_async` inside a tokio context: they
+execute the run on the caller's runtime with no spawned thread. Their future
+is not `Send`, so on a multi-thread runtime run them through a
+`tokio::task::LocalSet`; a single `run_async` may be awaited on a
+current-thread runtime directly. They must not be interleaved with another
+`run_async` on the same thread — a second one is rejected with
+`LibdenoError::Configuration` (interleaved runs would abort the process). For
+parallel runs use `run` (each run gets its own thread + isolate).
+
+The sync entry points (`run` / `run_with` / `run_with_output`) remain safe to
+call from inside a tokio runtime as a fallback: tokio forbids starting a
+second runtime on the same thread, so the run executes on a fresh thread and
+joins back. Note the calling task's thread is parked for the whole run (it is
+a synchronous call); on a single-threaded runtime every other task is stalled
+meanwhile, and on multi-threaded runtimes each concurrent run parks one
+worker. Ordinary runs proceed fully in parallel; only output capture is
+exclusive (a captured run rejects any overlapping run).
 
 ### Output capture
 
@@ -131,7 +143,8 @@ captured, *other host threads* that print to stdout/stderr during the run are
 captured too. Capture is also **exclusive**: because it is process-global fd
 redirection, a captured run rejects any concurrent run (captured or not) with
 `LibdenoError::Configuration` — for captured runs alongside parallel execution
-use `run_in_subprocess`, where each process has its own fds. Relatedly, the
+use `run_in_subprocess_with_output`, which pipes the child's own fds back to
+the parent. Relatedly, the
 runtime's console output takes the process-global
 `std::io::stdout()/stderr()` locks — hosts holding those locks across an await
 boundary (e.g. a custom `Write` impl used process-wide) should not hold them
@@ -145,10 +158,11 @@ bound.
 
 Output capture is unix-only: on Windows Rust std's stdout/stderr bypass the
 redirected CRT fd, so `capture_stdout`/`capture_stderr` fail with a
-`LibdenoError::Configuration` error there (use `run_in_subprocess` and pipe
-the child's output instead). `run_with` does not support capture at all —
-use `run_with_output`, or the reusable-stack variant
-`run_with_output(&runtime, ...)` for a long-lived host running many scripts.
+`LibdenoError::Configuration` error there (use `run_in_subprocess_with_output`
+instead — the child's own fds are piped, so it works on Windows). `run_with`
+does not support capture at all — use `run_with_output`, or the
+reusable-stack variant `run_with_output(&runtime, ...)` for a long-lived host
+running many scripts.
 
 Supported permission flags: `--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-import[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`, plus `-A` / `--allow-all`. `--allow-import` gates remote module loading (there is no `--allow-net` fallback); static and dynamic file imports are gated by `--allow-read`.
 

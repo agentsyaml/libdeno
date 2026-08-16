@@ -72,8 +72,9 @@ If the plugin (or its npm dependencies) load a `.node` native addon:
 - Output capture is fd-level and process-global for the run's duration:
   other host threads printing during the run land in the captured buffer
   too, and a captured run is exclusive — any concurrent run is rejected
-  with `LibdenoError::Configuration` (capture belongs in the subprocess
-  model).
+  with `LibdenoError::Configuration`. For concurrent captured runs use
+  `run_in_subprocess_with_output`, which pipes the child's own fds back
+  (runs in parallel, works on Windows).
 - The runtime's console takes the process-global `std::io::stdout()/stderr()`
   locks; don't hold those across an await boundary while calling libdeno.
 - Ordinary runs are fully parallel (each has its own isolate + graph); for

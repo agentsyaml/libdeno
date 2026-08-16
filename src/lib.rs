@@ -56,7 +56,7 @@ pub use permission_broker::{
     install_permission_broker, install_permission_hook, PermissionPrompt, PermissionRequest,
 };
 pub use runtime::{run_with, LibdenoRuntime};
-pub use subprocess::{maybe_handle_child_mode, run_in_subprocess};
+pub use subprocess::{maybe_handle_child_mode, run_in_subprocess, run_in_subprocess_with_output};
 
 use module_loader::GraphModuleLoader;
 use node_loader::SimpleNodeRequireLoader;
@@ -67,7 +67,8 @@ use worker_factory::create_web_worker_factory;
 
 /// Concurrency protocol for in-process runs: ordinary runs are fully
 /// parallel (each runs its own thread + isolate + graph, sharing nothing
-/// mutable), while a captured run is **exclusive** — output capture is
+/// mutable — the process-global analysis/npm/on-disk caches are safe shared
+/// state), while a captured run is **exclusive** — output capture is
 /// fd-level redirection of the process-global stdout/stderr, so any
 /// concurrent run (captured or not) would have its output stolen by the
 /// capture reader. Rather than serializing everything (the old CWD_LOCK
@@ -101,9 +102,9 @@ impl RunLease {
             {
                 return Err(LibdenoError::Configuration(
                     "output capture is process-global (fd-level redirection) \
-                     and cannot coexist with any other run — run this script \
-                     through run_in_subprocess instead, where each process \
-                     has its own fds"
+                     and cannot coexist with any other run — use \
+                     run_in_subprocess_with_output instead, where the \
+                     child's own fds are piped and runs stay parallel"
                         .to_string(),
                 ));
             }
@@ -114,8 +115,8 @@ impl RunLease {
                     return Err(LibdenoError::Configuration(
                         "a captured run is active; output capture is \
                          process-global and would steal this run's stdout. \
-                         Run the captured script through run_in_subprocess, \
-                         or wait for the captured run to finish"
+                         Use run_in_subprocess_with_output for the captured \
+                         script, or wait for the captured run to finish"
                             .to_string(),
                     ));
                 }
@@ -290,9 +291,10 @@ impl From<Box<deno_core::error::JsError>> for LibdenoError {
 /// returns the exit code the script requested (0 on normal completion).
 ///
 /// Each call builds its own current-thread runtime and worker. Ordinary runs
-/// execute **in parallel** — they share nothing mutable. The one exception:
-/// output capture is process-global fd redirection, so a captured run is
-/// exclusive and any overlapping run is rejected with
+/// execute **in parallel** — they share nothing mutable (the process-global
+/// analysis / npm-snapshot / on-disk caches are safe shared state). The one
+/// exception: output capture is process-global fd redirection, so a captured
+/// run is exclusive and any overlapping run is rejected with
 /// [`LibdenoError::Configuration`] (see [`RunLease`]); use
 /// [`run_in_subprocess`] for captured runs, where each process has its own
 /// fds.
@@ -335,13 +337,13 @@ pub fn run_with_output(
 }
 
 /// Shared message for the Windows capture rejection (sync and async entry
-/// points both hit it). Only compiled on Windows — the only platform that
-/// references it.
+/// points in lib.rs and runtime.rs all hit it). Only compiled on Windows —
+/// the only platform that references it.
 #[cfg(windows)]
-const CAPTURE_UNSUPPORTED_ON_WINDOWS: &str =
+pub(crate) const CAPTURE_UNSUPPORTED_ON_WINDOWS: &str =
     "output capture is not supported on Windows (std stdout/stderr \
-     bypass the redirected CRT fd); use run_in_subprocess and pipe \
-     the child's output instead";
+     bypass the redirected CRT fd); use run_in_subprocess_with_output \
+     instead — the child's own fds are piped, so it works on Windows";
 
 fn run_sync_output(entry: &Path, options: &LibdenoOptions) -> Result<RunOutput, LibdenoError> {
     // Windows: Rust std's stdout/stderr write via GetStdHandle, bypassing the
@@ -384,13 +386,19 @@ fn run_sync_output(entry: &Path, options: &LibdenoOptions) -> Result<RunOutput, 
 ///   a V8 isolate is pinned to the thread that created it (v8 0.150's
 ///   `PinnedRef`), and deno's worker stack is `Rc`-based, so two `run_async`
 ///   polled alternately on one thread abort the process (`HandleScope`
-///   fatal). Await them strictly one at a time; for parallel runs use
-///   [`run`] (each run gets its own thread + isolate) or
-///   [`run_in_subprocess`]. A single `run_async` may be awaited on a
+///   fatal). This is enforced by a thread-local RAII guard that rejects a
+///   second `run_async` on the same thread with
+///   [`LibdenoError::Configuration`] (the guard clears on drop, so a
+///   cancelled future releases the slot). Await them strictly one at a time;
+///   for parallel runs use [`run`] (each run gets its own thread + isolate)
+///   or [`run_in_subprocess`]. A single `run_async` may be awaited on a
 ///   current-thread runtime directly, or on a multi-thread runtime inside
 ///   `tokio::task::LocalSet::block_on` / `spawn_local`.
 /// - Capture, exclusivity, deadlines and every other option behave exactly
-///   as in [`run_with_output`] / [`run`].
+///   as in [`run_with_output`] / [`run`]. An `execution_deadline` runs on
+///   tokio's time driver, so the caller's runtime must enable it
+///   (`enable_time()` / `enable_all()`); a bare
+///   `Builder::new_current_thread().build()` has no time driver.
 pub async fn run_async(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
@@ -402,7 +410,9 @@ pub async fn run_async(
 
 /// Async equivalent of [`run_with_output`]: same captured-output semantics,
 /// executed on the caller's runtime with no spawned thread. See
-/// [`run_async`] for the tokio-context and non-`Send` requirements.
+/// [`run_async`] for the tokio-context and non-`Send` requirements, and the
+/// `execution_deadline` time-driver requirement (the caller's runtime must
+/// be built with `enable_time()` / `enable_all()`).
 pub async fn run_with_output_async(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,

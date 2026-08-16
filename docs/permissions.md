@@ -139,5 +139,6 @@ let options = LibdenoOptions {
   ],
   args: vec![],
   cwd: None,
+  ..Default::default()
 };
 ```
