@@ -17,6 +17,7 @@
 //! let exit_code = run("app.js", &options).unwrap();
 //! ```
 
+mod analysis_cache;
 mod graph;
 mod http;
 mod limits;
@@ -26,7 +27,10 @@ mod npm_cache;
 mod output;
 mod permission_broker;
 mod permissions;
-mod runtime;
+// Public so `libdeno::runtime::run_with_output` (capture on a reusable
+// resolver stack) is reachable; the root re-exports `run_with` /
+// `LibdenoRuntime` for the common paths.
+pub mod runtime;
 mod services;
 mod subprocess;
 mod worker_factory;
@@ -166,6 +170,24 @@ pub struct LibdenoOptions {
     /// [`RunOutput::stderr`]; same semantics and caveats as
     /// [`Self::capture_stdout`].
     pub capture_stderr: bool,
+    /// Cap on captured output per stream (stdout and stderr each get this
+    /// budget). When a stream exceeds it, capture stops, the excess is
+    /// dropped, and [`RunOutput::capture_truncated`] is set — a verbose or
+    /// hostile script can no longer grow host memory without limit. `None`
+    /// (default) captures without a bound.
+    pub max_capture_bytes: Option<usize>,
+    /// Runtime feature flags exposed to the script, overriding the default
+    /// set (`kv`, `cron`, `ffi`, `webgpu`, `worker-options`). Feature names
+    /// must be valid deno unstable-feature names (see deno's
+    /// `--unstable-*` flags); they gate which JS namespace IDs and feature
+    /// checks are wired into the runtime. `None` (default) enables the
+    /// default set. An embedder running untrusted plugins can shrink the
+    /// surface (e.g. `Some(vec!["ffi".into()])`); the ops themselves stay
+    /// permission-gated regardless. `worker-options` is always enabled even
+    /// when omitted from a custom set — without it `new Worker(...)` with
+    /// worker options terminates the host process, which a plugin must never
+    /// be able to trigger.
+    pub features: Option<Vec<String>>,
 }
 
 /// The result of a [`run_with_output`] invocation.
@@ -181,6 +203,10 @@ pub struct RunOutput {
     /// Captured stderr bytes; empty unless [`LibdenoOptions::capture_stderr`]
     /// was set. Same unbounded-growth caveat as [`Self::stdout`].
     pub stderr: Vec<u8>,
+    /// True when a captured stream hit [`LibdenoOptions::max_capture_bytes`]
+    /// and was truncated. False when no capture was requested or when both
+    /// streams fit their budgets.
+    pub capture_truncated: bool,
 }
 
 /// Errors from a [`run`] invocation.
@@ -263,9 +289,7 @@ pub fn run_with_output(
         std::thread::spawn(move || run_sync_output(&entry, &options))
             .join()
             .map_err(|_| {
-                LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-                    "libdeno::run() worker thread panicked"
-                ))
+                LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
             })?
     } else {
         run_sync_output(&entry, &options)
@@ -286,15 +310,43 @@ fn run_sync_output(entry: &Path, options: &LibdenoOptions) -> Result<RunOutput, 
                 .to_string(),
         ));
     }
-    let capture = output::OutputCapture::new(options.capture_stdout, options.capture_stderr)
-        .map_err(LibdenoError::Io)?;
+    let capture = output::OutputCapture::new(
+        options.capture_stdout,
+        options.capture_stderr,
+        options.max_capture_bytes,
+    )
+    .map_err(LibdenoError::Io)?;
     let result = run_sync(entry, options);
-    let (stdout, stderr) = capture.finish();
+    let (stdout, stderr, capture_truncated) = capture.finish();
     Ok(RunOutput {
         exit_code: result?,
         stdout,
         stderr,
+        capture_truncated,
     })
+}
+
+/// FeatureChecker::enable_feature requires `&'static str`, but a host's
+/// feature list arrives as owned `String`s. Leak one `'static` copy per
+/// *unique* set and cache it: a long-lived host running the same features
+/// leaks exactly once, not once per run.
+fn static_feature_names(features: &[String]) -> Vec<&'static str> {
+    static CACHE: std::sync::Mutex<Vec<(Vec<String>, Vec<&'static str>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, names)) = cache.iter().find(|(key, _)| key == features) {
+        return names.clone();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let names: Vec<&'static str> = features
+        .iter()
+        // Deduplicate: FeatureChecker::enable_feature asserts on a duplicate
+        // insert and would panic the host process.
+        .filter(|s| seen.insert(s.as_str()))
+        .map(|s| Box::leak(s.clone().into_boxed_str()) as &'static str)
+        .collect();
+    cache.push((features.to_vec(), names.clone()));
+    names
 }
 
 /// The actual run: a fresh current-thread runtime and the run lifecycle. Must
@@ -410,24 +462,52 @@ pub(crate) async fn run_inner_with(
 
     let blob_store = BlobStore::default_arc();
     let broadcast_channel = InMemoryBroadcastChannel::default();
-    // Unstable APIs enabled by default (kv, cron, ffi, webgpu, worker-options)
-    // — an "everything enabled" stance like `deno run --unstable`; an embedded
-    // runtime has no flag surface. worker-options gates the worker
-    // `permissions`/`env`/`net` options in `new Worker(...)` (op_create_worker
-    // exits the process if the feature is off), so it must stay enabled for
-    // worker permission narrowing to work. JS namespace IDs and FeatureChecker
-    // names must stay in sync.
+    // Default: "everything enabled" like `deno run --unstable` (kv, cron,
+    // ffi, webgpu, worker-options) — an embedded runtime has no flag surface
+    // unless the host opts in via `LibdenoOptions.features`. worker-options
+    // gates the worker `permissions`/`env`/`net` options in `new Worker(...)`
+    // (op_create_worker exits the process if the feature is off), so a
+    // custom set that omits it breaks worker permission narrowing. JS
+    // namespace IDs and FeatureChecker names must stay in sync.
     const ENABLED_FEATURES: &[&str] = &["kv", "cron", "ffi", "webgpu", "worker-options"];
+    // Unknown feature names would be silent no-ops; fail loudly instead,
+    // consistent with how other bad option values surface (Configuration).
+    if let Some(features) = &options.features {
+        let valid: std::collections::HashSet<&str> = deno_features::UNSTABLE_FEATURES
+            .iter()
+            .map(|f| f.name)
+            .collect();
+        if let Some(bad) = features.iter().find(|f| !valid.contains(f.as_str())) {
+            return Err(LibdenoError::Configuration(format!(
+                "unknown runtime feature: {bad}"
+            )));
+        }
+    }
+    let enabled_features: Vec<&str> = match &options.features {
+        Some(features) => {
+            // worker-options is force-enabled regardless of the custom set:
+            // it gates the worker `permissions`/`env`/`net` options, and
+            // op_create_worker EXITS the process when the feature is off —
+            // a host shrinking the surface for untrusted plugins must not
+            // hand a plugin a way to kill the host.
+            let mut names = static_feature_names(features);
+            if !names.contains(&"worker-options") {
+                names.push("worker-options");
+            }
+            names
+        }
+        None => ENABLED_FEATURES.to_vec(),
+    };
     let feature_checker = {
         let mut fc = deno_runtime::FeatureChecker::default();
-        for feature in ENABLED_FEATURES {
+        for feature in &enabled_features {
             fc.enable_feature(feature);
         }
         Arc::new(fc)
     };
     let unstable_ids: Vec<i32> = deno_features::UNSTABLE_FEATURES
         .iter()
-        .filter(|f| ENABLED_FEATURES.contains(&f.name))
+        .filter(|f| enabled_features.contains(&f.name))
         .map(|f| f.id)
         .collect();
 

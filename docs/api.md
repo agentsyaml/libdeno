@@ -42,6 +42,7 @@ pub struct RunOutput {
   pub exit_code: i32,
   pub stdout: Vec<u8>, // populated only when options.capture_stdout is set
   pub stderr: Vec<u8>, // populated only when options.capture_stderr is set
+  pub capture_truncated: bool, // true when a captured stream hit max_capture_bytes
 }
 ```
 
@@ -51,6 +52,58 @@ fd-level (deno_core's print op has no injectable writer), so `console.log`,
 `console.error`, `Deno.stderr.write` and direct fd writes all land in the
 buffer. Caveat: while captured, *other host threads* printing to stdout/stderr
 during the run are captured too (runs are serialized internally).
+
+## `LibdenoRuntime` / `run_with` / `run_with_output`
+
+```rust
+pub struct LibdenoRuntime { /* Clone + Send + Sync; its only state is an Arc<Mutex<...>> */ }
+
+impl LibdenoRuntime {
+  pub async fn new(cwd: impl AsRef<Path>) -> Result<Self, LibdenoError>;
+}
+
+pub fn run_with(
+  runtime: &LibdenoRuntime,
+  entry: impl AsRef<Path>,
+  options: &LibdenoOptions,
+) -> Result<i32, LibdenoError>
+
+pub fn run_with_output(
+  runtime: &LibdenoRuntime,
+  entry: impl AsRef<Path>,
+  options: &LibdenoOptions,
+) -> Result<RunOutput, LibdenoError>
+```
+
+`run` rebuilds the resolver stack (workspace / resolver / npm-installer
+factories, graph resolver, npm process state) on every call. For long-lived
+hosts running many scripts in the same project, `LibdenoRuntime::new(cwd)`
+builds the permission-free half of that stack once and `run_with` /
+`run_with_output` reuse it across runs:
+
+- `LibdenoRuntime::new` is **async** — stack construction needs a tokio
+  context. The stack is rebuilt automatically when the config chain changes
+  (deno.json / deno.jsonc / import_map.json / package.json / .npmrc /
+  node_modules at the project root and its ancestors): `run_with` recomputes
+  a fingerprint and swaps the stack when it diverges.
+- `run_with` semantics match `run` — serialized on the process cwd lock,
+  tokio re-entry handled automatically (fresh thread inside a tokio runtime),
+  `Deno.exit(n)` / exit codes / deadlines identical. The script runs in the
+  runtime's cwd; `LibdenoOptions.cwd` is **ignored** (the stack is scoped to
+  the runtime's directory). Permissions come from `options` per run: the
+  permission-bound file fetcher / graph loader / graph are rebuilt each call,
+  so one run's grants never leak into another.
+- `run_with` does **not** honor `capture_stdout` / `capture_stderr` (it
+  returns only the exit code). Use `run_with_output(&runtime, ...)` for
+  capture on the reusable stack; everything else matches `run_with_output`
+  (`LibdenoOptions.cwd` ignored, permissions per run, fd-level capture with
+  the same Windows rejection and per-stream byte cap).
+- `LibdenoRuntime` is `Clone` + `Send` + `Sync`, so it can be shared across
+  host threads; runs still serialize on the cwd lock. It is single-threaded
+  by design: the module loader stack is `Rc<...>`-based and every run
+  executes on a fresh current-thread tokio runtime. The async/sync split is
+  deliberate — `new` is async, `run_with` is sync and does its own `block_on`
+  on that fresh runtime.
 
 ## `LibdenoOptions`
 
@@ -64,6 +117,10 @@ pub struct LibdenoOptions {
   pub cwd: Option<PathBuf>,
   pub max_heap_bytes: Option<usize>,
   pub execution_deadline: Option<Duration>,
+  pub capture_stdout: bool,
+  pub capture_stderr: bool,
+  pub max_capture_bytes: Option<usize>,
+  pub features: Option<Vec<String>>,
 }
 ```
 
@@ -134,6 +191,32 @@ Arguments exposed to the script via `process.argv` (after argv[0]).
 
 Working directory that relative paths (entry, permissions, `node_modules`
 discovery) resolve against. Defaults to the process current directory.
+
+### `capture_stdout` / `capture_stderr`
+
+Redirect the script's stdout (fd 1, e.g. `console.log`) / stderr (fd 2, e.g.
+`console.error`) into `RunOutput::stdout` / `RunOutput::stderr` instead of the
+host's terminal. Off by default (output passes through). While active the
+redirection is fd-level and process-global: other host threads printing to
+stdout/stderr during the run are captured too (runs are serialized internally).
+
+### `max_capture_bytes`
+
+Per-stream cap on captured output (stdout and stderr each get this budget).
+When a stream exceeds it, capture stops, the excess is dropped, and
+`RunOutput::capture_truncated` is set — a verbose or hostile script can no
+longer grow host memory without limit. `None` (default) captures without a
+bound.
+
+### `features`
+
+Runtime feature flags exposed to the script, overriding the default set (`kv`,
+`cron`, `ffi`, `webgpu`, `worker-options`). Feature names must be valid deno
+unstable-feature names (see deno's `--unstable-*` flags); they gate which JS
+namespace IDs and feature checks are wired into the runtime. `None` (default)
+enables the default set. An embedder running untrusted plugins can shrink the
+surface (e.g. `Some(vec!["ffi".into()])`); the ops themselves stay
+permission-gated regardless.
 
 ## `LibdenoError`
 

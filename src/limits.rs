@@ -2,6 +2,7 @@
 //! gating, and the in-process V8 code cache.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -62,6 +63,13 @@ struct InMemoryCodeCache {
     state: Mutex<(Vec<CodeCacheEntry>, usize)>,
     /// (max entries, max total bytes); tuned small in tests via `with_limits`.
     limits: (usize, usize),
+    /// Optional disk-backed layer: compiled bytes survive process restarts
+    /// (CLI-style hosts — every npm-plugin invocation is a fresh process),
+    /// keyed by a hash of (specifier, type, source hash) so stale or
+    /// cross-project entries can never be served for the wrong source. V8
+    /// validates code-cache data itself, so corrupted/tampered files are
+    /// rejected at compile time, never mis-executed. `None` in tests.
+    disk_dir: Option<PathBuf>,
 }
 
 impl Default for InMemoryCodeCache {
@@ -69,6 +77,7 @@ impl Default for InMemoryCodeCache {
         Self {
             state: Mutex::new((Vec::new(), 0)),
             limits: (CODE_CACHE_MAX_ENTRIES, CODE_CACHE_MAX_BYTES),
+            disk_dir: None,
         }
     }
 }
@@ -83,6 +92,83 @@ impl InMemoryCodeCache {
     }
 }
 
+impl InMemoryCodeCache {
+    /// Disk directory for the code cache: `LIBDENO_CODE_CACHE_DIR` overrides,
+    /// else `<DENO_DIR>/code_cache`. Without either (and with an empty
+    /// override) the cache stays in-memory only.
+    fn disk_dir_from_env() -> Option<PathBuf> {
+        if let Some(dir) = std::env::var_os("LIBDENO_CODE_CACHE_DIR") {
+            return if dir.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(dir))
+            };
+        }
+        std::env::var_os("DENO_DIR").map(|d| PathBuf::from(d).join("code_cache"))
+    }
+
+    fn with_disk(dir: PathBuf) -> Self {
+        Self {
+            disk_dir: Some(dir),
+            ..Default::default()
+        }
+    }
+
+    /// Deterministic file name for a cache key; the specifier itself never
+    /// appears in the path (it can contain `/`, `..`, and platform
+    /// separators). Source-hash in the key means a changed source writes a
+    /// different file, never a stale hit.
+    fn disk_path(&self, key: &CodeCacheKey) -> Option<PathBuf> {
+        use std::hash::Hasher;
+        let dir = self.disk_dir.as_ref()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write(key.0.as_bytes());
+        h.write_u8(match key.1 {
+            CodeCacheType::EsModule => 0,
+            CodeCacheType::Script => 1,
+        });
+        h.write_u64(key.2);
+        Some(dir.join(format!("{:016x}.bin", h.finish())))
+    }
+    /// Bounded disk hygiene: on the first write of a process, delete files
+    /// matching this cache's own naming scheme (16 hex chars + `.bin`) if
+    /// there are more of them than the in-memory entry cap (eviction is
+    /// best-effort anyway; a clear only costs one cold run). The check runs
+    /// once per process, so a long-lived host's disk tier can grow past the
+    /// in-memory cap between checks — cache loss at worst (V8 validates
+    /// every code-cache payload), never wrong execution.
+    fn maybe_clean_disk(&self) {
+        static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let Some(dir) = &self.disk_dir else { return };
+        if CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let bin_entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                // Only this cache's own naming scheme (16 hex chars + .bin)
+                // is ever touched: other tools' .bin files in a shared
+                // LIBDENO_CODE_CACHE_DIR, or a concurrent libdeno process's
+                // entries, survive.
+                .filter(|p| {
+                    p.extension().is_some_and(|ext| ext == "bin")
+                        && p.file_stem().is_some_and(|stem| {
+                            let s = stem.to_str().unwrap_or("");
+                            s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
+                        })
+                })
+                .collect(),
+            Err(_) => return,
+        };
+        if bin_entries.len() > CODE_CACHE_MAX_ENTRIES {
+            for path in bin_entries {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
 impl CodeCache for InMemoryCodeCache {
     fn get_sync(
         &self,
@@ -91,13 +177,22 @@ impl CodeCache for InMemoryCodeCache {
         source_hash: u64,
     ) -> Option<Vec<u8>> {
         let key = (specifier.as_str().to_owned(), code_cache_type, source_hash);
-        self.state
+        if let Some(data) = self
+            .state
             .lock()
             .unwrap()
             .0
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, data)| data.clone())
+        {
+            return Some(data);
+        }
+        // Disk miss path: a fresh process with a warm disk cache reads once
+        // per module here. No memory backfill — by the time get_sync runs the
+        // compile will set_sync anyway (or the cached code is used and the
+        // next process reads the disk again; either way the file is correct).
+        std::fs::read(self.disk_path(&key)?).ok()
     }
 
     fn set_sync(
@@ -108,6 +203,7 @@ impl CodeCache for InMemoryCodeCache {
         data: &[u8],
     ) {
         let key = (specifier.as_str().to_owned(), code_cache_type, source_hash);
+        let disk_path = self.disk_path(&key);
         let (max_entries, max_bytes) = self.limits;
         let mut state = self.state.lock().unwrap();
         let (entries, total) = &mut *state;
@@ -132,16 +228,38 @@ impl CodeCache for InMemoryCodeCache {
             let removed = entries.remove(0);
             *total -= removed.1.len();
         }
+        // Disk write is best-effort: a read-only cache dir, a full disk, or
+        // a missing parent must never fail the run — the code cache is a
+        // pure optimization. Entries the in-memory tier just evicted as
+        // "uncacheable" (larger than max_bytes) are skipped, keeping the
+        // disk tier's per-entry bound identical to memory.
+        drop(state);
+        if let Some(path) = disk_path {
+            if data.len() <= max_bytes {
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(&path, data);
+                self.maybe_clean_disk();
+            }
+        }
     }
 }
 
 static CODE_CACHE: OnceLock<Arc<InMemoryCodeCache>> = OnceLock::new();
 
 /// Shared, process-wide code cache; repeated [`crate::run`] calls reuse the
-/// same instance so warm runs hit.
+/// same instance so warm runs hit. Backed by disk when
+/// `LIBDENO_CODE_CACHE_DIR` or `DENO_DIR` is set, so cold process starts
+/// (CLI-style hosts) reuse compiled script bytes across invocations too.
 pub(crate) fn in_process_code_cache() -> Arc<dyn CodeCache> {
     CODE_CACHE
-        .get_or_init(|| Arc::new(InMemoryCodeCache::default()))
+        .get_or_init(|| {
+            Arc::new(match InMemoryCodeCache::disk_dir_from_env() {
+                Some(dir) => InMemoryCodeCache::with_disk(dir),
+                None => InMemoryCodeCache::default(),
+            })
+        })
         .clone()
 }
 

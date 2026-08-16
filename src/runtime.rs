@@ -81,8 +81,8 @@ impl LibdenoRuntime {
 /// (the resolver stack is scoped to the runtime's directory).
 ///
 /// `LibdenoOptions.capture_stdout` / `capture_stderr` are **not** honored by
-/// `run_with` (it returns only the exit code); use [`crate::run_with_output`]
-/// for capture. Setting them here is a silent no-op.
+/// `run_with` (it returns only the exit code); use [`run_with_output`] for
+/// capture on the reusable stack.
 ///
 /// The async/sync split is deliberate: [`LibdenoRuntime::new`] is async
 /// because resolver stack construction needs a tokio context, while `run_with`
@@ -106,13 +106,74 @@ pub fn run_with(
         std::thread::spawn(move || run_with_sync(&runtime, &entry, &options))
             .join()
             .map_err(|_| {
-                LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-                    "libdeno::run_with() worker thread panicked"
-                ))
+                LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
             })?
     } else {
         run_with_sync(&runtime, &entry, &options)
     }
+}
+
+/// Runs `entry` through a prebuilt [`LibdenoRuntime`]'s resolver stack and
+/// returns the exit code together with the captured stdout/stderr when
+/// `LibdenoOptions.capture_stdout` / `capture_stderr` are set — the
+/// long-lived-host equivalent of [`crate::run_with_output`] (which rebuilds
+/// the resolver stack on every call).
+///
+/// Everything else matches [`run_with`]: serialized on the cwd lock, tokio
+/// re-entry handled automatically, `LibdenoOptions.cwd` ignored, permissions
+/// per-run. Capture semantics (fd-level redirection, byte cap, Windows
+/// rejection) are identical to [`crate::run_with_output`].
+pub fn run_with_output(
+    runtime: &LibdenoRuntime,
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+) -> Result<crate::RunOutput, LibdenoError> {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    crate::limits::capture_spawned_ipc_marker();
+    let entry = entry.as_ref().to_path_buf();
+    let options = options.clone();
+    let runtime = runtime.clone();
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || run_with_sync_output(&runtime, &entry, &options))
+            .join()
+            .map_err(|_| {
+                LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
+            })?
+    } else {
+        run_with_sync_output(&runtime, &entry, &options)
+    }
+}
+
+/// Capture + [`run_with_sync`]; the Windows rejection and byte-cap handling
+/// mirror `crate::run_sync_output`.
+fn run_with_sync_output(
+    runtime: &LibdenoRuntime,
+    entry: &Path,
+    options: &LibdenoOptions,
+) -> Result<crate::RunOutput, LibdenoError> {
+    #[cfg(windows)]
+    if options.capture_stdout || options.capture_stderr {
+        return Err(LibdenoError::Configuration(
+            "output capture is not supported on Windows (std stdout/stderr \
+             bypass the redirected CRT fd); use run_in_subprocess and pipe \
+             the child's output instead"
+                .to_string(),
+        ));
+    }
+    let capture = crate::output::OutputCapture::new(
+        options.capture_stdout,
+        options.capture_stderr,
+        options.max_capture_bytes,
+    )
+    .map_err(LibdenoError::Io)?;
+    let result = run_with_sync(runtime, entry, options);
+    let (stdout, stderr, capture_truncated) = capture.finish();
+    Ok(crate::RunOutput {
+        exit_code: result?,
+        stdout,
+        stderr,
+        capture_truncated,
+    })
 }
 
 /// The actual run against a prebuilt resolver stack: its own block_on on a

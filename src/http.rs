@@ -107,6 +107,58 @@ fn npm_body_limit(content_length: Option<u64>) -> usize {
     }
 }
 
+/// Default post-decompression budget for npm tarballs, and the env override
+/// (`LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`). Downstream extraction reserves
+/// from the gzip ISIZE header, which the publisher writes — a malicious
+/// registry could serve a small tarball whose ISIZE claims ~4 GiB and make
+/// the extractor try_reserve that much. This pre-check rejects such tarballs
+/// at download time; the budget is deliberately configurable so hosts with
+/// unusual packages can raise it.
+fn tarball_decompress_budget() -> usize {
+    const DEFAULT: usize = 1 << 30;
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT)
+    })
+}
+
+/// Rejects gzip tarballs whose ISIZE trailer (last 4 bytes, little-endian,
+/// mod 2^32) claims a decompressed size above the configured budget.
+///
+/// This is a coarse guard, not a precise bound: ISIZE only reflects the last
+/// gzip member (multi-member tarballs can decompress larger in total) and
+/// wraps at 4 GiB. It exists to block the cheap malicious case — a tiny
+/// tarball declaring ~4 GiB that would make upstream's `try_reserve` commit
+/// that much virtual memory before the real decompressed size is known;
+/// upstream falls back to streaming (no reservation) when the reserve fails,
+/// and that path plus this check bound the practical exposure. The
+/// `read_body_limited` cap above bounds the *compressed* bytes already.
+fn guard_tarball_isize(path: &str, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    // Only .tgz URLs carry gzip-compressed tar data; registry metadata
+    // (JSON, possibly transport-gzip-encoded) must not be size-checked here —
+    // its trailer bytes are not an ISIZE and would spuriously fail.
+    if !path.ends_with(".tgz") || bytes.len() < 8 || bytes[..2] != [0x1f, 0x8b] {
+        return Ok(bytes);
+    }
+    let isize = u32::from_le_bytes([
+        bytes[bytes.len() - 4],
+        bytes[bytes.len() - 3],
+        bytes[bytes.len() - 2],
+        bytes[bytes.len() - 1],
+    ]) as usize;
+    let budget = tarball_decompress_budget();
+    if isize > budget {
+        return Err(format!(
+            "tarball declares {isize} decompressed bytes, over the \
+             {budget}-byte budget (raise LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES to allow it)"
+        ));
+    }
+    Ok(bytes)
+}
+
 #[async_trait::async_trait(?Send)]
 impl HttpClient for ReqwestHttpClient {
     async fn send_no_follow(
@@ -250,6 +302,9 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
                         let limit = npm_body_limit(response.content_length());
                         let bytes = read_body_limited(&mut response, limit).await.map_err(|e| {
                             err(None, format!("failed to read npm registry response: {e}"))
+                        })?;
+                        let bytes = guard_tarball_isize(url.path(), bytes).map_err(|e| {
+                            err(None, format!("failed to download npm tarball: {e}"))
                         })?;
                         return Ok(NpmCacheHttpClientResponse::Bytes(
                             NpmCacheHttpClientBytesResponse { bytes, etag },
@@ -541,5 +596,47 @@ mod tests {
                 _ => panic!("expected npm registry bytes response"),
             }
         });
+    }
+
+    #[test]
+    fn isize_guard_rejects_inflated_trailer() {
+        // A small tarball whose gzip ISIZE trailer claims ~4 GiB must be
+        // rejected at download time (upstream extraction would try_reserve
+        // that much from a publisher-controlled header).
+        let mut bytes = vec![0x1f, 0x8b]; // gzip magic
+        bytes.extend_from_slice(&[0u8; 100]);
+        bytes.extend_from_slice(&((1u32 << 30) + 1).to_le_bytes()); // ISIZE > 1 GiB budget
+        let err = guard_tarball_isize("/pkg/-/pkg-1.0.0.tgz", bytes).unwrap_err();
+        assert!(
+            err.contains("decompressed bytes") && err.contains("budget"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn isize_guard_passes_small_trailer() {
+        let mut bytes = vec![0x1f, 0x8b];
+        bytes.extend_from_slice(&[0u8; 100]);
+        bytes.extend_from_slice(&1024u32.to_le_bytes());
+        assert!(guard_tarball_isize("/pkg/-/pkg-1.0.0.tgz", bytes).is_ok());
+    }
+
+    #[test]
+    fn isize_guard_ignores_non_tarball_paths() {
+        // Registry metadata (JSON) must never be size-checked: its trailer
+        // bytes are not an ISIZE and would spuriously fail.
+        let mut bytes = vec![0x1f, 0x8b];
+        bytes.extend_from_slice(&[0u8; 100]);
+        bytes.extend_from_slice(&((1u32 << 30) + 1).to_le_bytes());
+        assert!(
+            guard_tarball_isize("/pkg/pkg-1.0.0", bytes).is_ok(),
+            "non-.tgz responses must pass through"
+        );
+    }
+
+    #[test]
+    fn isize_guard_ignores_non_gzip_bytes() {
+        let bytes = vec![0u8; 64]; // no gzip magic
+        assert!(guard_tarball_isize("/pkg/-/pkg-1.0.0.tgz", bytes).is_ok());
     }
 }

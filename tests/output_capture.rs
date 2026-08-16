@@ -145,3 +145,90 @@ fn run_inside_tokio_keeps_error_reporting() {
         let _ = fs::remove_dir_all(&dir);
     });
 }
+
+#[test]
+fn capture_truncates_at_max_capture_bytes() {
+    // A verbose script must not grow host memory without limit: the byte cap
+    // stops capture and flags the truncation instead.
+    let dir = temp_dir("cap");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "for (let i = 0; i < 1000; i++) { console.log('x'.repeat(100)); }",
+    )
+    .unwrap();
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        capture_stdout: true,
+        max_capture_bytes: Some(256),
+        ..Default::default()
+    };
+    let out = run_with_output(&entry, &options).unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        out.stdout.len() <= 256,
+        "captured {} bytes, expected <= 256",
+        out.stdout.len()
+    );
+    assert!(out.capture_truncated, "truncation must be flagged");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capture_within_budget_is_not_truncated() {
+    let dir = temp_dir("fit");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('small');").unwrap();
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        capture_stdout: true,
+        max_capture_bytes: Some(1 << 20),
+        ..Default::default()
+    };
+    let out = run_with_output(&entry, &options).unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("small\n"),
+        "captured stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!out.capture_truncated, "small output must not truncate");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_with_reuses_stack_and_captures() {
+    // The reusable-runtime path must honor capture too: long-lived hosts get
+    // both stack reuse and per-run captured output via
+    // libdeno::runtime::run_with_output.
+    let dir = temp_dir("rt-out");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('runtime capture');").unwrap();
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        capture_stdout: true,
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runtime = rt
+        .block_on(libdeno::runtime::LibdenoRuntime::new(&dir))
+        .unwrap();
+    let out = libdeno::runtime::run_with_output(&runtime, &entry, &options).unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("runtime capture\n"),
+        "captured stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // A second run must reuse the stack and capture again.
+    let out2 = libdeno::runtime::run_with_output(&runtime, &entry, &options).unwrap();
+    assert!(
+        String::from_utf8_lossy(&out2.stdout).contains("runtime capture\n"),
+        "second run captured stdout: {:?}",
+        String::from_utf8_lossy(&out2.stdout)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

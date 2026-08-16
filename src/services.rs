@@ -222,6 +222,11 @@ pub struct SharedServices {
     /// Implements deno_graph's `Resolver` and `NpmResolver` traits for graph
     /// building.
     pub graph_resolver: Arc<GraphResolver>,
+    /// Cross-run module analysis cache (deno_graph `ModuleAnalyzer` +
+    /// `ModuleInfoCacher`): re-parses and re-analyzes of the transitive graph
+    /// are skipped when (specifier, source hash) is unchanged since the last
+    /// run.
+    pub module_info_cache: Arc<crate::analysis_cache::ModuleInfoCache>,
     /// npm process state for `child_process.fork` (npm snapshot propagation).
     pub npm_process_state_provider: deno_runtime::deno_process::NpmProcessStateProviderRc,
 }
@@ -256,6 +261,13 @@ impl SharedServices {
             },
         ));
 
+        // Cross-run analysis caches wired into the resolver stack (see
+        // analysis_cache.rs): in-memory CJS analysis, a process-global
+        // singleton so `run()` (which builds a fresh SharedServices per
+        // call) still reuses it.
+        let node_analysis_cache: deno_resolver::cjs::analyzer::NodeAnalysisCacheRc =
+            crate::analysis_cache::node_analysis_cache();
+
         let resolver_factory = Arc::new(ResolverFactory::new(
             workspace_factory.clone(),
             ResolverFactoryOptions {
@@ -279,7 +291,14 @@ impl SharedServices {
                 allow_json_imports: AllowJsonImports::WithAttribute,
                 require_modules: vec![],
                 newest_dependency_date: None,
-                node_analysis_cache: None,
+                // Cross-run CJS analysis cache (content-hash keyed, process-
+                // global — see analysis_cache.rs). node_resolution_cache and
+                // package_json_cache stay None deliberately: upstream's
+                // thread-local stores are keyed by path only with no
+                // invalidation path, so in-process filesystem changes (an
+                // `npm install` between runs, an edited package.json) would
+                // serve stale resolutions forever.
+                node_analysis_cache: Some(node_analysis_cache),
                 node_resolution_cache: None,
                 package_json_cache: None,
                 package_json_dep_resolution: None,
@@ -361,6 +380,7 @@ impl SharedServices {
             GraphResolver::new(resolver_factory.clone(), npm_installer_factory.clone()).await?,
         );
         let npm_process_state_provider = create_npm_process_state_provider(&resolver_factory)?;
+        let module_info_cache = crate::analysis_cache::module_info_cache();
 
         Ok(Arc::new(Self {
             sys,
@@ -370,6 +390,7 @@ impl SharedServices {
             global_http_cache,
             memory_files,
             graph_resolver,
+            module_info_cache,
             npm_process_state_provider,
         }))
     }

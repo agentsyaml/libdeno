@@ -97,3 +97,28 @@ jobs:
       # SECURITY.md); --deny warnings turns any NEW advisory into a failure.
       - name: Audit
         run: cargo audit --deny warnings
+
+  verify-versions:
+    name: verify pinned deno/TS versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The DENO_VERSION / TS_VERSION constants are hand-synced with the
+      # deno_runtime pin (build.rs documents the manual step); this job makes
+      # a stale or typoed constant fail CI instead of silently mislabeling
+      # the runtime's reported version.
+      - name: Verify pinned versions exist upstream
+        run: |
+          set -euo pipefail
+          # Trailing quote is part of the matched line; `$`-anchored classes
+          # would never match, so extract the first number run instead.
+          DENO_VERSION=$(grep -oE 'DENO_VERSION: &str = "[0-9.]+"' src/lib.rs | grep -oE '[0-9.]+')
+          TS_VERSION=$(grep -oE 'TS_VERSION: &str = "[0-9.]+"' build.rs | grep -oE '[0-9.]+')
+          echo "deno v${DENO_VERSION}, typescript ${TS_VERSION}"
+          # HTML page instead of the GitHub API: unauthenticated API calls
+          # from shared runner IPs hit the 60/hr rate limit and flake.
+          curl -sf --retry 3 --retry-all-errors -o /dev/null "https://github.com/denoland/deno/releases/tag/v${DENO_VERSION}" \
+            || { echo "deno tag v${DENO_VERSION} does not exist"; exit 1; }
+          curl -sf --retry 3 --retry-all-errors -o /dev/null "https://registry.npmjs.org/typescript/${TS_VERSION}" \
+            || { echo "typescript ${TS_VERSION} does not exist on npm"; exit 1; }

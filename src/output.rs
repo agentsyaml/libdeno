@@ -23,14 +23,18 @@ pub(crate) struct OutputCapture {
 }
 
 impl OutputCapture {
-    pub(crate) fn new(capture_stdout: bool, capture_stderr: bool) -> Result<Self, std::io::Error> {
+    pub(crate) fn new(
+        capture_stdout: bool,
+        capture_stderr: bool,
+        max_bytes: Option<usize>,
+    ) -> Result<Self, std::io::Error> {
         let stdout = if capture_stdout {
-            Some(StreamCapture::new(1)?)
+            Some(StreamCapture::new(1, max_bytes)?)
         } else {
             None
         };
         let stderr = if capture_stderr {
-            Some(StreamCapture::new(2)?)
+            Some(StreamCapture::new(2, max_bytes)?)
         } else {
             None
         };
@@ -38,12 +42,13 @@ impl OutputCapture {
     }
 
     /// Restores the original fds and returns (captured stdout, captured
-    /// stderr). Call unconditionally after the run, even on error, so the
-    /// redirection never outlives the run.
-    pub(crate) fn finish(mut self) -> (Vec<u8>, Vec<u8>) {
-        let stdout = self.stdout.take().map(|s| s.finish()).unwrap_or_default();
-        let stderr = self.stderr.take().map(|s| s.finish()).unwrap_or_default();
-        (stdout, stderr)
+    /// stderr, whether either stream hit its byte cap and was truncated).
+    /// Call unconditionally after the run, even on error, so the redirection
+    /// never outlives the run.
+    pub(crate) fn finish(mut self) -> (Vec<u8>, Vec<u8>, bool) {
+        let (stdout, trunc_stdout) = self.stdout.take().map(|s| s.finish()).unwrap_or_default();
+        let (stderr, trunc_stderr) = self.stderr.take().map(|s| s.finish()).unwrap_or_default();
+        (stdout, stderr, trunc_stdout || trunc_stderr)
     }
 }
 
@@ -59,13 +64,17 @@ struct StreamCapture {
     /// The fd being redirected (1 = stdout, 2 = stderr).
     target: libc::c_int,
     /// The original fd, kept open so it can be restored on finish.
-    saved: libc::c_int,
+    /// `None` once restored (taken by finish / Drop), so a stale fd number
+    /// can never be dup2'd again after the OS reused it for another file.
+    saved: Option<libc::c_int>,
     /// Captured blocks from the (detached) reader thread.
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    /// Set by the reader thread when the byte cap was hit (truncated).
+    overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StreamCapture {
-    fn new(fd: libc::c_int) -> Result<Self, std::io::Error> {
+    fn new(fd: libc::c_int, max_bytes: Option<usize>) -> Result<Self, std::io::Error> {
         let mut fds = [0; 2];
         let rc = unsafe {
             #[cfg(unix)]
@@ -115,7 +124,7 @@ impl StreamCapture {
             }
             return Err(err);
         }
-        let saved = dup_fd;
+        let saved = Some(dup_fd);
         if unsafe { libc::dup2(write_fd, fd) } < 0 {
             let err = std::io::Error::last_os_error();
             unsafe {
@@ -133,13 +142,17 @@ impl StreamCapture {
             libc::close(write_fd);
         }
         let (tx, rx) = std::sync::mpsc::channel();
+        let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let overflow_flag = overflow.clone();
         // Dropping the handle detaches: finish() drains the channel with a
         // timeout, and joining could block forever while a detached child
         // holds the pipe write end (macOS posix_spawn ignores FD_CLOEXEC).
-        // The thread ends on its own once EOF arrives or the receiver
-        // disconnects.
+        // The thread ends on its own once EOF arrives, the receiver
+        // disconnects, or the byte cap is hit.
         let _ = std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
+            let mut buf = [0u8; 65536];
+            let mut total: usize = 0;
+            let mut discarding = false;
             loop {
                 // read()'s count type differs per platform: size_t on unix,
                 // unsigned int on Windows. Mutually exclusive cfg bindings
@@ -158,6 +171,32 @@ impl StreamCapture {
                 if n <= 0 {
                     break; // EOF, or the fd was closed/broken mid-run
                 }
+                // After the cap fires the thread keeps draining and
+                // discarding (never closing the read end): the pipe's write
+                // end is the script's fd 1/2, so closing it here would make
+                // the script's subsequent writes fail with EPIPE mid-run.
+                // Draining also keeps a blocked writer flowing. The drain
+                // ends when finish() restores the fds (EOF) or the receiver
+                // disconnects.
+                if discarding {
+                    continue;
+                }
+                total += n as usize;
+                // On the block that crosses the cap, keep the part that fits
+                // and drop the rest — the buffer never exceeds max_bytes and
+                // still contains "the first max_bytes".
+                if let Some(max) = max_bytes {
+                    if total > max {
+                        let over = total - max;
+                        let keep = n as usize - over;
+                        if keep > 0 {
+                            let _ = tx.send(buf[..keep].to_vec());
+                        }
+                        overflow_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        discarding = true;
+                        continue;
+                    }
+                }
                 if tx.send(buf[..n as usize].to_vec()).is_err() {
                     break; // receiver gave up (finish timeout); stop reading
                 }
@@ -170,50 +209,71 @@ impl StreamCapture {
             target: fd,
             saved,
             rx,
+            overflow,
         })
     }
 
     /// Restores the original fd (which closes the last pipe write end and so
     /// unblocks the reader thread) and collects the captured bytes.
     ///
-    /// The wait is capped as a defense: on macOS `posix_spawn` inherits every
-    /// fd regardless of FD_CLOEXEC, so a child the script spawned and
-    /// `unref()`ed (detached, not awaited by the event loop) may hold the
-    /// pipe write end open after the run, and EOF would never arrive — a
-    /// daemonized child would hang the host forever. Linux closes the pipe in
-    /// the exec'd child via CLOEXEC; macOS needs the timeout, which returns
-    /// whatever was captured so far. A child that never exits also leaves the
-    /// detached reader thread blocked in read() until it does (one thread +
-    /// fd per such run — documented trade-off).
-    fn finish(self) -> Vec<u8> {
+    /// The wait is capped at a *total* budget from entry: on macOS
+    /// `posix_spawn` inherits every fd regardless of FD_CLOEXEC, so a child
+    /// the script spawned and `unref()`ed (detached, not awaited by the event
+    /// loop) may hold the pipe write end open after the run, and EOF would
+    /// never arrive — a daemonized child would hang the host forever. Linux
+    /// closes the pipe in the exec'd child via CLOEXEC; macOS needs the
+    /// timeout, which returns whatever was captured so far. The budget is
+    /// total, not per-block: a child that *keeps writing* (a logging daemon)
+    /// would otherwise reset the idle timer on every block and stall the
+    /// caller forever. A child that never exits also leaves the detached
+    /// reader thread blocked in read() until it does (one thread + fd per
+    /// such run — documented trade-off).
+    fn finish(mut self) -> (Vec<u8>, bool) {
+        // Defensive: finish() consumes self, so this can only trigger on a
+        // double-finish bookkeeping bug. Never dup2 a closed fd number.
+        let Some(saved) = self.saved.take() else {
+            return (
+                Vec::new(),
+                self.overflow.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        };
         // SAFETY: `saved` is a valid open fd; failure to restore leaves the
-        // host's fd 1/2 pointed at the pipe, so report it rather than
-        // silently swallowing.
-        let restored = unsafe { libc::dup2(self.saved, self.target) };
-        if restored < 0 {
+        // host's fd 1/2 pointed at the pipe with no way back — the host's
+        // stdio is permanently corrupted and every later println would be
+        // swallowed, then block when the pipe fills. Abort rather than
+        // continue in a wedged state.
+        if unsafe { libc::dup2(saved, self.target) } < 0 {
             eprintln!(
-                "libdeno: failed to restore fd {} after output capture: {}",
+                "libdeno: failed to restore fd {} after output capture: {}; aborting to avoid \
+                 silent stdio corruption",
                 self.target,
                 std::io::Error::last_os_error()
             );
+            std::process::abort();
         }
         // The original fd's content was copied back to `target`; the spare
         // copy is no longer needed.
         unsafe {
-            libc::close(self.saved);
+            libc::close(saved);
         }
-        // Collect blocks until EOF (channel closed) or the cap expires. The
-        // cap only fires when a spawned child holds the write end open; on
-        // every normal run EOF arrives right after the restore above.
+        // Collect blocks until EOF (channel closed) or the budget expires.
+        // The budget only fires when a spawned child holds the write end
+        // open; on every normal run EOF arrives right after the restore
+        // above.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         let mut out = Vec::new();
         loop {
-            match self.rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.rx.recv_timeout(remaining) {
                 Ok(block) => out.extend_from_slice(&block),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        out
+        (
+            out,
+            self.overflow.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 }
 
@@ -224,11 +284,14 @@ impl Drop for StreamCapture {
         // finish() ever running, leaving the host's fd 1/2 pointed at a pipe
         // with no reader — host stdout would be swallowed, then block once
         // the pipe buffer fills. Restore the fd here so the redirect never
-        // outlives its capture. Harmless when finish() already ran (its
-        // dup2 restored the same fd; saved was closed with self).
-        unsafe {
-            libc::dup2(self.saved, self.target);
-            libc::close(self.saved);
+        // outlives its capture. `take()` guards against double-restore: after
+        // finish() ran, `saved` is None, so the (possibly reused) fd number
+        // is never touched again.
+        if let Some(saved) = self.saved.take() {
+            unsafe {
+                libc::dup2(saved, self.target);
+                libc::close(saved);
+            }
         }
     }
 }

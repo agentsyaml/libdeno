@@ -370,8 +370,12 @@ async fn build_graph(
                 jsr_url_provider: &deno_graph::source::DefaultJsrUrlProvider,
                 jsr_version_resolver: Cow::Borrowed(&**jsr_version_resolver),
                 passthrough_jsr_specifiers: false,
-                module_analyzer: &deno_graph::ast::DefaultModuleAnalyzer,
-                module_info_cacher: &deno_graph::source::NullModuleInfoCacher,
+                // The shared cross-run analysis cache (see analysis_cache.rs):
+                // parse + analyze results are reused when (specifier, source
+                // hash) is unchanged, so warm runs skip re-analysis of the
+                // whole transitive graph. Same object for both seams.
+                module_analyzer: &*shared.module_info_cache,
+                module_info_cacher: &*shared.module_info_cache,
                 npm_resolver: Some(&*graph_resolver),
                 reporter: None,
                 resolver: Some(&*graph_resolver),
