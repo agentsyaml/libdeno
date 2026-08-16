@@ -65,6 +65,9 @@ fn parallel_runs_overlap_in_time() {
 /// rejected with `Configuration` (not silently serialized — capture is
 /// fd-level process-global redirection and would steal the other run's
 /// output). Once the captured run finishes, ordinary runs work again.
+/// (Capture itself is rejected on Windows — the sync capture tests are
+/// file-gated, this mixed file gates just the captured case.)
+#[cfg(not(windows))]
 #[test]
 fn captured_run_rejects_concurrent_ordinary_run() {
     let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
