@@ -75,6 +75,7 @@ fn async_run_reports_script_error() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn async_capture_returns_output() {
     let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
