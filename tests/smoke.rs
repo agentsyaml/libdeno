@@ -492,19 +492,15 @@ fn subprocess_child_uses_options_cwd() {
     let dir = temp_dir("subproc-cwd");
     fs::create_dir_all(&dir).unwrap();
     let entry = dir.join("main.js");
-    // Canonicalize: Deno.cwd()/process.cwd() come from getcwd, which resolves
-    // symlinks (e.g. /var -> /private/var on macOS).
-    let expected = fs::canonicalize(&dir).unwrap().display().to_string();
-    // Windows canonicalize returns a \\?\ verbatim path; Deno.cwd() never
-    // has the prefix — strip it so the comparison is apples-to-apples.
-    #[cfg(windows)]
-    let expected = expected
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&expected)
-        .to_string();
+    // Semantic cwd check instead of string comparison: Windows path forms
+    // differ between APIs (canonicalize returns \\?\ verbatim + resolves
+    // 8.3 short names, Deno.cwd() echoes the process cwd form), so compare
+    // behavior — a relative read that only resolves if cwd == dir.
+    fs::write(dir.join("marker.txt"), "subproc-cwd-ok").unwrap();
     fs::write(
         &entry,
-        format!("if (Deno.cwd() !== {expected:?}) throw new Error('cwd mismatch');"),
+        "if (Deno.readTextFileSync('./marker.txt') !== 'subproc-cwd-ok') \
+         throw new Error('cwd mismatch');",
     )
     .unwrap();
     let _host_exe = set_host_exe(env!("CARGO_BIN_EXE_child_host"));
