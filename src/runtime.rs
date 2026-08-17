@@ -30,7 +30,7 @@ use crate::RunLease;
 /// `Sync` (its only state is an `Arc<Mutex<RuntimeState>>` around the resolver
 /// stack), so it can be shared across host threads and used concurrently —
 /// ordinary runs are fully parallel; only a captured run is exclusive (see
-/// [`crate::RunLease`]).
+/// `RunLease`).
 #[derive(Clone)]
 pub struct LibdenoRuntime {
     cwd: PathBuf,
@@ -170,7 +170,7 @@ fn reject_unusable_cwd(
 /// the resolver stack on every call).
 ///
 /// Everything else matches [`run_with`]: the capture-exclusivity lease (see
-/// [`crate::RunLease`]), tokio re-entry handled automatically, mismatched
+/// `RunLease`), tokio re-entry handled automatically, mismatched
 /// `LibdenoOptions.cwd` rejected (matching cwd accepted), permissions
 /// per-run. Capture semantics
 /// (fd-level redirection, byte cap, Windows rejection) are identical to

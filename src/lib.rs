@@ -198,7 +198,7 @@ pub struct LibdenoOptions {
     /// process-global: other host threads printing to stdout during the run
     /// are captured too, and the run is **exclusive** — any concurrent run
     /// (captured or not) is rejected with [`LibdenoError::Configuration`]
-    /// (see [`RunLease`]). For captured runs alongside parallel execution use
+    /// (see `RunLease`). For captured runs alongside parallel execution use
     /// [`run_in_subprocess`], where each process has its own fds.
     pub capture_stdout: bool,
     /// Redirect the script's stderr (fd 2, e.g. `console.error`) into
@@ -295,7 +295,7 @@ impl From<Box<deno_core::error::JsError>> for LibdenoError {
 /// analysis / npm-snapshot / on-disk caches are safe shared state). The one
 /// exception: output capture is process-global fd redirection, so a captured
 /// run is exclusive and any overlapping run is rejected with
-/// [`LibdenoError::Configuration`] (see [`RunLease`]); use
+/// [`LibdenoError::Configuration`] (see `RunLease`); use
 /// [`run_in_subprocess`] for captured runs, where each process has its own
 /// fds.
 pub fn run(entry: impl AsRef<Path>, options: &LibdenoOptions) -> Result<i32, LibdenoError> {
@@ -311,7 +311,7 @@ pub fn run(entry: impl AsRef<Path>, options: &LibdenoOptions) -> Result<i32, Lib
 /// tokio context the run executes on a fresh thread (exactly the
 /// `std::thread::spawn + join` escape async hosts previously had to build
 /// themselves). A captured run holds the exclusivity lease across that
-/// thread's lifetime (see [`RunLease`]).
+/// thread's lifetime (see `RunLease`).
 pub fn run_with_output(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,

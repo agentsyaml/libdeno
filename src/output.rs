@@ -8,7 +8,7 @@
 //!
 //! The redirection is process-global while active: other threads of the host
 //! that print to fd 1/2 during the run land in the captured buffer too.
-//! The run holds the exclusivity lease ([`crate::RunLease`]) — any concurrent
+//! The run holds the exclusivity lease (`RunLease`) — any concurrent
 //! run is rejected with `Configuration` rather than letting the capture
 //! reader steal its output; host-side concurrent printing is a documented
 //! caveat.
