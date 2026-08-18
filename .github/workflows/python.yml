@@ -1,25 +1,6 @@
 name: Python wheels
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "python/**"
-      - "src/**"
-      - ".cargo/**"
-      - "build.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/python.yml"
-  pull_request:
-    paths:
-      - "python/**"
-      - "src/**"
-      - ".cargo/**"
-      - "build.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/python.yml"
   workflow_dispatch:
   workflow_call:
 

@@ -1,7 +1,6 @@
 name: Python publish
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - "python-v*"
@@ -18,7 +17,7 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    if: ${{ startsWith(github.ref, 'refs/tags/python-v') || github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.repository == 'agentsyaml/libdeno' && startsWith(github.ref, 'refs/tags/python-v') }}
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -93,7 +92,7 @@ jobs:
           PY
 
       - name: Publish to PyPI
-        # Official Docker action release ref is required for image lookup; do not replace it with a guessed SHA.
-        uses: pypa/gh-action-pypi-publish@release/v1
+        # Confirmed full SHA for the official PyPI Docker action.
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
         with:
           packages-dir: dist

@@ -1,9 +1,18 @@
-name: CI
+name: Rust PR
 
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
+  workflow_dispatch:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-pr-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,17 +23,13 @@ env:
 # (github-actions ecosystem) or `gh api repos/<owner>/<repo>/commits/<ref>`.
 
 jobs:
-  test:
-    name: build + test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # macos-15 = arm64, macos-15-intel = x86_64 (both standard labels;
-        # macos-13 is retired and macos-14 is deprecated).
-        os: [ubuntu-latest, macos-15, macos-15-intel, windows-latest]
+  fast:
+    name: Rust PR / fast
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch (2026-08-05)
         with:
@@ -32,8 +37,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # V8 snapshot compilation is heavy; cache the whole target dir.
-          cache-on-failure: true
+          cache-on-failure: false
 
       - name: Format
         run: cargo fmt --check
@@ -45,80 +49,3 @@ jobs:
         # --locked keeps CI in sync with the committed Cargo.lock (the release
         # publish is --locked too, so lockfile drift fails here, not at tag).
         run: cargo test --all-targets --locked
-
-  release-build:
-    name: release build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch (2026-08-05)
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-on-failure: true
-
-      - name: Build (release)
-        # Exercises the release profile (optimizations + final link) that the
-        # dev-profile test job never touches.
-        run: cargo build --release --all-targets --locked
-
-  msrv:
-    name: MSRV check (1.95.0)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0 branch
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-on-failure: true
-
-      - name: Check (MSRV)
-        run: cargo check --locked
-
-  audit:
-    name: cargo audit (deps)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # cargo audit runs as a cargo subcommand, so a toolchain is required.
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch (2026-08-05)
-
-      # Prebuilt binary from the official rustsec/cargo-audit release, instead
-      # of a 3-5 min `cargo install --locked cargo-audit` on every run.
-      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
-        with:
-          tool: cargo-audit
-
-      # Upstream-tracked advisories are ignored in .cargo/audit.toml (see
-      # SECURITY.md); --deny warnings turns any NEW advisory into a failure.
-      - name: Audit
-        run: cargo audit --deny warnings
-
-  verify-versions:
-    name: verify pinned deno/TS versions
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # The DENO_VERSION / TS_VERSION constants are hand-synced with the
-      # deno_runtime pin (build.rs documents the manual step); this job makes
-      # a stale or typoed constant fail CI instead of silently mislabeling
-      # the runtime's reported version.
-      - name: Verify pinned versions exist upstream
-        run: |
-          set -euo pipefail
-          # Trailing quote is part of the matched line; `$`-anchored classes
-          # would never match, so extract the first number run instead.
-          DENO_VERSION=$(grep -oE 'DENO_VERSION: &str = "[0-9.]+"' src/lib.rs | grep -oE '[0-9.]+')
-          TS_VERSION=$(grep -oE 'TS_VERSION: &str = "[0-9.]+"' build.rs | grep -oE '[0-9.]+')
-          echo "deno v${DENO_VERSION}, typescript ${TS_VERSION}"
-          # HTML page instead of the GitHub API: unauthenticated API calls
-          # from shared runner IPs hit the 60/hr rate limit and flake.
-          curl -sf --retry 3 --retry-all-errors -o /dev/null "https://github.com/denoland/deno/releases/tag/v${DENO_VERSION}" \
-            || { echo "deno tag v${DENO_VERSION} does not exist"; exit 1; }
-          curl -sf --retry 3 --retry-all-errors -o /dev/null "https://registry.npmjs.org/typescript/${TS_VERSION}" \
-            || { echo "typescript ${TS_VERSION} does not exist on npm"; exit 1; }

@@ -15,7 +15,7 @@
 #    publish requires an API token; later versions can use trusted publishing.
 # 2. crates.io -> crate page -> Settings -> Trusted Publishing -> Add ->
 #    GitHub: owner `agentsyaml`, repo `libdeno`, workflow `release.yml`,
-#    environment left empty (matches any job environment, incl. crates-io).
+#    bind the external publisher to environment `crates-io`.
 name: Release
 
 on:
@@ -27,28 +27,28 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-permissions:
-  # id-token for the crates.io OIDC exchange; contents for the GitHub Release.
-  # The deployment record is created by GitHub itself because the job
-  # references an environment, so no deployments permission is needed.
-  id-token: write
-  contents: write
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish:
-    name: publish to crates.io
+  preflight:
+    name: preflight
     runs-on: ubuntu-latest
-    # GitHub creates a deployment for this environment on each run; the job
-    # outcome becomes the deployment status shown in the main page's
-    # Deployments card (same pattern as the mineru-rs release workflow).
-    environment: crates-io
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch (2026-08-05)
+
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+        with:
+          tool: cargo-audit
 
       # Tag and Cargo.toml must agree; otherwise the tag would say one version
       # while crates.io receives another.
@@ -59,6 +59,35 @@ jobs:
           test "$tag" = "$crate" || {
             echo "tag v$tag does not match Cargo.toml version $crate"; exit 1;
           }
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      - name: Package
+        run: cargo package --locked --no-verify
+
+      - name: Audit
+        run: cargo audit --deny warnings
+
+  publish:
+    name: publish to crates.io
+    if: github.repository == 'agentsyaml/libdeno'
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: crates-io-publish-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch (2026-08-05)
 
       # Exchanges the GitHub OIDC token for a short-lived crates.io token
       # (auto-revoked afterwards). No CARGO_REGISTRY_TOKEN secret needed.
@@ -72,9 +101,26 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked
 
+  github-release:
+    name: create GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
       # The repo main page's Releases sidebar lists GitHub Releases, not tags
       # or crates.io versions — publishing without a Release leaves it empty.
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "GitHub Release $GITHUB_REF_NAME already exists"
+          else
+            gh release create "$GITHUB_REF_NAME" --generate-notes
+          fi
