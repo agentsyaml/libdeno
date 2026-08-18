@@ -367,7 +367,10 @@ jobs:
           rust-toolchain: stable
           maturin-version: "v1.11.5"
           manylinux: "2_28"
-          args: --release --locked --compatibility pypi --out target/wheels
+          args: >-
+            --release --locked --compatibility pypi
+            -i python3.9
+            --out target/wheels
 
       - name: Create audit environment
         shell: bash
@@ -429,7 +432,10 @@ jobs:
           rust-toolchain: stable
           maturin-version: "v1.11.5"
           manylinux: "2_28"
-          args: --release --locked --compatibility pypi --out target/wheels
+          args: >-
+            --release --locked --compatibility pypi
+            -i python3.9
+            --out target/wheels
 
       - name: Create audit environment
         shell: bash
