@@ -368,7 +368,7 @@ jobs:
           maturin-version: "v1.11.5"
           manylinux: "2_28"
           before-script-linux: |
-            yum install -y clang
+            dnf install -y clang-devel
           args: >-
             --release --locked --compatibility pypi
             -i python3.9
@@ -435,7 +435,7 @@ jobs:
           maturin-version: "v1.11.5"
           manylinux: "2_28"
           before-script-linux: |
-            yum install -y clang
+            dnf install -y clang-devel
           args: >-
             --release --locked --compatibility pypi
             -i python3.9
