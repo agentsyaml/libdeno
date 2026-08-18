@@ -1,0 +1,18 @@
+[package]
+name = "libdeno-python"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "_libdeno"
+crate-type = ["cdylib"]
+
+[dependencies]
+libdeno = { path = "..", version = "=0.3.0" }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
+tokio = { version = "1", features = ["rt", "time"] }
+
+# Keep this prototype as an independent Cargo package; the parent crate is a
+# path dependency, not a workspace member.
+[workspace]

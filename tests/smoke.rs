@@ -1179,6 +1179,98 @@ Deno.exit(result === "error" ? 0 : (result === "started" ? 42 : 43));"#,
 }
 
 #[test]
+fn worker_does_not_reuse_main_graph_entries_across_permissions() {
+    // Regression for the worker graph residual: the main worker loads secret.js
+    // first, then a worker whose read grant contains only its entry directory
+    // tries to import that same secret. With the old shared ModuleGraph this
+    // import was returned from the main graph without the worker's permission
+    // check.
+    let dir = temp_dir("worker-perms-graph-residual");
+    let worker_dir = dir.join("worker");
+    fs::create_dir_all(&worker_dir).unwrap();
+    fs::write(dir.join("secret.js"), "export const secret = 'loaded';").unwrap();
+    let worker_entry = worker_dir.join("entry.js");
+    fs::write(
+        &worker_entry,
+        r#"postMessage('entry-started');
+try {
+  await import('../secret.js');
+  postMessage('secret-loaded');
+} catch (error) {
+  const message = String(error);
+  const is_permission_error = error?.name === 'NotCapable'
+    || message.includes('NotCapable')
+    || message.includes('Requires read access');
+  postMessage(is_permission_error ? 'permission-error' : 'other-error');
+}"#,
+    )
+    .unwrap();
+    let worker_dir_abs = fs::canonicalize(&worker_dir).unwrap().display().to_string();
+    let worker_dir_json = deno_core::serde_json::to_string(&worker_dir_abs).unwrap();
+    let dir = fs::canonicalize(&dir).unwrap();
+    fs::write(
+        dir.join("main.js"),
+        format!(
+            r#"import {{ secret }} from './secret.js';
+const result = await new Promise((resolve) => {{
+  let entry_started = false;
+  let settled = false;
+  const finish = (value) => {{
+    if (!settled) {{
+      settled = true;
+      resolve(value);
+    }}
+  }};
+  const worker_entry = new URL('worker/entry.js', import.meta.url);
+  const w = new Worker(worker_entry, {{
+    type: 'module',
+    deno: {{ permissions: {{ read: [{worker_dir_json}] }} }},
+  }});
+  w.onmessage = (event) => {{
+    if (event.data === 'entry-started') {{
+      entry_started = true;
+    }} else if (event.data === 'permission-error') {{
+      finish(entry_started ? 'permission-error' : 'permission-before-entry');
+    }} else if (event.data === 'secret-loaded') {{
+      finish('secret-loaded');
+    }} else {{
+      finish('other-message');
+    }}
+  }};
+  w.onerror = (event) => {{
+    event.preventDefault();
+    finish(entry_started ? 'worker-error' : 'entry-error');
+  }};
+  setTimeout(() => {{ w.terminate(); finish('timeout'); }}, 10_000);
+}});
+// `secret` is intentionally referenced so the main graph definitely loads it
+// before the worker starts.
+if (secret !== 'loaded') throw new Error('main secret did not load');
+Deno.exit(result === 'permission-error' ? 0
+  : result === 'secret-loaded' ? 42
+  : result === 'entry-error' ? 43
+  : result === 'worker-error' ? 44
+  : result === 'permission-before-entry' ? 45
+  : result === 'other-message' ? 46
+  : 47);"#,
+        ),
+    )
+    .unwrap();
+    let options = LibdenoOptions {
+        permissions: vec![format!("--allow-read={}", dir.display())],
+        ..Default::default()
+    };
+    let code = run(dir.join("main.js"), &options).unwrap();
+    assert_eq!(
+        code, 0,
+        "a worker must re-check a main-loaded module with its own graph \
+         (42=secret loaded, 43=entry failed, 44=worker error, \
+          45=permission error before entry marker, 46=other error, 47=timeout)"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn subprocess_write_times_out_when_host_never_services_child_mode() {
     // M1: a host that never reads stdin (does not call maybe_handle_child_mode)
     // must not hang run_in_subprocess once the request exceeds the pipe

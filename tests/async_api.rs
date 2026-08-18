@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 #[cfg(not(windows))]
 use libdeno::run_with_output_async;
-use libdeno::{run_async, LibdenoOptions};
+use libdeno::{run_async, LibdenoOptions, LibdenoRuntime};
 
 /// The capture test's exclusivity lease rejects any concurrent run, so tests
 /// in this file (which cargo test runs in parallel) must take this lock —
@@ -104,6 +104,76 @@ fn async_capture_returns_output() {
         "captured stdout: {:?}",
         String::from_utf8_lossy(&output.stdout)
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn reusable_async_capture_returns_output() {
+    let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("runtime-cap");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('runtime-async-hello');").unwrap();
+    let build_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runtime = build_rt.block_on(LibdenoRuntime::new(&dir)).unwrap();
+    drop(build_rt);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let output = rt
+        .block_on(runtime.run_with_output_async(
+            &entry,
+            &LibdenoOptions {
+                allow_all_permissions: true,
+                capture_stdout: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        output
+            .stdout
+            .windows(19)
+            .any(|w| w == b"runtime-async-hello"),
+        "captured stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn reusable_async_capture_is_rejected_on_windows() {
+    let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("runtime-cap-win");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('runtime-async-hello');").unwrap();
+    let build_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runtime = build_rt.block_on(LibdenoRuntime::new(&dir)).unwrap();
+    drop(build_rt);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let error = rt
+        .block_on(runtime.run_with_output_async(
+            &entry,
+            &LibdenoOptions {
+                allow_all_permissions: true,
+                capture_stdout: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(error, libdeno::LibdenoError::Configuration(_)));
     let _ = fs::remove_dir_all(&dir);
 }
 

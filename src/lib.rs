@@ -287,6 +287,76 @@ impl From<Box<deno_core::error::JsError>> for LibdenoError {
     }
 }
 
+impl LibdenoError {
+    /// Returns whether this error carries Deno's typed `NotCapable` permission
+    /// error class. This deliberately ignores rendered error text so a user
+    /// exception mentioning permission wording remains a runtime error.
+    pub fn is_permission_error(&self) -> bool {
+        match self {
+            Self::Runtime(error) => error.chain().any(error_chain_has_not_capable),
+            Self::Core(error) => error_chain_has_not_capable(error),
+            _ => false,
+        }
+    }
+}
+
+fn error_chain_has_not_capable(error: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(error) = error.downcast_ref::<deno_core::error::JsError>() {
+        return js_error_has_not_capable(error);
+    }
+    if let Some(error) = error.downcast_ref::<Box<deno_core::error::JsError>>() {
+        return js_error_has_not_capable(error);
+    }
+    if let Some(error) = error.downcast_ref::<deno_error::JsErrorBox>() {
+        return js_error_class_is_not_capable(error);
+    }
+    if let Some(error) = error.downcast_ref::<Box<deno_error::JsErrorBox>>() {
+        return js_error_class_is_not_capable(error);
+    }
+    if let Some(error) = error.downcast_ref::<deno_core::error::CoreError>() {
+        if js_error_class_is_not_capable(error) {
+            return true;
+        }
+    }
+    error.source().is_some_and(error_chain_has_not_capable)
+}
+
+fn js_error_class_is_not_capable(error: &dyn deno_error::JsErrorClass) -> bool {
+    error.get_class().as_ref() == "NotCapable"
+}
+
+fn js_error_has_not_capable(error: &deno_core::error::JsError) -> bool {
+    error.name.as_deref() == Some("NotCapable")
+        || error.cause.as_deref().is_some_and(js_error_has_not_capable)
+        || error
+            .aggregated
+            .as_ref()
+            .is_some_and(|errors| errors.iter().any(js_error_has_not_capable))
+}
+
+fn check_entry_read_permission(
+    permissions: &deno_runtime::deno_permissions::PermissionsContainer,
+    main_module: &ModuleSpecifier,
+) -> Result<(), LibdenoError> {
+    // Keep entry denials typed before the graph loader turns load errors into
+    // generic JsErrorBox values.
+    let Some(path) = main_module.to_file_path().ok() else {
+        return Ok(());
+    };
+    permissions
+        .check_open(
+            std::borrow::Cow::Owned(path),
+            deno_runtime::deno_permissions::OpenAccessKind::Read,
+            Some("main module"),
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            LibdenoError::Core(deno_core::error::CoreError::from(
+                deno_error::JsErrorBox::from_err(error),
+            ))
+        })
+}
+
 /// Runs `entry` (a file, a directory, or a package.json) to completion and
 /// returns the exit code the script requested (0 on normal completion).
 ///
@@ -399,6 +469,10 @@ fn run_sync_output(entry: &Path, options: &LibdenoOptions) -> Result<RunOutput, 
 ///   tokio's time driver, so the caller's runtime must enable it
 ///   (`enable_time()` / `enable_all()`); a bare
 ///   `Builder::new_current_thread().build()` has no time driver.
+///
+/// For a long-lived project resolver stack, use
+/// [`LibdenoRuntime::run_async`] instead; it keeps the same caller-runtime and
+/// `!Send` constraints while reusing only the permission-free resolver state.
 pub async fn run_async(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
@@ -412,30 +486,16 @@ pub async fn run_async(
 /// executed on the caller's runtime with no spawned thread. See
 /// [`run_async`] for the tokio-context and non-`Send` requirements, and the
 /// `execution_deadline` time-driver requirement (the caller's runtime must
-/// be built with `enable_time()` / `enable_all()`).
+/// be built with `enable_time()` / `enable_all()`). For a prebuilt resolver
+/// stack, [`LibdenoRuntime::run_with_output_async`] provides the reusable
+/// equivalent without sharing permissions, graphs, or isolates.
 pub async fn run_with_output_async(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<RunOutput, LibdenoError> {
-    // Outside a tokio context the run's async chain would panic deep inside
-    // deno (runtime-context assert) — report it like every other invalid
-    // usage instead.
-    if tokio::runtime::Handle::try_current().is_err() {
-        return Err(LibdenoError::Configuration(
-            "run_async must be called from inside a tokio runtime context; \
-             outside one, use run()"
-                .to_string(),
-        ));
-    }
-    // Interleaving two run_async futures on one thread aborts the process
-    // (v8 pins the isolate to its creating thread — see [`run_async`]). The
-    // lease is process-global and cannot see this thread-local hazard, so a
-    // thread-local in-progress guard turns the crash into a recoverable
-    // Configuration error, matching the capture-exclusivity pattern. The
-    // guard is RAII: dropping the future (even mid-run, via cancel/select!)
-    // clears the flag.
-    let _guard = AsyncRunGuard::acquire()?;
-    run_with_output_async_inner(entry, options).await
+    check_async_context()?;
+    let entry = entry.as_ref().to_path_buf();
+    run_with_output_async_guarded(options, run_inner(&entry, options)).await
 }
 
 /// Thread-local guard: one `run_async` at a time per thread (see
@@ -467,12 +527,36 @@ impl Drop for AsyncRunGuard {
     }
 }
 
-/// The actual async run, split out so the thread-local guard above always
-/// runs to completion (cleared even on panic paths of the await).
-async fn run_with_output_async_inner(
-    entry: impl AsRef<Path>,
+/// Rejects async entry points outside a tokio runtime before any V8 work starts.
+pub(crate) fn check_async_context() -> Result<(), LibdenoError> {
+    // Outside a tokio context the run's async chain would panic deep inside
+    // deno (runtime-context assert) — report it like every other invalid
+    // usage instead.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Err(LibdenoError::Configuration(
+            "run_async must be called from inside a tokio runtime context; \
+             outside one, use run()"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Runs one async execution under the shared thread-local guard and output
+/// capture lease. The future is deliberately not `Send`: the worker and V8
+/// isolate remain on the caller's thread.
+pub(crate) async fn run_with_output_async_guarded<F>(
     options: &LibdenoOptions,
-) -> Result<RunOutput, LibdenoError> {
+    run: F,
+) -> Result<RunOutput, LibdenoError>
+where
+    F: std::future::Future<Output = Result<i32, LibdenoError>>,
+{
+    // Interleaving two async runs on one thread aborts the process (v8 pins
+    // the isolate to its creating thread). The process-global lease cannot see
+    // this thread-local hazard, so the RAII guard turns it into a recoverable
+    // Configuration error. Dropping the future releases the guard.
+    let _guard = AsyncRunGuard::acquire()?;
     // Same lease protocol as the sync path: capture is process-global and
     // exclusive; the lease is an atomic RAII guard, so it is safe to hold
     // across awaits.
@@ -491,7 +575,7 @@ async fn run_with_output_async_inner(
         options.max_capture_bytes,
     )
     .map_err(LibdenoError::Io)?;
-    let result = run_inner(entry.as_ref(), options).await;
+    let result = run.await;
     let (stdout, stderr, capture_truncated) = capture.finish();
     Ok(RunOutput {
         exit_code: result?,
@@ -587,6 +671,7 @@ pub(crate) async fn run_inner_with(
         permission_parser.clone(),
         &cwd,
     )?;
+    check_entry_read_permission(&permissions, &main_module)?;
     let services = Arc::new(
         RuntimeServices::new(shared, cwd, permissions.clone()).map_err(LibdenoError::Runtime)?,
     );

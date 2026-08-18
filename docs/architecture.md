@@ -58,8 +58,9 @@ Mirrors the CLI's composition:
   redirects are handled by the fetcher, not the HTTP client.
 - **`DenoGraphLoader`** — the `FileFetcher` wrapper implementing
   `deno_graph::source::Loader`.
-- **`ModuleGraph`** — the shared, mutex-guarded `deno_graph::ModuleGraph`
-  (`GraphKind::CodeOnly`).
+- **`ModuleGraph`** — the mutex-guarded main-run
+  `deno_graph::ModuleGraph` (`GraphKind::CodeOnly`). It is shared by the main
+  run's loader instances only; web workers allocate their own graph.
 
 ### Feature gates (two layers, must be kept in sync)
 
@@ -82,10 +83,11 @@ both layers in sync from a single list (`ENABLED_FEATURES` in `lib.rs`).
 - **`resolve`** — pass-through for absolute (`file:`, `node:`, `data:`) and
   `jsr:`/`npm:` specifiers; everything else goes through the official graph
   resolver.
-- **`prepare_load`** — builds (or extends) the shared module graph rooted at
-  the requested specifier. `node:` builtins are skipped (they come from the
-  extension module map in the snapshot). Already-present specifiers are not
-  rebuilt.
+- **`prepare_load`** — builds (or extends) the owning loader's module graph
+  rooted at the requested specifier. The main worker keeps the per-run graph;
+  each web worker gets a fresh `CodeOnly` graph. `node:` builtins are skipped
+  (they come from the extension module map in the snapshot). Already-present
+  specifiers are not rebuilt within that owning graph.
 - **`load`** — reads the prepared module from the graph via the
   `deno_resolver` module loader, which handles TS transpilation, CJS→ESM
   translation, JSON and WASM. `npm:` specifiers are first resolved to the
@@ -107,14 +109,17 @@ both layers in sync from a single list (`ENABLED_FEATURES` in `lib.rs`).
 
 `create_web_worker_factory` (in `worker_factory.rs`) builds the
 `CreateWebWorkerCb` for `new Worker(...)`. Each spawned worker constructs its
-own Rc-based loader/node services from the shared `Arc<SharedServices>` —
-nothing non-Send crosses threads. The factory is recursive, so nested workers
-work. Workers reuse the same snapshot, residual sources, blob store, and
-broadcast channel. Each worker builds its own `DenoGraphLoader` bound to the
+own Rc-based loader/node services from the per-run `Arc<RuntimeServices>` and
+its shared `Arc<SharedServices>` resolver state — nothing non-Send crosses
+threads. The factory is recursive, so nested workers work. Workers reuse the
+same snapshot, residual sources, blob store, and broadcast channel. Each
+worker builds its own `DenoGraphLoader` bound to the
 worker's permissions container, so a worker's module loads are gated by its
-own grants, not the main run's; the module *graph* itself stays shared (a
-module the main run already fetched is served to the worker without a
-re-check).
+own grants, not the main run's. `GraphModuleLoader::with_graph_loader` also
+allocates a fresh `GraphKind::CodeOnly` `ModuleGraph` for every worker, so a
+module already fetched by the main or parent worker cannot be returned from a
+shared graph without the new worker's permission check. Resolver factories,
+HTTP/file caches, analysis cache, and npm process state remain shared.
 
 ## HTTP client (`http.rs`)
 

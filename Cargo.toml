@@ -18,6 +18,10 @@ authors = ["Zhenxing Sun <zhenxing.sun@irootech.com>"]
 name = "demo"
 path = "examples/demo.rs"
 
+[[bench]]
+name = "baseline"
+harness = false
+
 [dependencies]
 deno_runtime = { version = "0.265.0", features = ["transpile"] }
 deno_resolver = { version = "0.88.0", features = ["graph", "deno_ast", "sync"] }

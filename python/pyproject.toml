@@ -1,0 +1,37 @@
+[build-system]
+requires = ["maturin>=1.11,<2"]
+build-backend = "maturin"
+
+[project]
+name = "libdeno"
+version = "0.1.0"
+requires-python = ">=3.9"
+description = "Private alpha Python bindings for embedding the Deno runtime"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Zhenxing Sun", email = "zhenxing.sun@irootech.com" },
+]
+keywords = ["deno", "javascript", "runtime", "embedding", "python"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Interpreters",
+]
+
+[project.urls]
+Repository = "https://github.com/agentsyaml/libdeno"
+Documentation = "https://github.com/agentsyaml/libdeno/tree/main/python"
+
+[tool.maturin]
+module-name = "libdeno._libdeno"
+python-source = "libdeno"

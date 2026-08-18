@@ -3,6 +3,7 @@
 //! fingerprint invalidation, and the per-run permission isolation guarantee.
 
 use std::fs;
+use std::future::Future;
 use std::path::PathBuf;
 
 use libdeno::{run_with, LibdenoOptions, LibdenoRuntime};
@@ -268,6 +269,193 @@ fn run_with_does_not_leak_permissions_between_runs() {
     assert!(
         msg.contains("Requires read access") || msg.contains("NotCapable"),
         "unexpected error: {msg}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reusable_async_run_executes_twice_on_same_runtime() {
+    let dir = temp_dir("async-reuse-basic");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "1 + 1;").unwrap();
+    let runtime = build_runtime(&dir);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let codes = rt.block_on(async {
+        let first = runtime.run_async(&entry, &options).await.unwrap();
+        let second = runtime.run_async(&entry, &options).await.unwrap();
+        (first, second)
+    });
+    assert_eq!(codes, (0, 0));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reusable_async_run_does_not_leak_permissions_between_runs() {
+    let dir = temp_dir("async-perm-isolation");
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    fs::write(dir.join("shared.js"), "export const secret = 'leaked';").unwrap();
+    let entry = dir.join("sub").join("main.js");
+    let shared_path = fs::canonicalize(dir.join("shared.js")).unwrap();
+    fs::write(
+        &entry,
+        format!(
+            "await import('../shared.js');\nDeno.readTextFileSync({:?});",
+            shared_path.display().to_string(),
+        ),
+    )
+    .unwrap();
+    let runtime = build_runtime(&dir);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let allow_all = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let sub = fs::canonicalize(dir.join("sub")).unwrap();
+    let restricted = LibdenoOptions {
+        permissions: vec![format!("--allow-read={}", sub.display())],
+        ..Default::default()
+    };
+    let (first, second) = rt.block_on(async {
+        let first = runtime.run_async(&entry, &allow_all).await;
+        let second = runtime.run_async(&entry, &restricted).await;
+        (first, second)
+    });
+    assert_eq!(first.unwrap(), 0);
+    let error = second.unwrap_err().to_string();
+    assert!(
+        error.contains("Requires read access") || error.contains("NotCapable"),
+        "unexpected error: {error}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reusable_async_run_rebuilds_when_config_changes() {
+    let dir = temp_dir("async-fp-invalid");
+    fs::write(dir.join("a.js"), "export const marker = 'a';").unwrap();
+    fs::write(dir.join("b.js"), "export const marker = 'b';").unwrap();
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "import { marker } from '#mod';\nDeno.writeTextFileSync(new URL('./out.txt', import.meta.url), marker);",
+    )
+    .unwrap();
+    let write_config = |target: &str| {
+        fs::write(
+            dir.join("deno.json"),
+            format!("{{\"imports\": {{\"#mod\": \"./{target}.js\"}}}}"),
+        )
+        .unwrap();
+    };
+    write_config("a");
+    let runtime = build_runtime(&dir);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    assert_eq!(rt.block_on(runtime.run_async(&entry, &options)).unwrap(), 0);
+    assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), "a");
+    write_config("b");
+    assert_eq!(rt.block_on(runtime.run_async(&entry, &options)).unwrap(), 0);
+    assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), "b");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reusable_async_run_rejects_mismatched_cwd() {
+    let dir = temp_dir("async-reject-cwd");
+    let other = temp_dir("async-reject-cwd-other");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "1 + 1;").unwrap();
+    let runtime = build_runtime(&dir);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let error = rt
+        .block_on(runtime.run_async(
+            &entry,
+            &LibdenoOptions {
+                cwd: Some(other.clone()),
+                allow_all_permissions: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(error, libdeno::LibdenoError::Configuration(_)));
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&other);
+}
+
+#[test]
+fn reusable_async_interleave_is_rejected_and_guard_releases_on_drop() {
+    let dir = temp_dir("async-reuse-interleave");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "await new Promise(r => setTimeout(r, 5000));").unwrap();
+    let runtime = build_runtime(&dir);
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let error = rt.block_on(async {
+        let mut future = Box::pin(runtime.run_async(&entry, &options));
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(future.as_mut().poll(&mut context).is_pending());
+        let error = runtime.run_async(&entry, &options).await.unwrap_err();
+        drop(future);
+        error
+    });
+    assert!(matches!(error, libdeno::LibdenoError::Configuration(_)));
+    assert_eq!(rt.block_on(runtime.run_async(&entry, &options)).unwrap(), 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reusable_async_execution_deadline_still_applies() {
+    let dir = temp_dir("async-deadline");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "await new Promise((resolve) => setTimeout(resolve, 60_000));",
+    )
+    .unwrap();
+    let runtime = build_runtime(&dir);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let error = rt
+        .block_on(runtime.run_async(
+            &entry,
+            &LibdenoOptions {
+                allow_all_permissions: true,
+                execution_deadline: Some(std::time::Duration::from_millis(100)),
+                ..Default::default()
+            },
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(error, libdeno::LibdenoError::Timeout(_)),
+        "expected Timeout, got: {error}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

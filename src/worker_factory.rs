@@ -1,6 +1,6 @@
 // `new Worker(...)` factory: builds the create-worker callback the main
 // worker uses to spawn web workers. Nested workers reuse the same shared
-// services and snapshot, so spawning is recursive.
+// services and snapshot, while each worker owns its own module graph.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -34,8 +34,9 @@ use crate::STARTUP_SNAPSHOT;
 /// The trailing resolver instances are resolved once at factory construction;
 /// nested factories reuse them instead of re-running fallible resolver factory
 /// init, so the worker-spawning path has no error left to panic on. The
-/// per-run `RuntimeServices` carries the run's file fetcher / graph loader /
-/// module graph, which workers share with the main run.
+/// per-run `RuntimeServices` carries the run's permission-bound file fetcher
+/// and graph loader; workers reuse those facilities and shared resolver state,
+/// but create an independent `ModuleGraph` for each worker.
 type WebWorkerFactoryShared = (
     Arc<dyn deno_runtime::deno_web::BlobStoreTrait>,
     InMemoryBroadcastChannel,
@@ -58,11 +59,13 @@ type WebWorkerFactoryShared = (
 );
 
 /// Builds the `new Worker(...)` factory. Each spawned worker builds its own
-/// Rc-based loader/node services from the per-run `Arc<RuntimeServices>`, so
-/// nothing non-Send crosses threads. Nested workers get their own factory
-/// built from the same per-run state, so spawning is recursive. `max_heap_bytes`
-/// (the main worker's `LibdenoOptions` heap cap) is forwarded so `new Worker()`
-/// cannot bypass the heap limit.
+/// Rc-based loader/node services and `CodeOnly` module graph from the per-run
+/// `Arc<RuntimeServices>`, so nothing non-Send crosses threads and a worker
+/// cannot read a module already admitted to another worker's graph without
+/// its own permission check. Nested workers get their own factory and graph
+/// built from the same per-run resolver/cache state, so spawning is recursive.
+/// `max_heap_bytes` (the main worker's `LibdenoOptions` heap cap) is forwarded
+/// so `new Worker()` cannot bypass the heap limit.
 #[allow(clippy::too_many_arguments)]
 pub fn create_web_worker_factory(
     blob_store: Arc<dyn deno_runtime::deno_web::BlobStoreTrait>,
@@ -136,8 +139,9 @@ fn build_web_worker_factory(
             in_npm_pkg_checker,
         ) = &*shared;
         // Nested factory for the spawned worker's own workers: built from the
-        // same per-run state and the same already-initialized resolvers, so
-        // this call cannot fail (no script-reachable error path, no panic).
+        // same per-run state and the same already-initialized resolvers, while
+        // each callback invocation creates a fresh worker graph. This call
+        // cannot fail (no script-reachable error path, no panic).
         let nested_cb = build_web_worker_factory(shared.clone());
         // The worker's static imports must be adjudicated by the worker's OWN
         // permissions container, not the main run's: the shared
@@ -147,11 +151,9 @@ fn build_web_worker_factory(
         // permissions. Build a dedicated graph loader bound to
         // `worker_permissions` — everything it needs (file fetcher, caches,
         // the in-npm-package checker cloned in the fallible factory phase) is
-        // at hand, so this stays infallible. Residual (documented): the module
-        // graph itself is shared with the main run, so a module the main run
-        // already fetched is served from that graph without a re-check; a
-        // per-worker graph would close it, deferred as the shared graph is a
-        // deliberate performance design.
+        // at hand, so this stays infallible. `with_graph_loader` also allocates
+        // a fresh CodeOnly ModuleGraph, keeping already-loaded main/parent
+        // modules from bypassing this worker's graph-loader permission check.
         let worker_graph_loader = Arc::new(deno_resolver::file_fetcher::DenoGraphLoader::new(
             runtime.file_fetcher.clone(),
             runtime.shared.global_http_cache.clone(),
@@ -202,10 +204,8 @@ fn build_web_worker_factory(
                 // static/dynamic file imports (file_permission_api_name =
                 // "import") with the worker's grants — the main run's scope
                 // cannot leak into a worker that declared narrower
-                // permissions. Residual: the module graph is shared with the
-                // main run, so modules the main run already fetched are served
-                // from the graph without a re-check; a per-worker graph would
-                // close that.
+                // permissions. The loader above owns a fresh graph, so
+                // main/parent graph entries are not reused.
                 permissions: args.permissions,
                 root_cert_store_provider: None,
                 shared_array_buffer_store: None,

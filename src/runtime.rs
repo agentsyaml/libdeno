@@ -5,7 +5,8 @@
 // time. The stack is rebuilt automatically when the project's config chain
 // changes (fingerprint check). Permission-bound pieces (the file fetcher,
 // the graph loader and the module graph) stay strictly per-run in
-// `RuntimeServices` — see services.rs.
+// `RuntimeServices` — see services.rs. The async methods use the caller's
+// tokio runtime while reusing the same shared resolver stack.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,19 +19,23 @@ use crate::RunLease;
 /// A reusable resolver stack scoped to a project directory.
 ///
 /// [`LibdenoRuntime::new`] builds the permission-free half of the module
-/// pipeline once; [`run_with`] then reuses it across runs. The stack is
+/// pipeline once; [`run_with`], [`Self::run_async`], and
+/// [`Self::run_with_output_async`] then reuse it across runs. The stack is
 /// rebuilt automatically when the config discovery chain changes (deno.json /
 /// deno.jsonc / import_map.json / package.json / .npmrc / node_modules at the
 /// project root and its ancestors), so long-lived hosts serving the same
 /// project skip the per-run factory construction entirely.
 ///
 /// The runtime is single-threaded by design: the module loader stack is
-/// `Rc<dyn ModuleLoader>`-based and every run executes on a fresh
-/// current-thread tokio runtime. `LibdenoRuntime` itself is `Clone` + `Send` +
-/// `Sync` (its only state is an `Arc<Mutex<RuntimeState>>` around the resolver
-/// stack), so it can be shared across host threads and used concurrently —
-/// ordinary runs are fully parallel; only a captured run is exclusive (see
-/// `RunLease`).
+/// `Rc<dyn ModuleLoader>`-based. Synchronous `run_with` executes on a fresh
+/// current-thread tokio runtime, while the reusable async methods use the
+/// caller's runtime. `LibdenoRuntime` itself is `Clone` + `Send` + `Sync` (its
+/// only state is an `Arc<Mutex<RuntimeState>>` around the resolver stack), so
+/// it can be shared across host threads and used concurrently — ordinary runs
+/// are fully parallel; only a captured run is exclusive (see `RunLease`). The
+/// async methods return `!Send` futures and must be awaited without
+/// interleaving on their V8-pinned thread; use `LocalSet` when the caller owns
+/// a multi-thread tokio runtime.
 #[derive(Clone)]
 pub struct LibdenoRuntime {
     cwd: PathBuf,
@@ -66,6 +71,49 @@ impl LibdenoRuntime {
                 shared,
             })),
         })
+    }
+
+    /// Runs `entry` on the caller's tokio runtime using this runtime's shared
+    /// resolver stack and returns its exit code.
+    ///
+    /// Like [`crate::run_async`], this method does not spawn a worker thread.
+    /// The returned future is `!Send`; await reusable async runs strictly one
+    /// at a time on a thread. Each call still creates fresh permission-bound
+    /// services, a module graph, and a V8 isolate. Output-capture flags are
+    /// honored and discarded, matching [`crate::run_async`]; use
+    /// [`Self::run_with_output_async`] to receive captured bytes.
+    pub async fn run_async(
+        &self,
+        entry: impl AsRef<Path>,
+        options: &LibdenoOptions,
+    ) -> Result<i32, LibdenoError> {
+        self.run_with_output_async(entry, options)
+            .await
+            .map(|output| output.exit_code)
+    }
+
+    /// Runs `entry` on the caller's tokio runtime using this runtime's shared
+    /// resolver stack and returns captured stdout/stderr when requested.
+    ///
+    /// The returned future is `!Send` and must not be interleaved with another
+    /// reusable async run on the same thread; a cancelled future releases the
+    /// same thread-local guard used by [`crate::run_async`]. Capture uses the
+    /// process-global `RunLease` and is exclusive. Permissions, the graph,
+    /// and the V8 isolate remain per-run and are never shared.
+    pub async fn run_with_output_async(
+        &self,
+        entry: impl AsRef<Path>,
+        options: &LibdenoOptions,
+    ) -> Result<crate::RunOutput, LibdenoError> {
+        crate::check_async_context()?;
+        reject_unusable_cwd(self, options)?;
+        let entry = entry.as_ref().to_path_buf();
+        let runtime = self;
+        crate::run_with_output_async_guarded(options, async move {
+            let shared = shared_for_run(runtime).await?;
+            crate::run_inner_with(shared, runtime.cwd.clone(), &entry, options).await
+        })
+        .await
     }
 }
 
@@ -239,36 +287,37 @@ fn run_with_sync(
         .build()
         .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
     rt.block_on(async {
-        // Fresh fingerprint of the config discovery chain. The swap lock
-        // covers only the check and the swap, never the rebuild: a slow
-        // factory rebuild must not be serialized behind anything but the
-        // capture-exclusivity lease.
-        let fp = config_fingerprint(&runtime.cwd);
-        let shared = {
-            let stale = {
-                let state = runtime.state.lock().unwrap_or_else(|e| e.into_inner());
-                fp != state.fingerprint
-            };
-            if stale {
-                let cwd = runtime.cwd.clone();
-                let rebuilt = SharedServices::new(cwd.clone(), vec![cwd])
-                    .await
-                    .map_err(LibdenoError::Runtime)?;
-                let mut state = runtime.state.lock().unwrap_or_else(|e| e.into_inner());
-                state.fingerprint = fp;
-                state.shared = rebuilt.clone();
-                rebuilt
-            } else {
-                runtime
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .shared
-                    .clone()
-            }
-        };
+        let shared = shared_for_run(runtime).await?;
         crate::run_inner_with(shared, runtime.cwd.clone(), entry, options).await
     })
+}
+
+/// Returns the current shared resolver stack, rebuilding it when the project
+/// configuration fingerprint changes. The helper is shared by sync and async
+/// reusable entry points; all permission-bound run state remains per-call.
+async fn shared_for_run(runtime: &LibdenoRuntime) -> Result<Arc<SharedServices>, LibdenoError> {
+    let fp = config_fingerprint(&runtime.cwd);
+    let stale = {
+        let state = runtime.state.lock().unwrap_or_else(|e| e.into_inner());
+        fp != state.fingerprint
+    };
+    if stale {
+        let cwd = runtime.cwd.clone();
+        let rebuilt = SharedServices::new(cwd.clone(), vec![cwd])
+            .await
+            .map_err(LibdenoError::Runtime)?;
+        let mut state = runtime.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.fingerprint = fp;
+        state.shared = rebuilt.clone();
+        Ok(rebuilt)
+    } else {
+        Ok(runtime
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .shared
+            .clone())
+    }
 }
 
 /// Fingerprint of the config discovery chain rooted at `cwd`: walking up from

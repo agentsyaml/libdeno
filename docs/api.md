@@ -138,13 +138,25 @@ async fn main() -> Result<(), libdeno::LibdenoError> {
 }
 ```
 
-## `LibdenoRuntime` / `run_with` / `run_with_output`
+## `LibdenoRuntime` / reusable sync and async runs
 
 ```rust
 pub struct LibdenoRuntime { /* Clone + Send + Sync; its only state is an Arc<Mutex<...>> */ }
 
 impl LibdenoRuntime {
   pub async fn new(cwd: impl AsRef<Path>) -> Result<Self, LibdenoError>;
+
+  pub async fn run_async(
+    &self,
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+  ) -> Result<i32, LibdenoError>
+
+  pub async fn run_with_output_async(
+    &self,
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+  ) -> Result<RunOutput, LibdenoError>
 }
 
 pub fn run_with(
@@ -188,13 +200,27 @@ builds the permission-free half of that stack once and `run_with` /
   everything else matches `run_with_output` (mismatched `cwd` rejected,
   permissions per run, fd-level capture with the same exclusivity lease,
   Windows rejection and per-stream byte cap).
+- `LibdenoRuntime::run_async` and `run_with_output_async` execute on the
+  **caller's** tokio runtime, without a spawned or background execution
+  thread. They reuse the runtime's permission-free resolver stack and the
+  same config-fingerprint rebuild path as `run_with`, while each call still
+  creates fresh permissions, permission-bound services, a module graph, and a
+  V8 isolate. `run_async` returns only the exit code and otherwise follows the
+  root `run_async` capture semantics; use `run_with_output_async` to receive
+  captured bytes. Capture uses the same process-global `RunLease` and is
+  rejected on Windows with `LibdenoError::Configuration`.
+- Both reusable async methods return **`!Send` futures**. Await them strictly
+  one at a time on the thread that polls them: a second interleaved future is
+  rejected with `LibdenoError::Configuration`, and dropping/cancelling the
+  first future releases the guard. On a multi-thread runtime, pin the call to
+  one thread with `tokio::task::LocalSet`, just as for the root async API.
 - `LibdenoRuntime` is `Clone` + `Send` + `Sync`, so it can be shared across
   host threads; ordinary runs through it are fully parallel (only a captured
   run is exclusive — see `run_with_output`). It is single-threaded by design:
-  the module loader stack is `Rc<...>`-based and every run executes on a
-  fresh current-thread tokio runtime. The async/sync split is deliberate —
-  `new` is async, `run_with` is sync and does its own `block_on` on that
-  fresh runtime.
+  the module loader stack is `Rc<...>`-based. The sync/async split is
+  deliberate: `new` is async, synchronous `run_with` creates its own fresh
+  current-thread runtime, and the reusable async methods use the caller's
+  runtime.
 
 ## `LibdenoOptions`
 

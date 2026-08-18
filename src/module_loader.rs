@@ -29,6 +29,7 @@ use deno_core::RequestedModuleType;
 use deno_core::ResolutionKind;
 use deno_error::JsErrorBox;
 use deno_graph::BuildOptions;
+use deno_graph::GraphKind;
 use deno_graph::ModuleGraph;
 use deno_media_type::MediaType;
 use deno_resolver::loader::LoadedModuleOrAsset;
@@ -46,7 +47,8 @@ pub struct GraphModuleLoader {
     shared: Arc<SharedServices>,
     /// Per-run permission-bound fetch pipeline: the file fetcher (permission-
     /// gated reads), the graph loader and the module graph all come from the
-    /// run's RuntimeServices, so worker loaders share the run's graph.
+    /// owning run/worker. Worker loaders use their own graph while reusing the
+    /// resolver and cache state in `shared`.
     file_fetcher: Arc<RealFileFetcher>,
     graph_loader: Arc<RealGraphLoader>,
     graph: Arc<tokio::sync::Mutex<ModuleGraph>>,
@@ -58,7 +60,8 @@ pub struct GraphModuleLoader {
 impl GraphModuleLoader {
     pub fn new(runtime: Arc<RuntimeServices>, permissions: PermissionsContainer) -> Self {
         let graph_loader = runtime.graph_loader.clone();
-        Self::with_graph_loader(runtime, permissions, graph_loader)
+        let graph = runtime.graph.clone();
+        Self::with_graph_loader_and_graph(runtime, permissions, graph_loader, graph)
     }
 
     /// Like [`new`], but binds graph builds to `graph_loader` instead of the
@@ -66,20 +69,31 @@ impl GraphModuleLoader {
     /// permissions container, so a worker-triggered graph build is gated by
     /// the worker's grants, not the main run's — otherwise the main run's
     /// `--allow-read` scope leaks to workers that declared narrower
-    /// permissions. (Residual: modules the main run already fetched stay
-    /// cached in the shared per-run graph and are served to the worker
-    /// without a re-check — a per-worker graph would be required to close
-    /// that, see worker_factory.rs.)
+    /// permissions. This constructor also gives the worker a fresh
+    /// `CodeOnly` graph; resolver, HTTP/file cache, analysis cache, and npm
+    /// state remain shared through `RuntimeServices::shared`.
     pub fn with_graph_loader(
         runtime: Arc<RuntimeServices>,
         permissions: PermissionsContainer,
         graph_loader: Arc<RealGraphLoader>,
     ) -> Self {
+        let graph = Arc::new(tokio::sync::Mutex::new(ModuleGraph::new(
+            GraphKind::CodeOnly,
+        )));
+        Self::with_graph_loader_and_graph(runtime, permissions, graph_loader, graph)
+    }
+
+    fn with_graph_loader_and_graph(
+        runtime: Arc<RuntimeServices>,
+        permissions: PermissionsContainer,
+        graph_loader: Arc<RealGraphLoader>,
+        graph: Arc<tokio::sync::Mutex<ModuleGraph>>,
+    ) -> Self {
         Self {
             shared: runtime.shared.clone(),
             file_fetcher: runtime.file_fetcher.clone(),
             graph_loader,
-            graph: runtime.graph.clone(),
+            graph,
             permissions,
         }
     }
