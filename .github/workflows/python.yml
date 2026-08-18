@@ -367,6 +367,8 @@ jobs:
           rust-toolchain: stable
           maturin-version: "v1.11.5"
           manylinux: "2_28"
+          before-script-linux: |
+            yum install -y clang
           args: >-
             --release --locked --compatibility pypi
             -i python3.9
@@ -432,6 +434,8 @@ jobs:
           rust-toolchain: stable
           maturin-version: "v1.11.5"
           manylinux: "2_28"
+          before-script-linux: |
+            yum install -y clang
           args: >-
             --release --locked --compatibility pypi
             -i python3.9
