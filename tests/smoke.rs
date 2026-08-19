@@ -270,14 +270,16 @@ fn permissions_reject_ungranted_capabilities() {
 
 #[cfg(unix)]
 #[test]
-fn permissions_reject_symlink_outside_granted_read_scope() {
+fn permissions_allow_symlink_inside_granted_read_scope() {
     use std::os::unix::fs::symlink;
 
-    let dir = temp_dir("perm-symlink");
+    let dir = temp_dir("perm-symlink-inside");
     let allowed = dir.join("allowed");
     let outside = dir.join("outside");
     fs::create_dir_all(&allowed).unwrap();
     fs::create_dir_all(&outside).unwrap();
+    let allowed = fs::canonicalize(&allowed).unwrap();
+    let outside = fs::canonicalize(&outside).unwrap();
     fs::write(outside.join("secret.txt"), "outside").unwrap();
     let link = allowed.join("outside-link");
     symlink(&outside, &link).unwrap();
@@ -285,18 +287,54 @@ fn permissions_reject_symlink_outside_granted_read_scope() {
     let target = link.join("secret.txt");
     fs::write(&entry, format!("Deno.readTextFileSync({target:?});")).unwrap();
 
-    let granted = fs::canonicalize(&allowed).unwrap();
+    let code = run(
+        &entry,
+        &LibdenoOptions {
+            permissions: vec![format!("--allow-read={}", allowed.display())],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn permissions_reject_symlink_outside_granted_read_scope() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("perm-symlink-outside");
+    let allowed = dir.join("allowed");
+    let outside = dir.join("outside");
+    fs::create_dir_all(&allowed).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let allowed = fs::canonicalize(&allowed).unwrap();
+    let outside = fs::canonicalize(&outside).unwrap();
+    let target = allowed.join("secret.txt");
+    fs::write(&target, "inside").unwrap();
+    let link = outside.join("inside-link");
+    symlink(&target, &link).unwrap();
+    // Keep the entry inside the granted directory so any failure comes from
+    // checking the outside symlink path, not from loading the entry itself.
+    let entry = allowed.join("main.js");
+    fs::write(&entry, format!("Deno.readTextFileSync({link:?});")).unwrap();
+
     let err = run(
         &entry,
         &LibdenoOptions {
-            permissions: vec![format!("--allow-read={}", granted.display())],
+            permissions: vec![format!("--allow-read={}", allowed.display())],
             ..Default::default()
         },
     )
     .unwrap_err();
     assert!(
         err.is_permission_error(),
-        "symlink escape unexpectedly returned: {err}"
+        "outside symlink unexpectedly returned: {err}"
+    );
+    assert!(
+        err.to_string().contains(&link.display().to_string()),
+        "entry read was denied instead of the outside symlink: {err}"
     );
     let _ = fs::remove_dir_all(&dir);
 }
