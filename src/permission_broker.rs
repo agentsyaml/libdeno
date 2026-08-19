@@ -30,9 +30,12 @@ pub struct PermissionRequest {
 ///
 /// Called synchronously from the permission-check path on the broker bridge
 /// thread: it must return quickly and must not block — a blocked hook stalls
-/// every permission check in the process — and must not panic (a panicking
-/// hook closes the bridge, which terminates the process through the upstream
-/// broker error path).
+/// every permission check in the process. Unwinding panics are caught at the
+/// bridge boundary and fail closed as a deny response. This does not apply to
+/// `panic = "abort"` builds or panic hooks that abort or exit the process:
+/// `catch_unwind` cannot capture those, and they may terminate the host. Hooks
+/// still must not panic because the panic hook may log noisy diagnostics and
+/// the callback is a security boundary for the decision.
 ///
 /// Re-entering any permission-checking code from the hook (e.g. calling
 /// [`crate::run`] in-process, or any op that consults permissions) deadlocks
@@ -60,6 +63,16 @@ static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// `run_in_subprocess` children when the host binary installs it in `main()`
 /// before `maybe_handle_child_mode()`. A second install returns an error.
 ///
+/// `Result` covers only failures libdeno can report, such as duplicate
+/// installation or local setup errors. It does **not** make the upstream
+/// connection operation catchable: `deno_permissions::broker::PermissionBroker::new`
+/// returns `Self` and may call `process::exit(87)` when the initial connection
+/// fails. Later broker/bridge communication failures may also terminate the
+/// process through the upstream error path, and the caller cannot catch either
+/// kind of termination. Do not use this API with an untrusted or unreliable
+/// endpoint, or where the host is required to remain alive after broker
+/// failure.
+///
 /// Note: the broker decides checks, not construction — an empty `permissions`
 /// list without `prompt: true` (or flags / `allow_all_permissions`) still
 /// fails at `run` construction time before any check reaches the broker.
@@ -72,10 +85,10 @@ pub fn install_permission_broker(path: impl AsRef<Path>) -> Result<(), LibdenoEr
         ));
     }
     // NOTE: PermissionBroker::new exits the process (code 87) if it cannot
-    // connect to `path` — upstream deno_permissions behavior, not ours.
-    // Callers should probe the socket's existence first (e.g. via the
-    // process-wide `has_broker()` guard after a successful connect, or by
-    // checking the path before installing) to fail cleanly instead.
+    // connect to `path` — upstream deno_permissions behavior, not ours. The
+    // upstream constructor is not try_new, so this cannot be converted into a
+    // catchable LibdenoError here; later bridge failures have the same external
+    // termination risk.
     let broker = PermissionBroker::new(path.as_ref());
     set_broker(broker);
     Ok(())
@@ -91,6 +104,14 @@ static HOOK: OnceLock<PermissionPrompt> = OnceLock::new();
 ///
 /// Unix only for now; on Windows use [`install_permission_broker`] with an
 /// external broker process.
+///
+/// The hook uses the same upstream `deno_permissions` broker bridge and
+/// `PermissionBroker::new` constructor as an external broker. The listener
+/// and socket path are created locally, which lowers normal connection-failure
+/// risk, but does not make the upstream constructor fallible: an initial
+/// connection failure, or a later bridge communication failure, may still
+/// terminate the process through an uncapturable `process::exit(87)`/upstream
+/// error path. `Result` cannot recover those terminations.
 ///
 /// # Safety (fork)
 ///
@@ -116,11 +137,11 @@ pub fn install_permission_hook(hook: PermissionPrompt) -> Result<(), LibdenoErro
 }
 
 #[cfg(unix)]
-fn random_suffix() -> String {
+fn random_suffix() -> Result<String, LibdenoError> {
     // getrandom is already in the tree (child-mode auth token entropy).
     let mut buf = [0u8; 8];
-    getrandom::fill(&mut buf).expect("OS RNG is required to install a permission hook");
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    getrandom::fill(&mut buf).map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 #[cfg(unix)]
@@ -143,13 +164,14 @@ fn install_permission_hook_unix(hook: PermissionPrompt) -> Result<(), LibdenoErr
     // connect window to starve the real broker connection. The random suffix
     // blocks pre-creation of a predictable path (a local DoS of this opt-in
     // install); no pid component is needed. Stale dirs from crashed installs
-    // are unreachable litter, never colliding. Both endpoints are ours, so
-    // the broker's connect cannot fail (PermissionBroker::new's exit(87)
-    // path is unreachable here).
+    // are unreachable litter, never colliding. The listener and path are
+    // created by this process, which lowers normal connection-failure risk,
+    // but local resource/connection errors can still reach the upstream
+    // constructor and its uncapturable process::exit(87) path.
     //
     // The dir/file names are deliberately short: macOS caps Unix socket paths
     // at 104 bytes (SUN_LEN), and its temp dir is already long.
-    let socket_dir = std::env::temp_dir().join(format!("libdeno-hook-{}", random_suffix()));
+    let socket_dir = std::env::temp_dir().join(format!("libdeno-hook-{}", random_suffix()?));
     std::fs::create_dir(&socket_dir).map_err(|e| {
         LibdenoError::Permission(format!(
             "failed to create hook socket dir {}: {e}",
@@ -250,10 +272,23 @@ fn serve_broker_connection(stream: std::os::unix::net::UnixStream, hook: &Permis
         }
         let response = match deno_core::serde_json::from_str::<BrokerRequest>(line.trim()) {
             Ok(req) => {
-                let allow = (hook)(&PermissionRequest {
+                let request = PermissionRequest {
                     name: req.permission,
                     value: req.value,
-                });
+                };
+                let allow = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (hook)(&request)
+                })) {
+                    Ok(allow) => allow,
+                    Err(_) => {
+                        let mut stderr = std::io::stderr().lock();
+                        let _ = writeln!(
+                            stderr,
+                            "libdeno: permission hook panicked; denying the request"
+                        );
+                        false
+                    }
+                };
                 BrokerResponseLine {
                     id: req.id,
                     result: if allow { "allow" } else { "deny" },
@@ -261,8 +296,8 @@ fn serve_broker_connection(stream: std::os::unix::net::UnixStream, hook: &Permis
                 }
             }
             Err(_) => {
-                // Unreachable in practice (both endpoints are ours). A
-                // well-formed deny response keeps the upstream broker reading;
+                // Normally unreachable for the locally-created hook endpoint,
+                // but a well-formed deny response keeps the upstream broker reading;
                 // a protocol mismatch ends in the upstream exit(87) path
                 // either way — this yields the deterministic "ID mismatch"
                 // error rather than a parse failure on EOF.
@@ -316,6 +351,15 @@ mod tests {
         assert_eq!(result, "allow");
         // Deny-hook.
         let (id, result) = round_trip(Arc::new(|_req: &PermissionRequest| false));
+        assert_eq!(id, 7);
+        assert_eq!(result, "deny");
+    }
+
+    #[test]
+    fn panicking_hook_fails_closed_as_deny() {
+        let (id, result) = round_trip(Arc::new(|_req: &PermissionRequest| -> bool {
+            panic!("synthetic permission-hook panic")
+        }));
         assert_eq!(id, 7);
         assert_eq!(result, "deny");
     }

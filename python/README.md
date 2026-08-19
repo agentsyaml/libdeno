@@ -2,7 +2,7 @@
 
 This is a private alpha Python binding prototype for the Rust `libdeno`
 runtime. The Python distribution and core Rust crate are both versioned at
-`0.3.0`. It exposes a small, fail-closed synchronous API backed by the Rust
+`0.3.1`. It exposes a small, fail-closed synchronous API backed by the Rust
 runtime:
 
 ```python

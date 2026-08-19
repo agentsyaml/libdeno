@@ -196,7 +196,7 @@ builds the permission-free half of that stack once and `run_with` /
   are rebuilt each call, so one run's grants never leak into another.
 - `run_with` **rejects** `capture_stdout` / `capture_stderr` with
   `LibdenoError::Configuration` (it returns only the exit code). Use
-  `run_with_output(&runtime, ...)` for capture on the reusable stack;
+  `libdeno::runtime::run_with_output(&runtime, ...)` for capture on the reusable stack;
   everything else matches `run_with_output` (mismatched `cwd` rejected,
   permissions per run, fd-level capture with the same exclusivity lease,
   Windows rejection and per-stream byte cap).
@@ -467,9 +467,15 @@ response `{id, result: "allow"|"deny", reason}` line.
   local `--allow-*` flags are no longer consulted (upstream deno semantics).
 - Checks are synchronous and blocking: the run stalls until the broker answers
   each query.
-- `PermissionBroker::new` exits the process (code 87) if it cannot connect to
-  `path` — upstream deno_permissions behavior, not libdeno's. Install at
-  startup so a bad socket fails loudly.
+- The returned `Result` covers only failures libdeno can report, such as a
+  duplicate install or local setup error. Upstream
+  `deno_permissions::broker::PermissionBroker::new` returns `Self`, not a
+  `try_new` result, and may call `process::exit(87)` when the initial
+  connection fails. Later broker/bridge communication failures may also
+  terminate the process through the upstream error path; the caller cannot
+  catch either termination. Do not use this API with an untrusted or
+  unreliable endpoint, or where the host must remain alive after broker
+  failure.
 - Works across `run_in_subprocess` children when the host binary installs it in
   `main()` before `maybe_handle_child_mode()`.
 
@@ -493,9 +499,25 @@ allow, `false` to deny.
   `PermissionRequest` carries the capability name (`"read"`, `"net"`, ...) and
   the stringified access value (path, host, env name, ...; `None` for unary
   checks).
+- The hook uses the same upstream `deno_permissions` broker bridge and
+  `PermissionBroker::new` constructor. The locally-created listener and path
+  reduce normal connection-failure risk but do not make that constructor
+  fallible: an initial connection failure, or a later bridge communication
+  failure, may still terminate the process through an uncapturable
+  `process::exit(87)`/upstream error path. `Result` cannot recover those
+  terminations.
 - The hook must return quickly and must not block: checks are synchronous and
-  blocking, so a stalled hook stalls every permission check in the process. A
-  panicking hook terminates the process (upstream broker error path).
+  blocking, so a stalled hook stalls every permission check in the process. An
+  unwinding panic is caught at the bridge boundary and the request is denied.
+  A `panic = "abort"` build or a panic hook that aborts/exits is not catchable
+  by `catch_unwind` and may terminate the host; the hook must still not panic
+  because it may produce noisy panic-hook diagnostics. This fail-closed
+  handling does not change the upstream external broker's uncapturable
+  constructor/communication termination behavior.
+- A blocked hook can defeat `execution_deadline`: the permission bridge may be
+  waiting on the hook while V8 has no interruptible JavaScript stack. The
+  deadline resumes only after the hook returns; it is not a timeout on the
+  callback or the broker connection.
 - The hook decides checks, not construction: an empty `permissions` list still
   fails at `run` construction time unless `prompt: true` (or flags /
   `allow_all_permissions`) is set — the minimal hook configuration is hook +

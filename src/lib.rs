@@ -186,11 +186,16 @@ pub struct LibdenoOptions {
     /// authors should use absolute paths (or [`crate::run_in_subprocess`],
     /// where the child's cwd is pinned at spawn).
     pub cwd: Option<PathBuf>,
-    /// Hard cap on the V8 old-generation heap in bytes (the constraint behind
-    /// `--v8-flags=--max-old-space-size`); V8 aborts with OOM when hit.
+    /// In-process, best-effort constraint on the V8 old-generation heap in
+    /// bytes (the constraint behind `--v8-flags=--max-old-space-size`). It does
+    /// not cap native allocations, V8 external memory, host allocations, or
+    /// memory used by child processes; it is not an OS/process memory boundary.
     pub max_heap_bytes: Option<usize>,
-    /// Hard wall-clock limit; on expiry the isolate is force-terminated and
-    /// the run fails with [`LibdenoError::Timeout`].
+    /// In-process, best-effort execution deadline. It can terminate JavaScript
+    /// when V8 reaches an interruptible stack check and then report
+    /// [`LibdenoError::Timeout`], but it cannot interrupt a blocking syscall,
+    /// native code, a child-process wait, or a blocked permission broker/hook;
+    /// such a run may exceed the requested deadline.
     pub execution_deadline: Option<std::time::Duration>,
     /// Redirect the script's stdout (fd 1, e.g. `console.log`) into
     /// [`RunOutput::stdout`] instead of the host's terminal. Off by default
@@ -232,11 +237,12 @@ pub struct RunOutput {
     pub exit_code: i32,
     /// Captured stdout bytes; empty unless [`LibdenoOptions::capture_stdout`]
     /// was set. Unbounded: a verbose or hostile script grows this without
-    /// limit for the run's duration — bound the script, or set
-    /// [`LibdenoOptions::execution_deadline`].
+    /// limit for the run's duration — set [`LibdenoOptions::max_capture_bytes`]
+    /// for a memory bound; `execution_deadline` is not a memory bound.
     pub stdout: Vec<u8>,
     /// Captured stderr bytes; empty unless [`LibdenoOptions::capture_stderr`]
-    /// was set. Same unbounded-growth caveat as [`Self::stdout`].
+    /// was set. Same unbounded-growth caveat as [`Self::stdout`]; use
+    /// [`LibdenoOptions::max_capture_bytes`] for a memory bound.
     pub stderr: Vec<u8>,
     /// True when a captured stream hit [`LibdenoOptions::max_capture_bytes`]
     /// and was truncated. False when no capture was requested or when both
@@ -269,11 +275,10 @@ pub enum LibdenoError {
     /// I/O failure in the host (cwd resolution).
     #[error("{0}")]
     Io(#[from] std::io::Error),
-    /// A hard time bound fired: the run exceeded
-    /// `LibdenoOptions.execution_deadline` and the isolate was
-    /// force-terminated, or a [`run_in_subprocess`] handshake timed out (the
-    /// host never serviced child mode). The payload is the human-readable
-    /// reason.
+    /// An in-process best-effort deadline was reported, or a
+    /// [`run_in_subprocess`] handshake timed out (the host never serviced child
+    /// mode). The payload is the human-readable reason; an in-process run can
+    /// exceed its requested deadline when it is inside non-interruptible work.
     #[error("{0}")]
     Timeout(String),
 }
@@ -433,13 +438,19 @@ fn run_sync_output(entry: &Path, options: &LibdenoOptions) -> Result<RunOutput, 
     )
     .map_err(LibdenoError::Io)?;
     let result = run_sync(entry, options);
-    let (stdout, stderr, capture_truncated) = capture.finish();
-    Ok(RunOutput {
-        exit_code: result?,
-        stdout,
-        stderr,
-        capture_truncated,
-    })
+    let capture_result = capture.finish().map_err(LibdenoError::Io);
+    match result {
+        Err(error) => Err(error),
+        Ok(exit_code) => {
+            let (stdout, stderr, capture_truncated) = capture_result?;
+            Ok(RunOutput {
+                exit_code,
+                stdout,
+                stderr,
+                capture_truncated,
+            })
+        }
+    }
 }
 
 /// Runs `entry` on the **caller's** tokio runtime. Identical semantics to
@@ -576,13 +587,19 @@ where
     )
     .map_err(LibdenoError::Io)?;
     let result = run.await;
-    let (stdout, stderr, capture_truncated) = capture.finish();
-    Ok(RunOutput {
-        exit_code: result?,
-        stdout,
-        stderr,
-        capture_truncated,
-    })
+    let capture_result = capture.finish().map_err(LibdenoError::Io);
+    match result {
+        Err(error) => Err(error),
+        Ok(exit_code) => {
+            let (stdout, stderr, capture_truncated) = capture_result?;
+            Ok(RunOutput {
+                exit_code,
+                stdout,
+                stderr,
+                capture_truncated,
+            })
+        }
+    }
 }
 
 /// FeatureChecker::enable_feature requires `&'static str`, but a host's

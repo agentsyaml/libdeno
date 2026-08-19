@@ -5,6 +5,48 @@ breaking changes are highlighted per release with migration notes.
 
 [keep a changelog]: https://keepachangelog.com/en/1.1.0/
 
+## 0.3.1 (Unreleased)
+
+### Security / Correctness
+
+- **Bounded child requests**: child-mode requests are capped at 1 MiB, and the
+  parent validates the serialized request before spawning the child.
+- **Failure propagation**: capture-reader and fd failures, negative
+  `NODE_CHANNEL_FD` values, and random-suffix RNG failures are surfaced rather
+  than silently treated as valid state.
+- **Fail-closed permission hooks**: unwinding panics from an in-process
+  permission hook are caught at the bridge boundary and return deny. Builds
+  using `panic = "abort"`, or panic hooks that abort/exit, cannot be recovered
+  by `catch_unwind` and may still terminate the host.
+- **Documented boundaries**: heap and execution-deadline controls are
+  best-effort; the external broker's upstream `exit(87)` behavior and
+  descendant-process limitations are explicit.
+
+### Compatibility / API
+
+- **Python PathLike support**: Python bindings accept `str`, `bytes`, and
+  custom `PathLike` values while preserving platform path semantics.
+- **Permission and subprocess boundary coverage**: added negative capability,
+  symlink-escape, and subprocess-boundary tests.
+- **Reusable output documentation**: corrected examples to use the public
+  `libdeno::runtime::run_with_output` path.
+
+### Performance
+
+- **Benchmark measurement**: benchmark coverage is available for the relevant
+  run paths, but no production performance rewrite was made without evidence.
+  Further graph, cache, isolate, and global-cache optimization work remains
+  deferred.
+
+### Known limitations
+
+- There is no cross-platform process-tree / Windows Job Object kill-tree
+  guarantee and no subprocess wall-time API.
+- Captured output is still returned only on success; partial output is not
+  carried with an error.
+- External broker upstream constructor and communication `exit(87)` paths are
+  not catchable as `LibdenoError`.
+
 ## 0.3.0
 
 > **Breaking (runtime behavior)**: the process cwd is never switched anymore

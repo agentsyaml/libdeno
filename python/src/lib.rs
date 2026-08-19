@@ -1,4 +1,10 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
 
 use libdeno::LibdenoError as CoreError;
 use pyo3::create_exception;
@@ -109,17 +115,55 @@ fn empty_tuple() -> Py<PyAny> {
 }
 
 fn path_from_python(value: &Bound<'_, PyAny>, name: &str) -> PyResult<PathBuf> {
-    let path = value
-        .extract::<String>()
-        .or_else(|_| {
-            value
-                .call_method0("__fspath__")
-                .and_then(|path| path.extract::<String>())
-        })
-        .map_err(|error| {
+    let os = value.py().import("os").map_err(|error| {
+        ConfigurationError::new_err(format!("{name} must be str or os.PathLike: {error}"))
+    })?;
+    let fspath = os.call_method1("fspath", (value,)).map_err(|error| {
+        ConfigurationError::new_err(format!("{name} must be str or os.PathLike: {error}"))
+    })?;
+    // `fsencode` preserves Python's filesystem bytes/surrogateescape semantics
+    // instead of routing paths through lossy UTF-8 conversion.
+    let encoded = os.call_method1("fsencode", (fspath,)).map_err(|error| {
+        ConfigurationError::new_err(format!("{name} must be str or os.PathLike: {error}"))
+    })?;
+
+    #[cfg(unix)]
+    {
+        let bytes = encoded.extract::<Vec<u8>>().map_err(|error| {
             ConfigurationError::new_err(format!("{name} must be str or os.PathLike: {error}"))
         })?;
-    Ok(PathBuf::from(path))
+        Ok(PathBuf::from(OsString::from_vec(bytes)))
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows paths are represented as UTF-16. Decode through Python's
+        // filesystem codec, then encode with surrogatepass so undecodable
+        // filesystem bytes are not replaced or dropped.
+        let decoded = os.call_method1("fsdecode", (encoded,)).map_err(|error| {
+            ConfigurationError::new_err(format!("{name} must be str or os.PathLike: {error}"))
+        })?;
+        let utf16 = decoded
+            .call_method1("encode", ("utf-16-le", "surrogatepass"))
+            .map_err(|error| {
+                ConfigurationError::new_err(format!(
+                    "{name} must be str or os.PathLike: {error}"
+                ))
+            })?;
+        let bytes = utf16.extract::<Vec<u8>>().map_err(|error| {
+            ConfigurationError::new_err(format!("{name} must be str or os.PathLike: {error}"))
+        })?;
+        if bytes.len() % 2 != 0 {
+            return Err(ConfigurationError::new_err(format!(
+                "{name} must be str or os.PathLike: invalid UTF-16 path"
+            )));
+        }
+        let wide: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        Ok(PathBuf::from(OsString::from_wide(&wide)))
+    }
 }
 
 fn string_sequence(value: &Bound<'_, PyAny>, name: &str) -> PyResult<Vec<String>> {

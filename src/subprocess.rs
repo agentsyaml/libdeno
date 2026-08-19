@@ -22,6 +22,11 @@ const LIBDENO_CHILD_TOKEN: &str = "LIBDENO_CHILD_TOKEN";
 /// run at a dedicated host binary.
 const LIBDENO_HOST_EXE: &str = "LIBDENO_HOST_EXE";
 
+/// Maximum child-mode request size. The reader consumes at most one extra byte
+/// so it can distinguish a payload exactly at the ceiling from an oversized
+/// payload without ever allocating an unbounded stdin buffer.
+const MAX_CHILD_REQUEST_BYTES: usize = 1024 * 1024; // 1 MiB
+
 /// Request payload serialized to the child process's stdin by
 /// [`run_in_subprocess`]. The `token` must match the [`LIBDENO_CHILD_TOKEN`]
 /// environment variable the parent set on the child; without it the child
@@ -89,7 +94,8 @@ fn token_matches(a: &str, b: &str) -> bool {
 ///
 /// The child inherits stdout/stderr, so script output still appears. Entry,
 /// permissions, prompt, args and cwd are passed over stdin as JSON, together
-/// with a fresh per-run auth `token`. The same token is handed to the child
+/// with a fresh per-run auth `token`; the serialized request is bounded at
+/// 1 MiB before the child is spawned. The same token is handed to the child
 /// via the `LIBDENO_CHILD_TOKEN` environment variable; the child refuses to
 /// run unless the request token matches, so a process that can set
 /// `LIBDENO_CHILD_MODE` and write the child's stdin cannot inject a request
@@ -162,6 +168,9 @@ fn spawn_child_request(
     };
     let payload = deno_core::serde_json::to_vec(&request)
         .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
+    // Validate before resolving the executable or spawning a process: an
+    // oversized request must have no child-side effects.
+    validate_child_request_size(&payload)?;
     let exe = std::env::var_os(LIBDENO_HOST_EXE)
         .map(PathBuf::from)
         .unwrap_or(std::env::current_exe()?);
@@ -283,10 +292,28 @@ pub fn run_in_subprocess_with_output(
         .map(|pipe| std::thread::spawn(move || drain_pipe(pipe, max)));
     let status = child.wait().map_err(LibdenoError::Io)?;
     let (stdout, stdout_truncated) = stdout_handle
-        .map(|h| h.join().unwrap_or_default())
+        .map(|h| {
+            h.join()
+                .map_err(|_| {
+                    LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                        "subprocess stdout reader thread panicked"
+                    ))
+                })?
+                .map_err(LibdenoError::Io)
+        })
+        .transpose()?
         .unwrap_or_default();
     let (stderr, stderr_truncated) = stderr_handle
-        .map(|h| h.join().unwrap_or_default())
+        .map(|h| {
+            h.join()
+                .map_err(|_| {
+                    LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                        "subprocess stderr reader thread panicked"
+                    ))
+                })?
+                .map_err(LibdenoError::Io)
+        })
+        .transpose()?
         .unwrap_or_default();
     Ok(crate::RunOutput {
         exit_code: status.code().unwrap_or(1),
@@ -298,8 +325,11 @@ pub fn run_in_subprocess_with_output(
 
 /// Reads a child pipe to EOF, keeping the first `max` bytes; excess is
 /// drained and dropped (a truncated stream still unblocks the child). Read
-/// errors are tolerated (best-effort capture, like in-process capture).
-fn drain_pipe<R: std::io::Read>(mut pipe: R, max: usize) -> (Vec<u8>, bool) {
+/// errors other than `Interrupted` are returned to the caller.
+fn drain_pipe<R: std::io::Read>(
+    mut pipe: R,
+    max: usize,
+) -> Result<(Vec<u8>, bool), std::io::Error> {
     let mut out = Vec::new();
     let mut truncated = false;
     let mut buf = [0u8; 64 * 1024];
@@ -317,10 +347,22 @@ fn drain_pipe<R: std::io::Read>(mut pipe: R, max: usize) -> (Vec<u8>, bool) {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(e) => return Err(e),
         }
     }
-    (out, truncated)
+    Ok((out, truncated))
+}
+
+/// Rejects an oversized child-mode request before JSON deserialization can
+/// allocate based on attacker-controlled input.
+fn validate_child_request_size(payload: &[u8]) -> Result<(), LibdenoError> {
+    if payload.len() > MAX_CHILD_REQUEST_BYTES {
+        return Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(format!(
+            "child-mode request exceeds the {}-byte limit",
+            MAX_CHILD_REQUEST_BYTES
+        ))));
+    }
+    Ok(())
 }
 
 /// Services a child-run request when this process was spawned by
@@ -343,8 +385,8 @@ fn drain_pipe<R: std::io::Read>(mut pipe: R, max: usize) -> (Vec<u8>, bool) {
 /// authenticated only by the token. Never run a host with child mode enabled
 /// under elevated privileges (setuid, service daemon, admin/root).
 ///
-/// The stdin request read is capped at 10 seconds; a caller that sets
-/// `LIBDENO_CHILD_MODE` but never sends (or never closes) stdin gets the
+/// The stdin request read is capped at 1 MiB and 10 seconds; a caller that
+/// sets `LIBDENO_CHILD_MODE` but never sends (or never closes) stdin gets the
 /// process exited rather than blocked forever.
 ///
 /// In child mode the child's stdin is a pipe (consumed by the request JSON),
@@ -365,8 +407,9 @@ pub fn maybe_handle_child_mode() -> bool {
         std::process::exit(1);
     };
     let result: Result<i32, LibdenoError> = (|| {
-        // The child-mode request read is bounded: a caller that sets LIBDENO_CHILD_MODE
-        // but never writes (or never closes) stdin must not pin this process forever.
+        // The child-mode request read is bounded to both 1 MiB and 10 seconds:
+        // a caller that sets LIBDENO_CHILD_MODE but never writes (or never
+        // closes) stdin must not pin this process forever.
         // Stdin is a 'static handle and Send, so the blocking read moves to a
         // dedicated thread and the main thread waits with a deadline.
         //
@@ -379,16 +422,24 @@ pub fn maybe_handle_child_mode() -> bool {
         // confusing Io error. Accepted trade-off for bounding an
         // attacker-held-open stdin.
         let request: ChildRunRequest = {
-            let (tx, rx) =
-                std::sync::mpsc::channel::<Result<ChildRunRequest, deno_core::serde_json::Error>>();
+            let (tx, rx) = std::sync::mpsc::channel::<Result<ChildRunRequest, LibdenoError>>();
             std::thread::spawn(move || {
-                let _ = tx.send(deno_core::serde_json::from_reader(std::io::stdin()));
+                use std::io::Read;
+                let result = (|| {
+                    let mut payload = Vec::with_capacity(MAX_CHILD_REQUEST_BYTES + 1);
+                    std::io::stdin()
+                        .take((MAX_CHILD_REQUEST_BYTES as u64) + 1)
+                        .read_to_end(&mut payload)
+                        .map_err(LibdenoError::Io)?;
+                    validate_child_request_size(&payload)?;
+                    deno_core::serde_json::from_slice(&payload)
+                        .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))
+                })();
+                let _ = tx.send(result);
             });
             match rx.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(Ok(request)) => request,
-                Ok(Err(e)) => {
-                    return Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)));
-                }
+                Ok(Err(e)) => return Err(e),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     eprintln!(
                         "libdeno: child-mode request timed out waiting on stdin; refusing to run"
@@ -444,7 +495,50 @@ pub fn maybe_handle_child_mode() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::drain_pipe;
     use super::token_matches;
+    use super::validate_child_request_size;
+    use super::LibdenoError;
+    use super::MAX_CHILD_REQUEST_BYTES;
+
+    #[test]
+    fn child_request_size_accepts_small_payload() {
+        assert!(validate_child_request_size(b"{}").is_ok());
+    }
+
+    #[test]
+    fn child_request_size_accepts_payload_at_limit() {
+        let payload = vec![0u8; MAX_CHILD_REQUEST_BYTES];
+        assert!(validate_child_request_size(&payload).is_ok());
+    }
+
+    #[test]
+    fn child_request_size_rejects_payload_over_limit() {
+        let payload = vec![0u8; MAX_CHILD_REQUEST_BYTES + 1];
+        let error = validate_child_request_size(&payload).unwrap_err();
+        assert!(matches!(&error, LibdenoError::Runtime(_)));
+        assert!(error
+            .to_string()
+            .contains(&format!("{}-byte limit", MAX_CHILD_REQUEST_BYTES)));
+    }
+
+    #[test]
+    fn drain_pipe_propagates_non_interrupted_read_errors() {
+        struct ErrorReader;
+
+        impl std::io::Read for ErrorReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "synthetic pipe failure",
+                ))
+            }
+        }
+
+        let error = drain_pipe(ErrorReader, usize::MAX).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "synthetic pipe failure");
+    }
 
     #[test]
     fn token_matches_compares_tokens() {

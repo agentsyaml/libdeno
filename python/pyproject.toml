@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "libdeno"
-version = "0.3.0"
+version = "0.3.1"
 requires-python = ">=3.9"
 description = "Private alpha Python bindings for embedding the Deno runtime"
 readme = "README.md"

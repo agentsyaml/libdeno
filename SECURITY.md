@@ -50,7 +50,7 @@ If you need stronger guarantees, pin your own lockfile and run `cargo-vet` /
 
 Since **v0.2.0**, an **empty** `LibdenoOptions.permissions` list **no longer
 implicitly grants all permissions**: `run` / `run_with` /
-`run_in_subprocess` return a permission error instead.
+`run_in_subprocess` return `LibdenoError::Configuration` instead.
 
 Embedders must do one of the following:
 
@@ -123,7 +123,41 @@ strings (`--allow-read`, `--allow-write`, `--allow-net`, `--allow-env`,
 per-operation through deno_runtime's `PermissionsContainer`. Web workers carry
 the permissions captured at `new Worker(...)` time.
 
-What it does **not** provide: no V8 heap/memory cap, no CPU limit, no
-execution-time limit, and no in-process sandbox. For untrusted code, add
-process-level limits (container / cgroup / `ulimit`) on top of the permission
-flags — see [Trusted Execution Model](#trusted-execution-model--read-this-first).
+The resource options are in-process, best-effort controls, not a security
+boundary:
+
+- `max_heap_bytes` requests a V8 old-generation heap ceiling for the isolate.
+  It does not cap total V8 memory, native allocations, V8 external memory,
+  host allocations, or memory used by child processes. It is not a cgroup,
+  container, or OS-enforced process-memory limit.
+- `execution_deadline` can interrupt JavaScript when V8 reaches an
+  interruptible stack check. It cannot interrupt a blocking syscall, a wait on
+  a child process, native code, or a blocked permission broker/hook, and it
+  cannot bound host-side memory or other work after the run leaves an
+  interruptible V8 frame. A run can therefore exceed the requested deadline.
+
+Neither option provides CPU isolation, a complete execution-time limit, or an
+in-process sandbox. They do not replace a process-level sandbox and resource
+policy (for example a container, cgroup, seccomp, Apple Seatbelt, or suitable
+`ulimit`) for untrusted code — see [Trusted Execution Model](#trusted-execution-model--read-this-first).
+
+## Subprocess and broker limits
+
+`run_in_subprocess` isolates the direct child from the host's `Deno.exit` and
+hard runtime termination, but it does not guarantee process-tree containment.
+Descendants spawned by the script can outlive the direct child, retain file
+descriptors, or continue consuming CPU and memory; libdeno does not provide a
+cross-platform process-group / Windows Job Object kill-tree guarantee. Use an
+OS-level supervisor or sandbox when descendant containment matters.
+
+`install_permission_broker` and `install_permission_hook` are process-global,
+install-once, synchronous decision paths, not isolation mechanisms. A blocked
+hook or broker stalls permission checks; an unwinding panic in an in-process
+hook is caught at the bridge boundary and fails closed as deny. A `panic =
+"abort"` build or a panic hook that aborts/exits cannot be caught by
+`catch_unwind` and may terminate the host. The upstream
+`deno_permissions::PermissionBroker::new` constructor
+may call `process::exit(87)` on initial connection failure, and later broker
+communication failures may also terminate through the upstream error path.
+These exits are not catchable as `LibdenoError`, so do not use an untrusted or
+unreliable broker endpoint where the host must remain alive.

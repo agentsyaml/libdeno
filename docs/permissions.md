@@ -6,7 +6,7 @@ libdeno's permission model mirrors the Deno CLI: capability strings in
 ## Default stance
 
 Since v0.2.0 the model is **explicit opt-in**: an **empty** `permissions`
-list is a **construction error** (`LibdenoError::Permission`) — it grants
+list is a **construction error** (`LibdenoError::Configuration`) — it grants
 nothing. To run with every capability, either set
 `LibdenoOptions.allow_all_permissions = true` (the `-A` equivalent) or pass
 `-A`/`--allow-all` in the `permissions` list. Use the allow-all escape hatch
@@ -91,13 +91,27 @@ more than once per process.
 Decision priority: broker/hook (if installed) → flag grants → interactive
 prompt when `prompt: true` → deny.
 
+The external broker has an upstream process-lifetime limitation: its
+`PermissionBroker::new` constructor is not fallible and may call
+`process::exit(87)` when the initial connection fails. Later broker/bridge
+communication failures may also terminate the host through the upstream error
+path; these exits cannot be caught as `LibdenoError`. Do not use
+`install_permission_broker` with an untrusted or unreliable endpoint, or where
+the host must remain alive after broker failure. The in-process hook has the
+same synchronous/blocking semantics; a blocking hook stalls permission checks,
+while an unwinding panic is caught at the bridge boundary and fails closed as
+deny. A `panic = "abort"` build or a panic hook that aborts/exits cannot be
+caught by `catch_unwind` and may terminate the host. A blocked hook can still
+prevent `execution_deadline` from interrupting the run; the external broker's
+upstream constructor/communication exits remain uncatchable.
+
 ## How it works
 
 `build_permissions` (`src/permissions.rs`) splits each flag on `=`, parses the
 comma-separated value, and fills a `PermissionsOptions` struct. If
 `LibdenoOptions.allow_all_permissions` is set (or the `-A`/`--allow-all`
 string appears), it returns `PermissionsContainer::allow_all` immediately.
-If no `--allow-*` flag was seen, it returns a permission error — an empty
+If no `--allow-*` flag was seen, it returns a configuration error — an empty
 list no longer silently grants everything. Otherwise it constructs a
 `Permissions` from the options and wraps it.
 

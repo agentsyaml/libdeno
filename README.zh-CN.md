@@ -86,7 +86,7 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `run_async(entry, &options) -> Result<i32, LibdenoError>` | 异步入口：在**调用方**的 tokio 运行时上执行脚本——不派生子线程。必须在 tokio 上下文中 await；future 不是 `Send`，同一线程上第二个 `run_async` 会被 `LibdenoError::Configuration` 拒绝（交错运行会中止进程）。一次只 await 一个——并行运行请用 `run`。 |
 | `LibdenoRuntime::new(cwd)` | 为一个项目目录构建一次解析器栈（async）。被 `run_with` 复用；配置链（deno.json / deno.jsonc / import_map.json / package.json / .npmrc / node_modules）变化时自动重建。 |
 | `run_with(&runtime, entry, &options) -> Result<i32, LibdenoError>` | 同 `run`，但复用 `runtime` 的解析器栈。语义与 `run` 一致（普通运行并行、tokio 重入处理、退出码、超时）；相对路径按 runtime 的 cwd 解析，权限相关组件每次调用重建。捕获标志与不匹配的 `options.cwd` 会被 `LibdenoError::Configuration` 拒绝。 |
-| `run_with_output(&runtime, entry, &options) -> Result<RunOutput, LibdenoError>` | 同 `run_with`，但当 `capture_stdout` / `capture_stderr` 开启时把脚本的 stdout/stderr 捕获进 `RunOutput`——长驻宿主对应的 `run_with_output`（后者每次调用重建解析器栈）。其余语义与 `run_with` 一致。 |
+| `libdeno::runtime::run_with_output(&runtime, entry, &options) -> Result<RunOutput, LibdenoError>` | 同 `run_with`，但当 `capture_stdout` / `capture_stderr` 开启时把脚本的 stdout/stderr 捕获进 `RunOutput`——长驻宿主对应的 `run_with_output`（后者每次调用重建解析器栈）。其余语义与 `run_with` 一致。 |
 | `run_in_subprocess(entry, &options) -> Result<i32, LibdenoError>` | 在子进程中运行入口。此时 `Deno.exit(n)` 只会终止子进程；宿主进程保持存活并拿到 `n`。宿主需在 `main()` 开头调用 `maybe_handle_child_mode()`。 |
 | `run_in_subprocess_with_output(entry, &options) -> Result<RunOutput, LibdenoError>` | 同 `run_in_subprocess`，但把子进程自己的 stdout/stderr 管道回传给 `RunOutput`：按进程捕获，可与其他运行并行，Windows 上也可用。两个流始终返回；`max_capture_bytes` 限制每个流，截断时置位 `RunOutput.capture_truncated`。 |
 | `maybe_handle_child_mode() -> bool` | 服务 `run_in_subprocess` 的子进程请求。正常宿主启动时立即返回 `false`；子进程模式下执行脚本并以脚本退出码退出进程。 |
@@ -97,8 +97,8 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `LibdenoOptions.features: Option<Vec<String>>` | 覆盖默认 unstable 特性集（`kv`、`cron`、`ffi`、`webgpu`、`worker-options`）。特性名必须是合法的 deno unstable 特性名；`None`（默认）启用默认特性集。运行不受信任插件的嵌入方可缩小暴露面（例如 `Some(vec!["ffi".into()])`）；op 本身始终受权限管控。 |
 | `LibdenoOptions.args: Vec<String>` | 通过 `process.argv`（argv[0] 之后）暴露给脚本的参数。 |
 | `LibdenoOptions.cwd: Option<PathBuf>` | 相对路径（入口、权限、node_modules 发现）解析的基准目录，默认进程当前目录。进程 cwd 从不切换——脚本观察到的是宿主的 cwd（`Deno.cwd()`），需要按运行指定工作目录时请用 `run_in_subprocess`。 |
-| `LibdenoOptions.max_heap_bytes: Option<usize>` | V8 老生代堆的硬上限（字节）；超过时 V8 以 OOM 中止。适用于主 worker **以及** `new Worker(...)` 派生的 web worker。 |
-| `LibdenoOptions.execution_deadline: Option<Duration>` | 硬墙钟时限；到期后 isolate 被强制终止，运行以 `LibdenoError::Timeout` 失败。**不会**中断阻塞的系统调用（NFS 挂起的文件读取、同步 `Deno.Command` 等待）——这些调用只有在其自身返回后才结束，因此运行可能超出时限一个系统调用的时长。 |
+| `LibdenoOptions.max_heap_bytes: Option<usize>` | 进程内、尽力而为的 V8 老生代堆约束（字节）；不覆盖 native 分配、V8 external memory、宿主分配或子进程内存，也不是 OS/进程级内存边界。适用于主 worker **以及** `new Worker(...)` 派生的 web worker。 |
+| `LibdenoOptions.execution_deadline: Option<Duration>` | 进程内、尽力而为的时限；当 V8 到达可中断的 JavaScript stack check 时可中断并返回 `LibdenoError::Timeout`。**不能**中断阻塞系统调用、native code、子进程等待或阻塞的 permission broker/hook，因此运行可能超过请求的时限。 |
 | `LibdenoError` | 枚举：`Entry`（入口解析失败）、`Permission`（权限字符串非法）、`Configuration`（选项无法构成合法配置，如 v0.2.0 起空权限列表未显式选择）、`Runtime`（运行时启动 / 脚本失败——脚本 JS 异常走这里）、`Core`（保留；不会为脚本错误构造）、`Io`、`Timeout`（超时；消息说明具体原因）。 |
 
 支持的权限标志：`--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-import[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`，以及 `-A` / `--allow-all`。`--allow-import` 管控远程模块加载（没有 `--allow-net` 兜底）；静态与动态文件导入由 `--allow-read` 管控。
@@ -125,7 +125,7 @@ println!("exit={} stdout={:?}", out.exit_code, out.stdout);
 
 `LibdenoOptions.max_capture_bytes` 限制每个流的缓冲区（stdout 与 stderr 各一份额度）：流超限时停止捕获、丢弃多余输出并置位 `RunOutput.capture_truncated`，防止冗长或恶意的脚本无限撑大宿主内存。`None`（默认）不限量。
 
-输出捕获仅限 unix：Windows 上 Rust std 的 stdout/stderr 绕过被重定向的 CRT fd，因此 `capture_stdout`/`capture_stderr` 在那里会以 `LibdenoError::Configuration` 错误失败（请改用 `run_in_subprocess_with_output`——子进程自己的 fd 被管道回传，Windows 上也可用）。`run_with` 不支持捕获——请用 `run_with_output`，长驻宿主复用解析器栈时用 `run_with_output(&runtime, ...)`。
+输出捕获仅限 unix：Windows 上 Rust std 的 stdout/stderr 绕过被重定向的 CRT fd，因此 `capture_stdout`/`capture_stderr` 在那里会以 `LibdenoError::Configuration` 错误失败（请改用 `run_in_subprocess_with_output`——子进程自己的 fd 被管道回传，Windows 上也可用）。`run_with` 不支持捕获——请用 `run_with_output`，长驻宿主复用解析器栈时用 `libdeno::runtime::run_with_output(&runtime, ...)`。
 
 完整 API 文档见 [`docs/api.md`](docs/api.md)（英文）。常见嵌入形态（npm 插件 + 输出捕获）的端到端示例见 [`examples/npm-plugin.md`](examples/npm-plugin.md)（英文）。
 

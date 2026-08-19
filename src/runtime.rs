@@ -265,13 +265,19 @@ fn run_with_sync_output(
     )
     .map_err(LibdenoError::Io)?;
     let result = run_with_sync(runtime, entry, options);
-    let (stdout, stderr, capture_truncated) = capture.finish();
-    Ok(crate::RunOutput {
-        exit_code: result?,
-        stdout,
-        stderr,
-        capture_truncated,
-    })
+    let capture_result = capture.finish().map_err(LibdenoError::Io);
+    match result {
+        Err(error) => Err(error),
+        Ok(exit_code) => {
+            let (stdout, stderr, capture_truncated) = capture_result?;
+            Ok(crate::RunOutput {
+                exit_code,
+                stdout,
+                stderr,
+                capture_truncated,
+            })
+        }
+    }
 }
 
 /// The actual run against a prebuilt resolver stack: its own block_on on a

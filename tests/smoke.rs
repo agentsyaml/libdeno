@@ -207,6 +207,101 @@ fn require_traversal_outside_granted_dir_is_denied() {
 }
 
 #[test]
+fn permissions_reject_ungranted_capabilities() {
+    // Grant only entry/read access so each operation below reaches its own
+    // capability check without touching the network, shell, or host state.
+    let dir = temp_dir("perm-capabilities");
+    let permission = format!("--allow-read={}", dir.display());
+    let write_target = dir.join("blocked-write.txt");
+    let cases = vec![
+        (
+            "write",
+            format!("Deno.writeTextFileSync({write_target:?}, 'blocked');"),
+        ),
+        (
+            "env",
+            "Deno.env.get('LIBDENO_PHASE2_UNGRANTED_ENV');".to_string(),
+        ),
+        (
+            "net",
+            "const listener = Deno.listen({hostname: '127.0.0.1', port: 0}); listener.close();"
+                .to_string(),
+        ),
+        (
+            "run",
+            "new Deno.Command(Deno.execPath()).outputSync();".to_string(),
+        ),
+        ("sys", "Deno.osRelease();".to_string()),
+        (
+            "import",
+            "await import('https://example.invalid/libdeno-phase2.js');".to_string(),
+        ),
+    ];
+
+    for (name, source) in cases {
+        let entry = dir.join(format!("{name}.js"));
+        fs::write(&entry, source).unwrap();
+        let err = run(
+            &entry,
+            &LibdenoOptions {
+                permissions: vec![permission.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        if name == "import" {
+            assert!(
+                err.to_string().contains("Requires import access"),
+                "import unexpectedly returned a non-permission error: {err}"
+            );
+        } else {
+            assert!(
+                err.is_permission_error(),
+                "{name} unexpectedly returned a non-permission error: {err}"
+            );
+        }
+    }
+    assert!(
+        !write_target.exists(),
+        "denied write must not create a file"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn permissions_reject_symlink_outside_granted_read_scope() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("perm-symlink");
+    let allowed = dir.join("allowed");
+    let outside = dir.join("outside");
+    fs::create_dir_all(&allowed).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), "outside").unwrap();
+    let link = allowed.join("outside-link");
+    symlink(&outside, &link).unwrap();
+    let entry = allowed.join("main.js");
+    let target = link.join("secret.txt");
+    fs::write(&entry, format!("Deno.readTextFileSync({target:?});")).unwrap();
+
+    let granted = fs::canonicalize(&allowed).unwrap();
+    let err = run(
+        &entry,
+        &LibdenoOptions {
+            permissions: vec![format!("--allow-read={}", granted.display())],
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.is_permission_error(),
+        "symlink escape unexpectedly returned: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn cwd_option_is_resolution_base_not_process_cwd() {
     // options.cwd is a resolution base only: the process cwd is never
     // switched, so the script observes the host's cwd (Deno.cwd/process.cwd)
@@ -321,6 +416,59 @@ fn subprocess_mode_passes_args() {
     };
     let code = libdeno::run_in_subprocess(&entry, &options).unwrap();
     assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn subprocess_mode_accepts_256kib_arg_request() {
+    // The child-side 1 MiB bound must not reject a realistic large argument,
+    // and the real child host must receive the complete payload.
+    let dir = temp_dir("subproc-large-arg");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "if (process.argv[2].length !== 256 * 1024) Deno.exit(1);",
+    )
+    .unwrap();
+    let _host_exe = set_host_exe(env!("CARGO_BIN_EXE_child_host"));
+    let code = libdeno::run_in_subprocess(
+        &entry,
+        &LibdenoOptions {
+            args: vec!["x".repeat(256 * 1024)],
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn oversized_subprocess_request_fails_before_spawn() {
+    // An invalid executable makes an accidental spawn observable: the size
+    // validation must run first and return the request error instead of an IO
+    // error from Command::spawn.
+    let dir = temp_dir("subproc-oversized-request");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "Deno.exit(0);").unwrap();
+    let _host_exe = set_host_exe("/definitely/not-a-libdeno-host");
+    let error = libdeno::run_in_subprocess(
+        &entry,
+        &LibdenoOptions {
+            args: vec!["x".repeat(1024 * 1024)],
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("child-mode request exceeds the 1048576-byte limit"),
+        "unexpected oversized-request error: {error}"
+    );
+    std::env::set_var("LIBDENO_HOST_EXE", env!("CARGO_BIN_EXE_child_host"));
     let _ = fs::remove_dir_all(&dir);
 }
 

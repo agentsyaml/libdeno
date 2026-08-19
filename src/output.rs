@@ -18,7 +18,8 @@
 // on Windows. Closing is explicit at the two exit points (finish / Drop).
 
 /// Redirects fd 1 (stdout) and/or fd 2 (stderr) to pipes for the lifetime of
-/// the guard; [`finish`](Self::finish) restores them and returns the bytes.
+/// the guard; [`finish`](Self::finish) restores them and returns the bytes or
+/// a reader I/O error.
 pub(crate) struct OutputCapture {
     stdout: Option<StreamCapture>,
     stderr: Option<StreamCapture>,
@@ -46,19 +47,38 @@ impl OutputCapture {
     /// Restores the original fds and returns (captured stdout, captured
     /// stderr, whether either stream hit its byte cap and was truncated).
     /// Call unconditionally after the run, even on error, so the redirection
-    /// never outlives the run.
-    pub(crate) fn finish(mut self) -> (Vec<u8>, Vec<u8>, bool) {
-        let (stdout, trunc_stdout) = self.stdout.take().map(|s| s.finish()).unwrap_or_default();
-        let (stderr, trunc_stderr) = self.stderr.take().map(|s| s.finish()).unwrap_or_default();
-        (stdout, stderr, trunc_stdout || trunc_stderr)
+    /// never outlives the run. Reader errors are returned after both streams
+    /// have had a chance to restore their fds.
+    pub(crate) fn finish(mut self) -> Result<(Vec<u8>, Vec<u8>, bool), std::io::Error> {
+        let stdout = self
+            .stdout
+            .take()
+            .map(|stream| stream.finish())
+            .unwrap_or_else(|| Ok((Vec::new(), false)));
+        let stderr = self
+            .stderr
+            .take()
+            .map(|stream| stream.finish())
+            .unwrap_or_else(|| Ok((Vec::new(), false)));
+        match (stdout, stderr) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok((stdout, trunc_stdout)), Ok((stderr, trunc_stderr))) => {
+                Ok((stdout, stderr, trunc_stdout || trunc_stderr))
+            }
+        }
     }
 }
 
 impl Drop for OutputCapture {
     fn drop(&mut self) {
         // Panic-safety: restore whatever was not finished.
-        self.stdout.take().map(|s| s.finish());
-        self.stderr.take().map(|s| s.finish());
+        if let Some(stream) = self.stdout.take() {
+            let _ = stream.finish();
+        }
+        if let Some(stream) = self.stderr.take() {
+            let _ = stream.finish();
+        }
     }
 }
 
@@ -70,7 +90,7 @@ struct StreamCapture {
     /// can never be dup2'd again after the OS reused it for another file.
     saved: Option<libc::c_int>,
     /// Captured blocks from the (detached) reader thread.
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    rx: std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
     /// Set by the reader thread when the byte cap was hit (truncated).
     overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -130,6 +150,7 @@ impl StreamCapture {
         if unsafe { libc::dup2(write_fd, fd) } < 0 {
             let err = std::io::Error::last_os_error();
             unsafe {
+                libc::close(dup_fd);
                 libc::close(read_fd);
                 libc::close(write_fd);
             }
@@ -143,7 +164,7 @@ impl StreamCapture {
         unsafe {
             libc::close(write_fd);
         }
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
         let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let overflow_flag = overflow.clone();
         // Dropping the handle detaches: finish() drains the channel with a
@@ -165,13 +186,16 @@ impl StreamCapture {
                 let count = buf.len() as libc::c_uint;
                 let n =
                     unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, count) };
-                if n < 0
-                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                {
-                    continue; // EINTR (e.g. a signal handler): retry, don't truncate
+                if n < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue; // EINTR (e.g. a signal handler): retry, don't truncate
+                    }
+                    let _ = tx.send(Err(error));
+                    break;
                 }
-                if n <= 0 {
-                    break; // EOF, or the fd was closed/broken mid-run
+                if n == 0 {
+                    break; // EOF
                 }
                 // After the cap fires the thread keeps draining and
                 // discarding (never closing the read end): the pipe's write
@@ -191,15 +215,15 @@ impl StreamCapture {
                     if total > max {
                         let over = total - max;
                         let keep = n as usize - over;
-                        if keep > 0 {
-                            let _ = tx.send(buf[..keep].to_vec());
+                        if keep > 0 && tx.send(Ok(buf[..keep].to_vec())).is_err() {
+                            break;
                         }
                         overflow_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                         discarding = true;
                         continue;
                     }
                 }
-                if tx.send(buf[..n as usize].to_vec()).is_err() {
+                if tx.send(Ok(buf[..n as usize].to_vec())).is_err() {
                     break; // receiver gave up (finish timeout); stop reading
                 }
             }
@@ -216,7 +240,8 @@ impl StreamCapture {
     }
 
     /// Restores the original fd (which closes the last pipe write end and so
-    /// unblocks the reader thread) and collects the captured bytes.
+    /// unblocks the reader thread) and collects the captured bytes or a reader
+    /// I/O error.
     ///
     /// The wait is capped at a *total* budget from entry: on macOS
     /// `posix_spawn` inherits every fd regardless of FD_CLOEXEC, so a child
@@ -230,14 +255,14 @@ impl StreamCapture {
     /// caller forever. A child that never exits also leaves the detached
     /// reader thread blocked in read() until it does (one thread + fd per
     /// such run — documented trade-off).
-    fn finish(mut self) -> (Vec<u8>, bool) {
+    fn finish(mut self) -> Result<(Vec<u8>, bool), std::io::Error> {
         // Defensive: finish() consumes self, so this can only trigger on a
         // double-finish bookkeeping bug. Never dup2 a closed fd number.
         let Some(saved) = self.saved.take() else {
-            return (
+            return Ok((
                 Vec::new(),
                 self.overflow.load(std::sync::atomic::Ordering::Relaxed),
-            );
+            ));
         };
         // SAFETY: `saved` is a valid open fd; failure to restore leaves the
         // host's fd 1/2 pointed at the pipe with no way back — the host's
@@ -258,25 +283,30 @@ impl StreamCapture {
         unsafe {
             libc::close(saved);
         }
-        // Collect blocks until EOF (channel closed) or the budget expires.
-        // The budget only fires when a spawned child holds the write end
-        // open; on every normal run EOF arrives right after the restore
-        // above.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        let mut out = Vec::new();
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            match self.rx.recv_timeout(remaining) {
-                Ok(block) => out.extend_from_slice(&block),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        (
-            out,
-            self.overflow.load(std::sync::atomic::Ordering::Relaxed),
-        )
+        collect_blocks(&self.rx, &self.overflow)
     }
+}
+
+/// Collects reader messages until EOF or the detached-child wait budget.
+/// Reader errors are not interchangeable with EOF: callers must see them.
+fn collect_blocks(
+    rx: &std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+    overflow: &std::sync::atomic::AtomicBool,
+) -> Result<(Vec<u8>, bool), std::io::Error> {
+    // The budget only fires when a spawned child holds the write end open; on
+    // every normal run EOF arrives right after the fd restore.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut out = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(block)) => out.extend_from_slice(&block),
+            Ok(Err(error)) => return Err(error),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok((out, overflow.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
 impl Drop for StreamCapture {
@@ -295,5 +325,24 @@ impl Drop for StreamCapture {
                 libc::close(saved);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_blocks;
+
+    #[test]
+    fn reader_error_is_not_treated_as_eof() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "synthetic capture read failure",
+        )))
+        .unwrap();
+        let overflow = std::sync::atomic::AtomicBool::new(false);
+        let error = collect_blocks(&rx, &overflow).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "synthetic capture read failure");
     }
 }

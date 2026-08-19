@@ -411,12 +411,19 @@ pub(crate) fn node_ipc_init() -> Option<(i64, ChildIpcSerialization)> {
     if !NODE_IPC_MARKER.get().copied().unwrap_or(false) {
         return None;
     }
-    let fd = std::env::var("NODE_CHANNEL_FD").ok()?.parse::<i64>().ok()?;
+    let fd = parse_node_channel_fd(&std::env::var("NODE_CHANNEL_FD").ok()?)?;
     let serialization = match std::env::var("NODE_CHANNEL_SERIALIZATION_MODE").as_deref() {
         Ok("advanced") => ChildIpcSerialization::Advanced,
         _ => ChildIpcSerialization::Json,
     };
     Some((fd, serialization))
+}
+
+/// Parses the inherited Node IPC descriptor without allowing a negative value
+/// to become an invalid OS fd later in the setup path.
+fn parse_node_channel_fd(value: &str) -> Option<i64> {
+    let fd = value.parse::<i64>().ok()?;
+    (fd >= 0).then_some(fd)
 }
 
 #[cfg(test)]
@@ -565,5 +572,20 @@ mod tests {
         // A non-numeric FD is rejected, never adopted.
         std::env::set_var("NODE_CHANNEL_FD", "not-a-fd");
         assert!(node_ipc_init().is_none());
+    }
+
+    #[test]
+    fn parse_node_channel_fd_rejects_negative_values() {
+        assert_eq!(parse_node_channel_fd("-1"), None);
+    }
+
+    #[test]
+    fn parse_node_channel_fd_rejects_non_numeric_values() {
+        assert_eq!(parse_node_channel_fd("not-a-fd"), None);
+    }
+
+    #[test]
+    fn parse_node_channel_fd_accepts_normal_values() {
+        assert_eq!(parse_node_channel_fd("10"), Some(10));
     }
 }

@@ -167,6 +167,61 @@ class ApiTests(unittest.TestCase):
             0,
         )
 
+    def test_bytes_and_custom_fspath_paths(self):
+        directory = self.root / "bytes-paths"
+        entry = directory / "entry.js"
+        directory.mkdir()
+        entry.write_text("const ok = true;", encoding="utf-8")
+
+        self.assertEqual(
+            libdeno.run(
+                os.fsencode(str(entry)),
+                cwd=os.fsencode(str(directory)),
+                allow_all_permissions=True,
+            ),
+            0,
+        )
+
+        class StringPathLike:
+            def __init__(self, path):
+                self.path = path
+
+            def __fspath__(self):
+                return str(self.path)
+
+        class BytesPathLike:
+            def __init__(self, path):
+                self.path = path
+
+            def __fspath__(self):
+                return os.fsencode(str(self.path))
+
+        self.assertEqual(
+            libdeno.run(
+                StringPathLike(entry),
+                cwd=StringPathLike(directory),
+                allow_all_permissions=True,
+            ),
+            0,
+        )
+        self.assertEqual(
+            libdeno.run(
+                BytesPathLike(entry),
+                cwd=BytesPathLike(directory),
+                allow_all_permissions=True,
+            ),
+            0,
+        )
+
+        class InvalidPathLike:
+            def __fspath__(self):
+                return 123
+
+        with self.assertRaises(libdeno.ConfigurationError):
+            libdeno.run(InvalidPathLike(), allow_all_permissions=True)
+        with self.assertRaises(libdeno.ConfigurationError):
+            libdeno.run(entry, cwd=InvalidPathLike(), allow_all_permissions=True)
+
     def test_parallel_python_threads_and_gil_progress(self):
         script = self.write(
             "peer.js",
