@@ -1,9 +1,10 @@
-# Publishes the crate to crates.io via trusted publishing (OIDC, no API token
-# secret) when a version tag (vX.Y.Z) is pushed, then creates a GitHub Release
-# so the repository's main page shows the release in the sidebar.
+# Rust and Python production publishing share this workflow: one version tag
+# (vX.Y.Z) publishes the crate to crates.io and wheels to PyPI via trusted
+# publishing (OIDC, no API token secrets), then creates a GitHub Release.
 #
-# The tag version must match the `version` field in Cargo.toml; bump both
-# together before tagging (the workflow enforces this).
+# The tag version must match the version fields in the root Cargo.toml,
+# python/pyproject.toml, and python/Cargo.toml; bump them together before
+# tagging (the workflow enforces this).
 #
 # The job declares `environment: crates-io` so GitHub Actions itself records
 # the deployment (job outcome = deployment status). Only Actions-created
@@ -16,6 +17,9 @@
 # 2. crates.io -> crate page -> Settings -> Trusted Publishing -> Add ->
 #    GitHub: owner `agentsyaml`, repo `libdeno`, workflow `release.yml`,
 #    bind the external publisher to environment `crates-io`.
+# 3. PyPI -> Account -> Publishing -> Add pending publisher (or the existing
+#    project -> Manage -> Publishing): owner `agentsyaml`, repo `libdeno`,
+#    workflow `release.yml`, environment `pypi`.
 name: Release
 
 on:
@@ -24,7 +28,7 @@ on:
       - "v*"
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 permissions: {}
@@ -50,15 +54,23 @@ jobs:
         with:
           tool: cargo-audit
 
-      # Tag and Cargo.toml must agree; otherwise the tag would say one version
-      # while crates.io receives another.
-      - name: Verify tag matches Cargo.toml
+      # Every published artifact must carry the version named by the tag.
+      - name: Verify release versions
+        shell: bash
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          test "$tag" = "$crate" || {
-            echo "tag v$tag does not match Cargo.toml version $crate"; exit 1;
-          }
+          set -euo pipefail
+          case "$GITHUB_REF_NAME" in
+            v*) tag="${GITHUB_REF_NAME#v}" ;;
+            *) echo "expected a vX.Y.Z tag, got $GITHUB_REF_NAME"; exit 1 ;;
+          esac
+          root_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          python_project_version="$(sed -n 's/^version = "\(.*\)"/\1/p' python/pyproject.toml | head -1)"
+          python_crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' python/Cargo.toml | head -1)"
+          for version in "$root_version" "$python_project_version" "$python_crate_version"; do
+            test "$tag" = "$version" || {
+              echo "tag v$tag does not match release version $version"; exit 1;
+            }
+          done
 
       - name: Test
         run: cargo test --all-targets --locked
@@ -66,13 +78,95 @@ jobs:
       - name: Package
         run: cargo package --locked --no-verify
 
-      - name: Audit
+      - name: Audit root lockfile
         run: cargo audit --deny warnings
 
-  publish:
+      - name: Audit Python lockfile
+        run: cargo audit --file python/Cargo.lock --deny warnings
+
+  python-build:
+    name: build Python wheels
+    needs: preflight
+    uses: ./.github/workflows/python.yml
+    permissions:
+      contents: read
+
+  python-verify:
+    name: verify Python wheels
+    needs: python-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: libdeno-wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check wheel versions against the release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF_NAME" in
+            v*) tag_version="${GITHUB_REF_NAME#v}" ;;
+            *) echo "expected a vX.Y.Z tag, got $GITHUB_REF_NAME"; exit 1 ;;
+          esac
+          test -n "$tag_version"
+          EXPECTED_VERSION="$tag_version" python - <<'PY'
+          import os
+          import re
+          import zipfile
+          from email.parser import Parser
+          from pathlib import Path
+
+          wheels = sorted(Path("dist").glob("*.whl"))
+          if len(wheels) != 5:
+              raise SystemExit(f"expected exactly five wheel artifacts, found {len(wheels)}")
+
+          versions = {}
+          for wheel in wheels:
+              with zipfile.ZipFile(wheel) as archive:
+                  metadata_names = [
+                      name
+                      for name in archive.namelist()
+                      if re.fullmatch(r"[^/]+\.dist-info/METADATA", name)
+                  ]
+                  if len(metadata_names) != 1:
+                      raise SystemExit(
+                          f"{wheel.name}: expected exactly one *.dist-info/METADATA, "
+                          f"found {len(metadata_names)}"
+                      )
+                  metadata = Parser().parsestr(
+                      archive.read(metadata_names[0]).decode("utf-8")
+                  )
+                  values = metadata.get_all("Version") or []
+                  if len(values) != 1 or not values[0].strip():
+                      raise SystemExit(
+                          f"{wheel.name}: expected exactly one non-empty Version field"
+                      )
+                  versions.setdefault(values[0].strip(), []).append(wheel.name)
+
+          if len(versions) != 1:
+              raise SystemExit(f"wheel versions are inconsistent: {versions}")
+          version, names = next(iter(versions.items()))
+          expected = os.environ["EXPECTED_VERSION"]
+          if version != expected:
+              raise SystemExit(
+                  f"release tag version {expected!r} does not match wheel version {version!r}"
+              )
+          print(f"validated version {version} across {len(names)} wheels")
+          PY
+
+  publish-crates:
     name: publish to crates.io
     if: github.repository == 'agentsyaml/libdeno'
-    needs: preflight
+    needs: [preflight, python-verify]
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
@@ -101,9 +195,38 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked
 
+  publish-pypi:
+    name: publish to PyPI
+    if: github.repository == 'agentsyaml/libdeno'
+    needs: [preflight, python-verify]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: pypi-publish-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: libdeno-wheel-*
+          path: dist
+          merge-multiple: true
+
+      # Confirmed full SHA for the official PyPI Docker action.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          packages-dir: dist
+
   github-release:
     name: create GitHub Release
-    needs: publish
+    if: >-
+      github.repository == 'agentsyaml/libdeno' &&
+      needs.publish-crates.result == 'success' &&
+      needs.publish-pypi.result == 'success'
+    needs: [publish-crates, publish-pypi]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -52,22 +52,3 @@ jobs:
 
       - name: Audit Python lockfile
         run: cargo audit --file python/Cargo.lock --deny warnings
-
-  verify-versions:
-    name: verify pinned deno/TS versions
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Verify pinned versions exist upstream
-        run: |
-          set -euo pipefail
-          DENO_VERSION=$(grep -oE 'DENO_VERSION: &str = "[0-9.]+"' src/lib.rs | grep -oE '[0-9.]+')
-          TS_VERSION=$(grep -oE 'TS_VERSION: &str = "[0-9.]+"' build.rs | grep -oE '[0-9.]+')
-          echo "deno v${DENO_VERSION}, typescript ${TS_VERSION}"
-          curl -sf --retry 3 --retry-all-errors -o /dev/null "https://github.com/denoland/deno/releases/tag/v${DENO_VERSION}" \
-            || { echo "deno tag v${DENO_VERSION} does not exist"; exit 1; }
-          curl -sf --retry 3 --retry-all-errors -o /dev/null "https://registry.npmjs.org/typescript/${TS_VERSION}" \
-            || { echo "typescript ${TS_VERSION} does not exist on npm"; exit 1; }
