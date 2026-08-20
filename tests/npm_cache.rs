@@ -548,18 +548,7 @@ fn child_process_fork_uses_the_parent_npm_snapshot() {
     let done = dir.join("done");
     let child = dir.join("fork-child.cjs");
     let parent = dir.join("fork-parent.cjs");
-    let demo = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .and_then(Path::parent)
-        .unwrap()
-        .join("examples")
-        .join(format!("demo{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        demo.is_file(),
-        "build the demo host before running the fork E2E: {}",
-        demo.display()
-    );
+    let child_host = PathBuf::from(env!("CARGO_BIN_EXE_child_host"));
 
     std::fs::write(
         &child,
@@ -579,7 +568,7 @@ const {{ fork }} = require('node:child_process');
 const pkg = (await import('npm:mock-pkg')).default;
 fs.writeFileSync({ready}, pkg);
 while (!fs.existsSync({release})) await new Promise((resolve) => setTimeout(resolve, 10));
-const child = fork({child}, [], {{ execPath: {demo} }});
+const child = fork({child}, [], {{ execPath: {child_host} }});
 await new Promise((resolve, reject) => {{
   let gotMessage = false;
   let settled = false;
@@ -608,7 +597,7 @@ fs.writeFileSync({done}, pkg);
             ready = quote(&ready),
             release = quote(&release),
             child = quote(&child),
-            demo = quote(&demo),
+            child_host = quote(&child_host),
             done = quote(&done),
         ),
     )
