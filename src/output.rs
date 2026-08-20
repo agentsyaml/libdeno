@@ -13,6 +13,52 @@
 //! reader steal its output; host-side concurrent printing is a documented
 //! caveat.
 
+/// One detached reader and its pipe are kept for every captured stream. A
+/// child that inherits a pipe write end can keep that reader blocked after the
+/// run's 500ms collection budget; bound those retained resources instead of
+/// allowing an unbounded number of blocked threads/fds.
+const MAX_ACTIVE_CAPTURE_READERS: usize = 64;
+static ACTIVE_CAPTURE_READERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct CaptureReaderBudget;
+
+impl Drop for CaptureReaderBudget {
+    fn drop(&mut self) {
+        let previous = ACTIVE_CAPTURE_READERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(
+            previous > 0,
+            "capture reader budget released without a reservation"
+        );
+    }
+}
+
+#[cfg(test)]
+fn active_capture_readers() -> usize {
+    ACTIVE_CAPTURE_READERS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn reserve_capture_reader() -> Result<CaptureReaderBudget, std::io::Error> {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+
+    let mut active = ACTIVE_CAPTURE_READERS.load(Acquire);
+    loop {
+        if active >= MAX_ACTIVE_CAPTURE_READERS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "output capture reader/pipe resource budget exhausted: {} active, maximum {}",
+                    active, MAX_ACTIVE_CAPTURE_READERS
+                ),
+            ));
+        }
+        match ACTIVE_CAPTURE_READERS.compare_exchange_weak(active, active + 1, AcqRel, Acquire) {
+            Ok(_) => return Ok(CaptureReaderBudget),
+            Err(next) => active = next,
+        }
+    }
+}
+
 // Fds are plain libc::c_int (CRT fds) on every platform: libc's pipe/dup/
 // dup2/read/close all speak CRT fds, and std::os::fd (OwnedFd) does not exist
 // on Windows. Closing is explicit at the two exit points (finish / Drop).
@@ -97,6 +143,7 @@ struct StreamCapture {
 
 impl StreamCapture {
     fn new(fd: libc::c_int, max_bytes: Option<usize>) -> Result<Self, std::io::Error> {
+        let reader_budget = reserve_capture_reader()?;
         let mut fds = [0; 2];
         let rc = unsafe {
             #[cfg(unix)]
@@ -172,65 +219,96 @@ impl StreamCapture {
         // holds the pipe write end (macOS posix_spawn ignores FD_CLOEXEC).
         // The thread ends on its own once EOF arrives, the receiver
         // disconnects, or the byte cap is hit.
-        let _ = std::thread::spawn(move || {
-            let mut buf = [0u8; 65536];
-            let mut total: usize = 0;
-            let mut discarding = false;
-            loop {
-                // read()'s count type differs per platform: size_t on unix,
-                // unsigned int on Windows. Mutually exclusive cfg bindings
-                // (a shadowed binding would trip -D warnings on Windows).
-                #[cfg(not(windows))]
-                let count = buf.len();
-                #[cfg(windows)]
-                let count = buf.len() as libc::c_uint;
-                let n =
-                    unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, count) };
-                if n < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.kind() == std::io::ErrorKind::Interrupted {
-                        continue; // EINTR (e.g. a signal handler): retry, don't truncate
-                    }
-                    let _ = tx.send(Err(error));
-                    break;
-                }
-                if n == 0 {
-                    break; // EOF
-                }
-                // After the cap fires the thread keeps draining and
-                // discarding (never closing the read end): the pipe's write
-                // end is the script's fd 1/2, so closing it here would make
-                // the script's subsequent writes fail with EPIPE mid-run.
-                // Draining also keeps a blocked writer flowing. The drain
-                // ends when finish() restores the fds (EOF) or the receiver
-                // disconnects.
-                if discarding {
-                    continue;
-                }
-                total += n as usize;
-                // On the block that crosses the cap, keep the part that fits
-                // and drop the rest — the buffer never exceeds max_bytes and
-                // still contains "the first max_bytes".
-                if let Some(max) = max_bytes {
-                    if total > max {
-                        let over = total - max;
-                        let keep = n as usize - over;
-                        if keep > 0 && tx.send(Ok(buf[..keep].to_vec())).is_err() {
-                            break;
+        let reader = std::thread::Builder::new()
+            .name("libdeno-output-reader".to_string())
+            .spawn(move || {
+                let mut buf = [0u8; 65536];
+                let mut total: usize = 0;
+                let mut discarding = false;
+                let mut read_error = None;
+                loop {
+                    // read()'s count type differs per platform: size_t on unix,
+                    // unsigned int on Windows. Mutually exclusive cfg bindings
+                    // (a shadowed binding would trip -D warnings on Windows).
+                    #[cfg(not(windows))]
+                    let count = buf.len();
+                    #[cfg(windows)]
+                    let count = buf.len() as libc::c_uint;
+                    let n = unsafe {
+                        libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, count)
+                    };
+                    if n < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue; // EINTR (e.g. a signal handler): retry, don't truncate
                         }
-                        overflow_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                        discarding = true;
+                        read_error = Some(error);
+                        break;
+                    }
+                    if n == 0 {
+                        break; // EOF
+                    }
+                    // After the cap fires the thread keeps draining and
+                    // discarding (never closing the read end): the pipe's write
+                    // end is the script's fd 1/2, so closing it here would make
+                    // the script's subsequent writes fail with EPIPE mid-run.
+                    // Draining also keeps a blocked writer flowing. The drain
+                    // ends when finish() restores the fds (EOF) or the receiver
+                    // disconnects.
+                    if discarding {
                         continue;
                     }
+                    total += n as usize;
+                    // On the block that crosses the cap, keep the part that fits
+                    // and drop the rest — the buffer never exceeds max_bytes and
+                    // still contains "the first max_bytes".
+                    if let Some(max) = max_bytes {
+                        if total > max {
+                            let over = total - max;
+                            let keep = n as usize - over;
+                            if keep > 0 && tx.send(Ok(buf[..keep].to_vec())).is_err() {
+                                break;
+                            }
+                            overflow_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            discarding = true;
+                            continue;
+                        }
+                    }
+                    if tx.send(Ok(buf[..n as usize].to_vec())).is_err() {
+                        break; // receiver gave up (finish timeout); stop reading
+                    }
                 }
-                if tx.send(Ok(buf[..n as usize].to_vec())).is_err() {
-                    break; // receiver gave up (finish timeout); stop reading
+                unsafe {
+                    libc::close(read_fd);
                 }
+                // Release the budget only after the pipe read end has actually
+                // closed. In particular, a timed-out detached child keeps this
+                // reservation while the reader remains blocked in read().
+                drop(reader_budget);
+                if let Some(error) = read_error {
+                    let _ = tx.send(Err(error));
+                }
+            });
+        if let Err(error) = reader {
+            // The closure (and its budget reservation) is dropped when thread
+            // creation fails. Restore the target fd and close the reader end
+            // so a failed capture cannot leave stdio redirected or leak a
+            // pipe.
+            if unsafe { libc::dup2(dup_fd, fd) } < 0 {
+                eprintln!(
+                    "libdeno: failed to restore fd {} after output reader spawn failed: {}; \
+                     aborting to avoid silent stdio corruption",
+                    fd,
+                    std::io::Error::last_os_error()
+                );
+                std::process::abort();
             }
             unsafe {
+                libc::close(dup_fd);
                 libc::close(read_fd);
             }
-        });
+            return Err(error);
+        }
         Ok(Self {
             target: fd,
             saved,
@@ -330,7 +408,12 @@ impl Drop for StreamCapture {
 
 #[cfg(test)]
 mod tests {
+    use super::active_capture_readers;
     use super::collect_blocks;
+    use super::reserve_capture_reader;
+    use super::MAX_ACTIVE_CAPTURE_READERS;
+
+    static CAPTURE_READER_BUDGET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn reader_error_is_not_treated_as_eof() {
@@ -344,5 +427,60 @@ mod tests {
         let error = collect_blocks(&rx, &overflow).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         assert_eq!(error.to_string(), "synthetic capture read failure");
+    }
+
+    #[test]
+    fn reader_budget_is_finite_and_releases_exactly() {
+        let _lock = CAPTURE_READER_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let baseline = active_capture_readers();
+        assert!(baseline <= MAX_ACTIVE_CAPTURE_READERS);
+        let available = MAX_ACTIVE_CAPTURE_READERS - baseline;
+        let mut reservations = Vec::with_capacity(available);
+        for _ in 0..available {
+            reservations.push(reserve_capture_reader().unwrap());
+        }
+        assert_eq!(active_capture_readers(), MAX_ACTIVE_CAPTURE_READERS);
+        let error = match reserve_capture_reader() {
+            Ok(_) => panic!("reader budget must reject a new reservation at its limit"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("reader/pipe resource budget"));
+        drop(reservations);
+        assert_eq!(active_capture_readers(), baseline);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_budget_releases_after_normal_eof() {
+        use std::os::fd::AsRawFd;
+
+        let _lock = CAPTURE_READER_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let target = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let baseline = active_capture_readers();
+        let capture = super::StreamCapture::new(target.as_raw_fd(), None).unwrap();
+        assert_eq!(active_capture_readers(), baseline + 1);
+
+        let message = b"normal eof";
+        let written = unsafe {
+            libc::write(
+                target.as_raw_fd(),
+                message.as_ptr() as *const libc::c_void,
+                message.len(),
+            )
+        };
+        assert_eq!(written, message.len() as isize);
+        let (captured, truncated) = capture.finish().unwrap();
+        assert_eq!(captured, message);
+        assert!(!truncated);
+        assert_eq!(active_capture_readers(), baseline);
     }
 }

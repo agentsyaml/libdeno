@@ -14,6 +14,20 @@ keywords = ["deno", "runtime", "embed", "npm", "javascript"]
 categories = ["api-bindings", "development-tools"]
 authors = ["Zhenxing Sun <zhenxing.sun@irootech.com>"]
 
+# Checked-in compatibility ledger for the upstream Deno snapshot. Cargo does
+# not expose the Deno CLI or bundled TypeScript compiler versions, so these
+# values are sourced manually from the matching upstream tag. The offline CI
+# and release checks compare this ledger with the local source/dependency
+# declarations; they deliberately do not claim to query or prove upstream
+# provenance.
+[package.metadata.libdeno.upstream]
+deno-version = "2.9.5"
+typescript-version = "6.0.3"
+deno-runtime-version = "0.265.0"
+deno-core-version = "0.410.0"
+deno-resolver-version = "0.88.0"
+deno-graph-version = "0.110.1"
+
 [[example]]
 name = "demo"
 path = "examples/demo.rs"

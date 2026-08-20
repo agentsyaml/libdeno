@@ -81,18 +81,16 @@ fn create_cli_snapshot(snapshot_path: &Path, residual_path: &Path, out_dir: &Pat
     // the tag for deno_runtime 0.265.0 (v2.9.5) — update in lockstep with the
     // deno_runtime bump (see the format assertion below).
     //
-    // There is no public constant to machine-check this against, so syncing
-    // it stays a manual step: when bumping deno_runtime, copy TS_VERSION by
-    // hand from the corresponding deno tag's cli/snapshot/shared.rs. The
-    // format assertion below only catches malformed values — it cannot catch
-    // a well-formed but wrong version. A CI check comparing this value to the
-    // deno tag could close that gap; left for a future change (out of scope
-    // here).
+    // There is no public constant to machine-check this against. The checked-in
+    // Cargo.toml compatibility ledger and the offline CI/release checks catch
+    // local declaration drift, but they cannot prove upstream provenance. When
+    // bumping deno_runtime, manually copy TS_VERSION from the corresponding
+    // deno tag's cli/snapshot/shared.rs and update that ledger together.
     const TS_VERSION: &str = "6.0.3";
     // Sanity check: TS_VERSION must be a bare x.y.z version. This only
     // catches malformed values, not a wrong-but-well-formed one; upgrading
-    // deno_runtime still requires syncing TS_VERSION by hand to the new
-    // tag's cli/snapshot/shared.rs.
+    // deno_runtime still requires the manual upstream-tag check described
+    // above.
     let ts_version_parts: Vec<&str> = TS_VERSION.split('.').collect();
     assert!(
         ts_version_parts.len() == 3

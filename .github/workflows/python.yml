@@ -129,7 +129,8 @@ jobs:
 
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
-          python-version: "3.13"
+          # This leg is the real abi3-py39 smoke test for macOS.
+          python-version: "3.9"
 
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
@@ -196,6 +197,19 @@ jobs:
           test "${#final_wheels[@]}" -eq 1
           "$RUNNER_TEMP/libdeno-audit-venv/bin/delocate-listdeps" "${final_wheels[0]}"
 
+      - name: Verify abi3-py39 wheel tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          shopt -s nullglob
+          final_wheels=(python/target/wheels-final/*.whl)
+          test "${#final_wheels[@]}" -eq 1
+          case "$(basename "${final_wheels[0]}")" in
+            *-cp39-abi3-*.whl) ;;
+            *) echo "expected a cp39-abi3 wheel, got $(basename "${final_wheels[0]}")"; exit 1 ;;
+          esac
+
       - name: Smoke-test wheel in a fresh virtualenv
         shell: bash
         run: |
@@ -226,7 +240,8 @@ jobs:
 
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
-          python-version: "3.13"
+          # This leg is the real abi3-py39 smoke test for Windows.
+          python-version: "3.9"
 
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
@@ -300,6 +315,17 @@ jobs:
           $auditPython = Join-Path $env:RUNNER_TEMP 'libdeno-audit-venv/Scripts/python.exe'
           & $auditPython -m delvewheel show $finalWheels[0].FullName
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify abi3-py39 wheel tag
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $finalDir = Join-Path $env:GITHUB_WORKSPACE 'python/target/wheels-final'
+          $finalWheels = @(Get-ChildItem -LiteralPath $finalDir -Filter '*.whl' -File)
+          if ($finalWheels.Count -ne 1) { throw "expected one final wheel, found $($finalWheels.Count)" }
+          if ($finalWheels[0].Name -notmatch '-cp39-abi3-') {
+            throw "expected a cp39-abi3 wheel, got $($finalWheels[0].Name)"
+          }
 
       - name: Smoke-test wheel in a fresh virtualenv
         shell: pwsh
@@ -484,3 +510,37 @@ jobs:
           python -m venv "$twine_venv"
           "$twine_venv/bin/python" -m pip install --upgrade pip 'twine==7.0.0'
           "$twine_venv/bin/twine" check artifacts/*.whl
+
+      - name: Check all wheel tags are abi3-py39
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(artifacts/*.whl)
+          test "${#wheels[@]}" -eq 5
+          for wheel in "${wheels[@]}"; do
+            case "$(basename "$wheel")" in
+              *-cp39-abi3-*.whl) ;;
+              *) echo "expected a cp39-abi3 wheel, got $(basename "$wheel")"; exit 1 ;;
+            esac
+          done
+
+      - name: Check typing metadata is packaged
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = sorted(Path("artifacts").glob("*.whl"))
+          if len(wheels) != 5:
+              raise SystemExit(f"expected exactly five wheel artifacts, found {len(wheels)}")
+          required = {"libdeno/__init__.pyi", "libdeno/py.typed"}
+          for wheel in wheels:
+              with ZipFile(wheel) as archive:
+                  missing = required - set(archive.namelist())
+              if missing:
+                  raise SystemExit(f"{wheel.name}: missing wheel members {sorted(missing)}")
+          print("validated typing metadata in all wheels")
+          PY

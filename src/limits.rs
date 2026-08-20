@@ -18,6 +18,38 @@ use deno_runtime::code_cache::CodeCacheType;
 use deno_runtime::deno_node::ops::ipc::ChildIpcSerialization;
 use deno_runtime::worker::MainWorker;
 
+/// V8's own resource-constraint tests use an 8 MiB old generation as the
+/// smallest deliberately constrained isolate. Rejecting smaller values keeps
+/// the option from silently becoming an unusable V8 configuration while still
+/// avoiding an embedder-invented upper policy limit.
+const MIN_V8_OLD_GENERATION_BYTES: usize = 8 << 20;
+
+/// Validates the optional old-generation heap cap before any permission or V8
+/// setup. `None` keeps V8's defaults; there is no arbitrary upper policy cap,
+/// but zero/small values and the `usize` sentinel are rejected explicitly.
+pub(crate) fn validate_max_heap_bytes(
+    max_heap_bytes: Option<usize>,
+) -> Result<(), crate::LibdenoError> {
+    let Some(bytes) = max_heap_bytes else {
+        return Ok(());
+    };
+    if bytes < MIN_V8_OLD_GENERATION_BYTES {
+        return Err(crate::LibdenoError::Configuration(format!(
+            "max_heap_bytes={bytes} is too small; use at least \
+             {MIN_V8_OLD_GENERATION_BYTES} bytes for a V8 old-generation limit"
+        )));
+    }
+    // The V8 entry point takes `usize`; there is no unit conversion or policy
+    // ceiling here. Reject only the one value that cannot be a finite budget.
+    if bytes == usize::MAX {
+        return Err(crate::LibdenoError::Configuration(
+            "max_heap_bytes=usize::MAX cannot be represented as a finite V8 heap budget"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// V8 isolate creation parameters for a heap cap.
 ///
 /// Maps `max_heap_bytes` to the V8 old-generation limit — the same constraint
@@ -419,11 +451,31 @@ pub(crate) fn node_ipc_init() -> Option<(i64, ChildIpcSerialization)> {
     Some((fd, serialization))
 }
 
-/// Parses the inherited Node IPC descriptor without allowing a negative value
-/// to become an invalid OS fd later in the setup path.
+/// Parses the inherited Node IPC descriptor without allowing a malformed or
+/// out-of-range value to be cast into an invalid OS handle later in bootstrap.
+#[cfg(unix)]
 fn parse_node_channel_fd(value: &str) -> Option<i64> {
     let fd = value.parse::<i64>().ok()?;
-    (fd >= 0).then_some(fd)
+    (0..=i32::MAX as i64).contains(&fd).then_some(fd)
+}
+
+#[cfg(windows)]
+fn parse_node_channel_fd(value: &str) -> Option<i64> {
+    // deno_io consumes this as a raw HANDLE on Windows. Null and
+    // INVALID_HANDLE_VALUE are not usable handles; the conversion back to
+    // i64 also rejects a value that cannot be represented by the bootstrap
+    // tuple on a wider target.
+    let handle: usize = value.parse::<u64>().ok()?.try_into().ok()?;
+    if handle == 0 || handle == usize::MAX {
+        return None;
+    }
+    i64::try_from(handle).ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn parse_node_channel_fd(value: &str) -> Option<i64> {
+    let fd = value.parse::<i64>().ok()?;
+    (fd > 0).then_some(fd)
 }
 
 #[cfg(test)]
@@ -435,8 +487,18 @@ mod tests {
         // P2: max_heap_bytes must reach isolate creation as the V8
         // old-generation ceiling; None leaves V8 defaults untouched.
         assert!(isolate_create_params(None).is_none());
-        let params = isolate_create_params(Some(12345)).unwrap();
-        assert_eq!(params.max_old_generation_size_in_bytes(), 12345);
+        let bytes = 16 << 20;
+        let params = isolate_create_params(Some(bytes)).unwrap();
+        assert_eq!(params.max_old_generation_size_in_bytes(), bytes);
+    }
+
+    #[test]
+    fn invalid_heap_caps_are_rejected_before_v8_configuration() {
+        assert!(validate_max_heap_bytes(Some(0)).is_err());
+        assert!(validate_max_heap_bytes(Some(MIN_V8_OLD_GENERATION_BYTES - 1)).is_err());
+        assert!(validate_max_heap_bytes(Some(usize::MAX)).is_err());
+        assert!(validate_max_heap_bytes(Some(MIN_V8_OLD_GENERATION_BYTES)).is_ok());
+        assert!(validate_max_heap_bytes(None).is_ok());
     }
 
     #[test]
@@ -587,5 +649,22 @@ mod tests {
     #[test]
     fn parse_node_channel_fd_accepts_normal_values() {
         assert_eq!(parse_node_channel_fd("10"), Some(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_node_channel_fd_rejects_values_outside_raw_fd_range() {
+        assert_eq!(
+            parse_node_channel_fd(&(i32::MAX as i64 + 1).to_string()),
+            None
+        );
+        assert_eq!(parse_node_channel_fd(&i64::MAX.to_string()), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_node_channel_fd_rejects_null_and_invalid_handles() {
+        assert_eq!(parse_node_channel_fd("0"), None);
+        assert_eq!(parse_node_channel_fd(&u64::MAX.to_string()), None);
     }
 }

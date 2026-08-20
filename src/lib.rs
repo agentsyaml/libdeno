@@ -602,27 +602,31 @@ where
     }
 }
 
-/// FeatureChecker::enable_feature requires `&'static str`, but a host's
-/// feature list arrives as owned `String`s. Leak one `'static` copy per
-/// *unique* set and cache it: a long-lived host running the same features
-/// leaks exactly once, not once per run.
-fn static_feature_names(features: &[String]) -> Vec<&'static str> {
-    static CACHE: std::sync::Mutex<Vec<(Vec<String>, Vec<&'static str>)>> =
-        std::sync::Mutex::new(Vec::new());
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, names)) = cache.iter().find(|(key, _)| key == features) {
-        return names.clone();
+/// The default unstable runtime surface. Keep this as the only default list;
+/// tests exercise it through the runtime rather than mirroring the names.
+const DEFAULT_RUNTIME_FEATURES: &[&str] = &["kv", "cron", "ffi", "webgpu", "worker-options"];
+
+/// FeatureChecker::enable_feature requires `&'static str`, while a host's
+/// feature list arrives as owned `String`s. The deno registry already owns the
+/// static names, so map through it and retain first-seen order without leaking
+/// host-provided strings or retaining the input set.
+fn static_feature_names(features: &[String]) -> Result<Vec<&'static str>, String> {
+    let mut names = Vec::with_capacity(features.len().min(deno_features::UNSTABLE_FEATURES.len()));
+    for feature in features {
+        let Some(name) = deno_features::UNSTABLE_FEATURES
+            .iter()
+            .find(|definition| definition.name == feature)
+            .map(|definition| definition.name)
+        else {
+            return Err(feature.clone());
+        };
+        // FeatureChecker rejects duplicate enables; preserve the old
+        // duplicate-tolerant behavior while keeping caller order.
+        if !names.contains(&name) {
+            names.push(name);
+        }
     }
-    let mut seen = std::collections::HashSet::new();
-    let names: Vec<&'static str> = features
-        .iter()
-        // Deduplicate: FeatureChecker::enable_feature asserts on a duplicate
-        // insert and would panic the host process.
-        .filter(|s| seen.insert(s.as_str()))
-        .map(|s| Box::leak(s.clone().into_boxed_str()) as &'static str)
-        .collect();
-    cache.push((features.to_vec(), names.clone()));
-    names
+    Ok(names)
 }
 
 /// The actual run: a fresh current-thread runtime and the run lifecycle. Must
@@ -666,6 +670,11 @@ pub(crate) async fn run_inner_with(
     entry: &Path,
     options: &LibdenoOptions,
 ) -> Result<i32, LibdenoError> {
+    // Validate before permission construction, graph setup, or MainWorker/V8
+    // bootstrap. All ordinary, reusable, async, and subprocess-backed runs
+    // converge here, so an invalid cap cannot fall through to V8 defaults.
+    limits::validate_max_heap_bytes(options.max_heap_bytes)?;
+
     // rustls needs an explicit CryptoProvider (aws-lc-rs and ring are both
     // enabled in the dep graph); the deno CLI does the same. Only install when
     // the host has not already set one — install_default returns Err exactly
@@ -734,27 +743,13 @@ pub(crate) async fn run_inner_with(
 
     let blob_store = BlobStore::default_arc();
     let broadcast_channel = InMemoryBroadcastChannel::default();
-    // Default: "everything enabled" like `deno run --unstable` (kv, cron,
-    // ffi, webgpu, worker-options) — an embedded runtime has no flag surface
-    // unless the host opts in via `LibdenoOptions.features`. worker-options
-    // gates the worker `permissions`/`env`/`net` options in `new Worker(...)`
-    // (op_create_worker exits the process if the feature is off), so a
-    // custom set that omits it breaks worker permission narrowing. JS
-    // namespace IDs and FeatureChecker names must stay in sync.
-    const ENABLED_FEATURES: &[&str] = &["kv", "cron", "ffi", "webgpu", "worker-options"];
-    // Unknown feature names would be silent no-ops; fail loudly instead,
-    // consistent with how other bad option values surface (Configuration).
-    if let Some(features) = &options.features {
-        let valid: std::collections::HashSet<&str> = deno_features::UNSTABLE_FEATURES
-            .iter()
-            .map(|f| f.name)
-            .collect();
-        if let Some(bad) = features.iter().find(|f| !valid.contains(f.as_str())) {
-            return Err(LibdenoError::Configuration(format!(
-                "unknown runtime feature: {bad}"
-            )));
-        }
-    }
+    // Default: "everything enabled" like `deno run --unstable` — an embedded
+    // runtime has no flag surface unless the host opts in via
+    // `LibdenoOptions.features`. worker-options gates the worker
+    // `permissions`/`env`/`net` options in `new Worker(...)` (op_create_worker
+    // exits the process if the feature is off), so a custom set that omits it
+    // breaks worker permission narrowing. JS namespace IDs and
+    // FeatureChecker names must stay in sync.
     let enabled_features: Vec<&str> = match &options.features {
         Some(features) => {
             // worker-options is force-enabled regardless of the custom set:
@@ -762,13 +757,15 @@ pub(crate) async fn run_inner_with(
             // op_create_worker EXITS the process when the feature is off —
             // a host shrinking the surface for untrusted plugins must not
             // hand a plugin a way to kill the host.
-            let mut names = static_feature_names(features);
+            let mut names = static_feature_names(features).map_err(|bad| {
+                LibdenoError::Configuration(format!("unknown runtime feature: {bad}"))
+            })?;
             if !names.contains(&"worker-options") {
                 names.push("worker-options");
             }
             names
         }
-        None => ENABLED_FEATURES.to_vec(),
+        None => DEFAULT_RUNTIME_FEATURES.to_vec(),
     };
     let feature_checker = {
         let mut fc = deno_runtime::FeatureChecker::default();

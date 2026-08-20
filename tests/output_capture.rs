@@ -210,6 +210,26 @@ fn capture_within_budget_is_not_truncated() {
 }
 
 #[test]
+fn repeated_capture_does_not_exhaust_reader_budget() {
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // More sequential captures than the detached-reader budget: normal EOF
+    // must release each reader before the next capture is admitted.
+    let dir = temp_dir("reader-pressure");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('pressure');").unwrap();
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        capture_stdout: true,
+        ..Default::default()
+    };
+    for _ in 0..70 {
+        let out = run_with_output(&entry, &options).unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("pressure\n"));
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn run_with_reuses_stack_and_captures() {
     let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // The reusable-runtime path must honor capture too: long-lived hosts get

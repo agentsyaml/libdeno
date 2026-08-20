@@ -46,7 +46,7 @@ let exit_code = run("app.js", &options).unwrap();
 
 ### Reuse the resolver stack: `LibdenoRuntime` + `run_with`
 
-`run()` rebuilds the resolver stack (workspace / resolver / npm-installer factories, graph resolver) on every call. For long-lived hosts running many scripts in the same project, build the stack once and reuse it — it is rebuilt automatically when the config chain changes:
+`run()` rebuilds the resolver stack (workspace / resolver / npm-installer factories, graph resolver) on every call. For long-lived hosts running many scripts in the same project, build the stack once and reuse it — it is rebuilt automatically when the config chain changes. The fingerprint includes the project config chain, `deno.lock`, root `node_modules`, the effective registry, and the resolver-supported global npmrc (`$HOME/.npmrc`) by canonical path and content. `deno_resolver` 0.88 does not honor `NPM_CONFIG_USERCONFIG`. Call `runtime.refresh()` after changes below that chain, such as nested `node_modules`; refresh is an explicit bounded invalidation, not a recursive watcher:
 
 ```rust
 use libdeno::{LibdenoRuntime, LibdenoOptions, run_with};
@@ -56,7 +56,7 @@ let options = LibdenoOptions { allow_all_permissions: true, ..Default::default()
 let exit_code = run_with(&runtime, "app.js", &options).unwrap();
 ```
 
-Scripts resolve relative paths against the runtime's cwd (the process cwd is never switched, and `LibdenoOptions.cwd` is ignored as a resolution base) — the script itself observes the host's cwd. Each `run_with` still rebuilds the permission-bound file fetcher / graph loader / graph from its own `options.permissions`, so one run's grants can never leak into another.
+Scripts resolve relative entry/module paths against the runtime's cwd (the process cwd is never switched) — the script itself observes the host's cwd. `LibdenoOptions.cwd` may be omitted or must match the runtime's directory; a mismatched value is rejected with `LibdenoError::Configuration`. Each `run_with` still rebuilds the permission-bound file fetcher / graph loader / graph from its own `options.permissions`, so one run's grants can never leak into another.
 
 ### Run the demo
 
@@ -88,7 +88,8 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `run(entry, &options) -> Result<i32, LibdenoError>` | Runs the entry to completion and returns the exit code the script requested. Each call builds its own current-thread runtime and worker; ordinary runs execute fully in parallel — own thread, isolate, and graph, sharing nothing mutable (the process-global analysis / npm-snapshot / on-disk caches are safe shared state; the process cwd is never switched). Safe to call from inside a tokio runtime — the run executes on a fresh thread there (see below). |
 | `run_with_output(entry, &options) -> Result<RunOutput, LibdenoError>` | Like `run`, but also captures the script's stdout/stderr into `RunOutput` when `capture_stdout` / `capture_stderr` are set. |
 | `run_async(entry, &options) -> Result<i32, LibdenoError>` | Async entry point: runs the script on the **caller's** tokio runtime — no spawned thread. Must be awaited inside a tokio context; the future is not `Send` and a second `run_async` on one thread is rejected with `LibdenoError::Configuration` (interleaved runs would abort the process). Await one at a time — use `run` for parallel runs. |
-| `LibdenoRuntime::new(cwd)` | Builds the resolver stack for a project directory once (async). Reused by `run_with`; rebuilt automatically when the config chain (deno.json / deno.jsonc / import_map.json / package.json / .npmrc / node_modules) changes. |
+| `LibdenoRuntime::new(cwd)` | Builds the resolver stack for a project directory once (async). Reused by `run_with`; rebuilt automatically when the config chain (deno.json / deno.jsonc / import_map.json / package.json / `.npmrc` / `deno.lock` / `node_modules`) or effective npm registry / `$HOME/.npmrc` changes. |
+| `LibdenoRuntime::refresh()` | Forces the next reusable run to rebuild its resolver stack, for example after a nested `node_modules` change not visible in the discovered fingerprint. |
 | `run_with(&runtime, entry, &options) -> Result<i32, LibdenoError>` | Like `run`, but reuses `runtime`'s resolver stack. Semantics identical to `run` (parallel ordinary runs, tokio re-entry handling, exit codes, deadlines); relative paths resolve against the runtime's cwd and permission-bound components are rebuilt per call. Capture flags and a mismatched `options.cwd` are rejected with `LibdenoError::Configuration`. |
 | `libdeno::runtime::run_with_output(&runtime, entry, &options) -> Result<RunOutput, LibdenoError>` | Like `run_with`, but also captures the script's stdout/stderr into `RunOutput` when `capture_stdout` / `capture_stderr` are set — the long-lived-host equivalent of `run_with_output` (which rebuilds the resolver stack every call). Same semantics as `run_with` otherwise. |
 | `run_in_subprocess(entry, &options) -> Result<i32, LibdenoError>` | Runs the entry in a child process. `Deno.exit(n)` then terminates only the child; the host stays alive and observes `n`. The host must call `maybe_handle_child_mode()` at the start of `main()`. |
@@ -101,8 +102,8 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `LibdenoOptions.features: Option<Vec<String>>` | Overrides the default unstable feature set (`kv`, `cron`, `ffi`, `webgpu`, `worker-options`). Feature names must be valid deno unstable-feature names; `None` (default) enables the default set. An embedder running untrusted plugins can shrink the surface; the ops themselves stay permission-gated regardless. |
 | `LibdenoOptions.args: Vec<String>` | Arguments exposed to the script via `process.argv` (after argv[0]). |
 | `LibdenoOptions.cwd: Option<PathBuf>` | Resolution base that relative paths (entry, permissions, `node_modules` discovery) resolve against. Defaults to the process current directory. The process cwd is never switched — scripts observe the host's cwd (`Deno.cwd()`), so use `run_in_subprocess` for a per-run working directory. |
-| `LibdenoOptions.max_heap_bytes: Option<usize>` | In-process, best-effort constraint on the V8 old-generation heap in bytes; it does not cap native allocations, V8 external memory, host allocations, or child-process memory, and is not an OS/process memory boundary. Applies to the main worker **and** web workers spawned via `new Worker(...)`. |
-| `LibdenoOptions.execution_deadline: Option<Duration>` | In-process, best-effort deadline; it can interrupt JavaScript when V8 reaches an interruptible stack check and report `LibdenoError::Timeout`. It cannot interrupt blocking system calls, native code, child-process waits, or a blocked permission broker/hook, so the run may exceed the requested deadline. |
+| `LibdenoOptions.max_heap_bytes: Option<usize>` | In-process, best-effort constraint on the V8 old-generation heap in bytes; values below 8 MiB are rejected. It does not cap native allocations, V8 external memory, host allocations, RSS, CPU, or child-process memory, and is not an OS/process boundary. Applies to the main worker **and** web workers spawned via `new Worker(...)`. |
+| `LibdenoOptions.execution_deadline: Option<Duration>` | In-process, best-effort deadline; it can interrupt JavaScript when V8 reaches an interruptible stack check and report `LibdenoError::Timeout`. It cannot interrupt blocking system calls, native code, child-process waits, or a blocked permission broker/hook, so the run may exceed the requested deadline; it is not a CPU-time limit. |
 | `LibdenoError` | Enum: `Entry` (entry resolution failed), `Permission` (invalid permission flags), `Configuration` (options that cannot form a valid configuration, e.g. an empty permission list without opt-in), `Runtime` (runtime startup / script failure — JS exceptions surface here), `Core` (reserved; never constructed for script errors), `Io`, `Timeout` (deadline exceeded / subprocess handshake timed out; the message says which). |
 
 ### Async hosts (tokio/axum)
@@ -163,6 +164,24 @@ instead — the child's own fds are piped, so it works on Windows). `run_with`
 does not support capture at all — use `run_with_output`, or the
 reusable-stack variant `libdeno::runtime::run_with_output(&runtime, ...)` for a long-lived host
 running many scripts.
+
+### Resource boundaries
+
+- Remote module bodies and npm metadata are capped at 256 MiB after
+  decompression. An explicit npm `.tgz` path is capped at 1 GiB of downloaded
+  bytes; its gzip `ISIZE` is checked against a default 1 GiB decompressed
+  budget (`LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES` overrides it). These are
+  bounded guards, not exact multi-member gzip accounting.
+- Each HTTP operation has a 300-second wall-clock budget for retries, backoff,
+  applicable redirects, and body reads. This is separate from
+  `execution_deadline`.
+- npm lifecycle scripts are disabled by default. If enabled, the direct child
+  is supervised for 60 seconds, followed by up to five seconds to kill/wait;
+  descendants are not supervised.
+- Subprocess mode contains the direct child's `Deno.exit` and hard runtime
+  termination, but does not promise complete process-tree cleanup. No API here
+  provides an RSS or CPU hard-isolation boundary; use an OS-level supervisor
+  or sandbox when that is required.
 
 Supported permission flags: `--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-import[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`, plus `-A` / `--allow-all`. `--allow-import` gates remote module loading (there is no `--allow-net` fallback); static and dynamic file imports are gated by `--allow-read`.
 

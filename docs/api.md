@@ -28,6 +28,12 @@ Behavior notes:
 - Since v0.2.0 every remote module fetch is capped at 256 MiB regardless of
   the declared `Content-Length`; the 1 GiB tier applies only to npm registry
   (tarball) downloads.
+- Each HTTP operation has a 300-second wall-clock budget covering its retries,
+  backoff, redirects where applicable, and response-body reads. This transport
+  budget is separate from `execution_deadline`.
+- npm lifecycle scripts are disabled by default. If an embedder/configuration
+  enables them, each direct lifecycle child is supervised for 60 seconds and a
+  kill is followed by a five-second wait; descendants are not supervised.
 - Safe to call from inside a tokio runtime: the run executes on a fresh
   thread (tokio forbids nested runtimes) and joins back. Same for
   `run_with_output` and `run_with`.
@@ -145,6 +151,7 @@ pub struct LibdenoRuntime { /* Clone + Send + Sync; its only state is an Arc<Mut
 
 impl LibdenoRuntime {
   pub async fn new(cwd: impl AsRef<Path>) -> Result<Self, LibdenoError>;
+  pub fn refresh(&self);
 
   pub async fn run_async(
     &self,
@@ -180,18 +187,23 @@ builds the permission-free half of that stack once and `run_with` /
 
 - `LibdenoRuntime::new` is **async** — stack construction needs a tokio
   context. The stack is rebuilt automatically when the config chain changes
-  (deno.json / deno.jsonc / import_map.json / package.json / .npmrc /
-  node_modules at the project root and its ancestors): `run_with` recomputes
-  a fingerprint and swaps the stack when it diverges.
+  (deno.json / deno.jsonc / import_map.json / package.json / `.npmrc`,
+  `deno.lock`, and `node_modules` at the project root and its ancestors):
+  `run_with` recomputes a fingerprint and swaps the stack when it diverges.
+  The npm part of the fingerprint includes the effective registry and the
+  resolver-supported global npmrc (`$HOME/.npmrc`) by canonical path and
+  content. `deno_resolver` 0.88 does not honor `NPM_CONFIG_USERCONFIG`. Call
+  `runtime.refresh()` to force the next run to rebuild after changes below the
+  discovered chain, such as nested `node_modules`; this is an explicit bounded
+  invalidation, not a recursive watcher/hash.
 - `run_with` semantics match `run` — ordinary runs are fully parallel, tokio
   re-entry handled automatically (fresh thread inside a tokio runtime),
   `Deno.exit(n)` / exit codes / deadlines identical. The script runs in the
   host's cwd and the process cwd is never switched. `LibdenoOptions.cwd` is
-  honored only when it matches the runtime's directory (canonicalize-aware
-  comparison); a mismatched `cwd` is **rejected** with
+  omitted by default; when provided it must match the runtime's directory
+  (canonicalize-aware comparison), otherwise a mismatched `cwd` is **rejected** with
   `LibdenoError::Configuration` — the stack is scoped to the runtime's
-  directory, so a different base would silently resolve elsewhere. Omit
-  `cwd`, or build the runtime for that directory. Permissions come from
+  directory, so a different base would silently resolve elsewhere. Permissions come from
   `options` per run: the permission-bound file fetcher / graph loader / graph
   are rebuilt each call, so one run's grants never leak into another.
 - `run_with` **rejects** `capture_stdout` / `capture_stderr` with
@@ -304,6 +316,23 @@ only makes sense for in-process `run`.
 
 Arguments exposed to the script via `process.argv` (after argv[0]).
 
+### `max_heap_bytes`
+
+An in-process, best-effort constraint on the V8 old-generation heap in bytes.
+The minimum accepted value is 8 MiB; smaller values and `usize::MAX` are
+rejected with `LibdenoError::Configuration`. It does not cap native
+allocations, V8 external memory, host allocations, RSS, CPU, or child-process
+memory, and is not an OS/process memory boundary. The constraint applies to
+the main worker and web workers created with `new Worker(...)`.
+
+### `execution_deadline`
+
+An in-process, best-effort execution deadline. When V8 reaches an interruptible
+stack check, the isolate is terminated and `LibdenoError::Timeout` is returned.
+It cannot interrupt a blocking system call, native code, a child-process wait,
+or a blocked permission broker/hook, so a run can exceed the requested
+duration. The deadline is not the HTTP transport budget described above.
+
 ### `cwd`
 
 Resolution base that relative paths (entry, permissions, `node_modules`
@@ -333,7 +362,10 @@ Per-stream cap on captured output (stdout and stderr each get this budget).
 When a stream exceeds it, capture stops, the excess is dropped, and
 `RunOutput::capture_truncated` is set — a verbose or hostile script can no
 longer grow host memory without limit. `None` (default) captures without a
-bound.
+bound. In-process capture remains process-global and exclusive; subprocess
+capture drains the child's pipes while retaining only the bounded prefix.
+In-process fd capture is rejected on Windows; use
+`run_in_subprocess_with_output` there.
 
 ### `features`
 
@@ -344,6 +376,26 @@ namespace IDs and feature checks are wired into the runtime. `None` (default)
 enables the default set. An embedder running untrusted plugins can shrink the
 surface (e.g. `Some(vec!["ffi".into()])`); the ops themselves stay
 permission-gated regardless.
+
+## Resource and supervision boundaries
+
+- Remote module response bodies are capped at 256 MiB after transport
+  decompression, regardless of `Content-Length`. npm registry metadata uses
+  the same cap; an explicit `.tgz` tarball path has a 1 GiB compressed-byte
+  cap. A tarball's gzip `ISIZE` is checked against a default 1 GiB
+  decompressed budget, configurable with
+  `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`; this is a coarse guard, not an
+  exact multi-member gzip total.
+- The HTTP client allows 300 seconds per operation for retries, backoff,
+  redirects on the npm path, and body reads. Remote-module redirects are
+  handled by the file fetcher rather than followed by the HTTP client.
+- npm lifecycle scripts are disabled by default. When enabled, the direct
+  lifecycle child has a 60-second run budget and a five-second kill/wait
+  cleanup window. Descendants are not supervised.
+- `run_in_subprocess` contains `Deno.exit` and hard runtime termination to the
+  direct child, but does not promise complete process-tree cleanup or a
+  cross-platform process-group/Windows Job Object boundary. Neither
+  `max_heap_bytes` nor `execution_deadline` provides an RSS or CPU hard limit.
 
 ## `LibdenoError`
 
@@ -396,6 +448,12 @@ Requirements:
   the full unstable surface). The capture flags are not forwarded — the
   child writes to the inherited fds; use `run_in_subprocess_with_output` to
   pipe the child's own fds back to the parent.
+- The JSON request is capped at 1 MiB and the parent write/child read
+  handshake is bounded at 10 seconds. This protects the handshake, not the
+  lifetime or resource use of the child's descendants.
+- Only the direct child is observed and reaped. No complete process-tree,
+  RSS, or CPU hard-isolation guarantee is provided; use an OS-level supervisor
+  or sandbox when those boundaries matter.
 
 `LIBDENO_HOST_EXE` overrides the executable spawned (defaults to
 `current_exe()`); integration tests use this to point at a dedicated host.

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use libdeno::{run, LibdenoOptions};
+use libdeno::{run, run_with, LibdenoOptions, LibdenoRuntime};
 
 /// Serializes the two tests in this file: NPM_CONFIG_REGISTRY / DENO_DIR are
 /// process-global env vars and the in-process snapshot cache is shared state,
@@ -19,10 +19,40 @@ fn env_lock() -> &'static Mutex<()> {
     ENV_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvGuard {
+    fn new(names: &[&'static str]) -> Self {
+        Self(
+            names
+                .iter()
+                .map(|&name| (name, std::env::var_os(name)))
+                .collect(),
+        )
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.0 {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("libdeno-npm-{}-{}", std::process::id(), name));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+fn set_modified_time(path: &Path, modified: std::time::SystemTime) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
 }
 
 /// Minimal HTTP server for one mock package (`mock-pkg`): any request path
@@ -31,21 +61,29 @@ fn temp_dir(name: &str) -> PathBuf {
 /// registry down; later connections are refused.
 struct MockRegistry {
     base_url: String,
+    requests: Arc<AtomicUsize>,
     shutdown: std::sync::mpsc::Sender<()>,
     thread: std::thread::JoinHandle<()>,
 }
 
 impl MockRegistry {
     fn new() -> Self {
+        Self::with_marker("hello-from-mock-pkg")
+    }
+
+    fn with_marker(marker: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://127.0.0.1:{}/", addr.port());
-        let (packument, tarball) = make_package(&base_url);
+        let (packument, tarball) = make_package(&base_url, marker);
+        let requests = Arc::new(AtomicUsize::new(0));
         let (shutdown, done_rx) = std::sync::mpsc::channel::<()>();
         listener.set_nonblocking(true).unwrap();
+        let requests_for_thread = requests.clone();
         let thread = std::thread::spawn(move || loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    requests_for_thread.fetch_add(1, Ordering::SeqCst);
                     let _ = stream.set_nonblocking(false);
                     let request = read_request(&mut stream);
                     let path = request
@@ -72,6 +110,7 @@ impl MockRegistry {
         });
         Self {
             base_url,
+            requests,
             shutdown,
             thread,
         }
@@ -79,6 +118,10 @@ impl MockRegistry {
 
     fn url(&self) -> &str {
         &self.base_url
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
     }
 
     /// Takes the registry down and waits until the port is released; later
@@ -120,15 +163,15 @@ fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
 /// Packument + gzipped tarball for a single mock package (`mock-pkg@1.0.0`).
 /// The tarball mirrors a real npm artifact: a ustar archive whose entries
 /// carry the leading `package/` component that the extractor strips.
-fn make_package(base_url: &str) -> (String, Vec<u8>) {
+fn make_package(base_url: &str, marker: &str) -> (String, Vec<u8>) {
     let packument = format!(
         r#"{{"name":"mock-pkg","dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"mock-pkg","version":"1.0.0","main":"index.js","dist":{{"tarball":"{base_url}mock-pkg-1.0.0.tgz"}}}}}}}}"#
     );
     let package_json = br#"{"name":"mock-pkg","version":"1.0.0","main":"index.js"}"#;
-    let index_js = br#"module.exports = "hello-from-mock-pkg";"#;
+    let index_js = format!("module.exports = {marker:?};");
     let tar = tar_archive(&[
         ("package/package.json", package_json),
-        ("package/index.js", index_js),
+        ("package/index.js", index_js.as_bytes()),
     ]);
     (packument, gzip(&tar))
 }
@@ -267,6 +310,10 @@ impl RefusingRegistry {
 }
 
 fn write_project(dir: &Path) {
+    write_project_with_expected(dir, "hello-from-mock-pkg");
+}
+
+fn write_project_with_expected(dir: &Path, expected: &str) {
     std::fs::write(
         dir.join("package.json"),
         r#"{"name":"proj","dependencies":{"mock-pkg":"1.0.0"}}"#,
@@ -274,13 +321,25 @@ fn write_project(dir: &Path) {
     .unwrap();
     std::fs::write(
         dir.join("main.js"),
-        "import pkg from 'npm:mock-pkg';\n\
-         if (pkg !== 'hello-from-mock-pkg') throw new Error('unexpected pkg: ' + pkg);\n\
+        format!(
+            "import pkg from 'npm:mock-pkg';\n\
+         if (pkg !== {expected:?}) throw new Error('unexpected pkg: ' + pkg);\n\
          // Absolute path via import.meta.url: in-process runs never chdir, so\n\
          // a relative path would resolve against the host cwd.\n\
-         Deno.writeTextFileSync(new URL('./out.txt', import.meta.url), pkg);",
+         Deno.writeTextFileSync(new URL('./out.txt', import.meta.url), pkg);"
+        ),
     )
     .unwrap();
+}
+
+fn build_runtime(cwd: &Path) -> LibdenoRuntime {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runtime = rt.block_on(LibdenoRuntime::new(cwd)).unwrap();
+    drop(rt);
+    runtime
 }
 
 #[test]
@@ -362,6 +421,242 @@ fn cached_snapshot_skips_network_on_second_run() {
         "hello-from-mock-pkg"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&deno_dir);
+}
+
+#[test]
+fn reusable_runtime_rebuilds_for_home_npmrc_change_with_independent_userconfig() {
+    let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard::new(&[
+        "NPM_CONFIG_REGISTRY",
+        "NPM_CONFIG_USERCONFIG",
+        "DENO_DIR",
+        "HOME",
+    ]);
+    let dir = temp_dir("runtime-registry-change");
+    let deno_dir = temp_dir("runtime-registry-change-deno");
+    let home = dir.join("home");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&deno_dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&deno_dir).unwrap();
+
+    let home_npmrc = home.join(".npmrc");
+    let userconfig_a = dir.join("npmrc-a");
+    let userconfig_b = dir.join("npmrc-b");
+    let registry_a = MockRegistry::with_marker("from-registry-a");
+    let registry_b = MockRegistry::with_marker("from-registry-b");
+    let config_a = format!("registry={}\n", registry_a.url());
+    let config_b = format!("registry={}\n", registry_b.url());
+    let config_len = config_a.len().max(config_b.len()) + 16;
+    let pad_config = |config: String| {
+        format!(
+            "{config}{}",
+            "#".repeat(config_len.saturating_sub(config.len()))
+        )
+    };
+    let home_content_a = pad_config(config_a);
+    let home_content_b = pad_config(config_b);
+    let userconfig_content_a = "# unrelated userconfig-a\n";
+    let userconfig_content_b = "# unrelated userconfig-b\n";
+    std::fs::write(&home_npmrc, &home_content_a).unwrap();
+    std::fs::write(&userconfig_a, userconfig_content_a).unwrap();
+    std::fs::write(&userconfig_b, userconfig_content_b).unwrap();
+    assert_eq!(userconfig_content_a.len(), userconfig_content_b.len());
+    // deno_resolver 0.88 reads `$HOME/.npmrc`; keep NPM_CONFIG_USERCONFIG on
+    // a separate, unrelated file and change it independently below.
+    std::env::remove_var("NPM_CONFIG_REGISTRY");
+    std::env::set_var("HOME", &home);
+    std::env::set_var("NPM_CONFIG_USERCONFIG", &userconfig_a);
+    std::env::set_var("DENO_DIR", &deno_dir);
+    write_project_with_expected(&dir, "from-registry-a");
+
+    let runtime = build_runtime(&dir);
+    let options = LibdenoOptions {
+        cwd: Some(dir.clone()),
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        run_with(&runtime, dir.join("main.js"), &options).unwrap(),
+        0
+    );
+
+    // Changing only NPM_CONFIG_USERCONFIG must not select a different npmrc
+    // for the resolver.
+    std::env::set_var("NPM_CONFIG_USERCONFIG", &userconfig_b);
+    write_project_with_expected(&dir, "from-registry-a");
+    assert_eq!(
+        run_with(&runtime, dir.join("main.js"), &options).unwrap(),
+        0
+    );
+
+    registry_a.shutdown();
+    std::fs::remove_dir_all(dir.join("node_modules")).unwrap();
+    let home_modified = std::fs::metadata(&home_npmrc).unwrap().modified().unwrap();
+    std::fs::write(&home_npmrc, &home_content_b).unwrap();
+    set_modified_time(&home_npmrc, home_modified);
+    assert_eq!(
+        home_content_a.len() as u64,
+        std::fs::metadata(&home_npmrc).unwrap().len()
+    );
+    assert_eq!(
+        home_modified,
+        std::fs::metadata(&home_npmrc).unwrap().modified().unwrap()
+    );
+    write_project_with_expected(&dir, "from-registry-b");
+
+    assert_eq!(
+        run_with(&runtime, dir.join("main.js"), &options).unwrap(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+        "from-registry-b"
+    );
+    let requests = registry_b.request_count();
+    registry_b.shutdown();
+    assert!(requests > 0, "the rebuilt runtime never reached registry B");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&deno_dir);
+}
+
+#[test]
+fn child_process_fork_uses_the_parent_npm_snapshot() {
+    let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("fork-snapshot");
+    let deno_dir = temp_dir("fork-snapshot-deno");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&deno_dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&deno_dir).unwrap();
+
+    let old_registry = std::env::var_os("NPM_CONFIG_REGISTRY");
+    let old_userconfig = std::env::var_os("NPM_CONFIG_USERCONFIG");
+    let old_deno_dir = std::env::var_os("DENO_DIR");
+    let registry = MockRegistry::new();
+    std::env::set_var("NPM_CONFIG_REGISTRY", registry.url());
+    std::env::remove_var("NPM_CONFIG_USERCONFIG");
+    std::env::set_var("DENO_DIR", &deno_dir);
+
+    let quote = |path: &Path| format!("{:?}", path.to_string_lossy());
+    let ready = dir.join("ready");
+    let release = dir.join("release");
+    let done = dir.join("done");
+    let child = dir.join("fork-child.cjs");
+    let parent = dir.join("fork-parent.cjs");
+    let demo = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("examples")
+        .join(format!("demo{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        demo.is_file(),
+        "build the demo host before running the fork E2E: {}",
+        demo.display()
+    );
+
+    std::fs::write(
+        &child,
+        r#"(async () => {
+const pkg = (await import('npm:mock-pkg')).default;
+if (!process.send) throw new Error('fork child has no IPC channel');
+process.send(pkg);
+})().catch((error) => { console.error(error); process.exitCode = 1; });"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &parent,
+        format!(
+            r#"(async () => {{
+const fs = require('node:fs');
+const {{ fork }} = require('node:child_process');
+const pkg = (await import('npm:mock-pkg')).default;
+fs.writeFileSync({ready}, pkg);
+while (!fs.existsSync({release})) await new Promise((resolve) => setTimeout(resolve, 10));
+const child = fork({child}, [], {{ execPath: {demo} }});
+await new Promise((resolve, reject) => {{
+  let gotMessage = false;
+  let settled = false;
+  let timer;
+  const fail = (error) => {{
+    if (!settled) {{ settled = true; clearTimeout(timer); reject(error); }}
+    child.kill();
+  }};
+  child.on('message', (message) => {{
+    if (message !== pkg) return fail(new Error('unexpected fork result: ' + message));
+    gotMessage = true;
+    if (child.connected) child.disconnect();
+  }});
+  child.on('error', fail);
+  child.on('exit', (code) => {{
+    if (settled) return;
+    if (!gotMessage || code !== 0) return fail(new Error('fork exited before IPC success: ' + code));
+    settled = true;
+    clearTimeout(timer);
+    resolve();
+  }});
+  timer = setTimeout(() => fail(new Error('fork timed out')), 10000);
+}});
+fs.writeFileSync({done}, pkg);
+}})().catch((error) => {{ console.error(error); process.exitCode = 1; }});"#,
+            ready = quote(&ready),
+            release = quote(&release),
+            child = quote(&child),
+            demo = quote(&demo),
+            done = quote(&done),
+        ),
+    )
+    .unwrap();
+
+    let entry = parent.clone();
+    let options = LibdenoOptions {
+        cwd: Some(dir.clone()),
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let handle = std::thread::spawn(move || run(&entry, &options));
+    for _ in 0..600 {
+        if ready.is_file() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(ready.is_file(), "parent never resolved npm:mock-pkg");
+    assert!(
+        registry.request_count() > 0,
+        "parent never reached the registry"
+    );
+
+    // The parent has already resolved the package. Removing its installed
+    // tree and taking the registry down makes a successful fork depend on the
+    // serialized npm snapshot plus the on-disk tarball cache.
+    registry.shutdown();
+    std::fs::remove_dir_all(dir.join("node_modules")).unwrap();
+    std::fs::write(&release, "go").unwrap();
+    assert_eq!(handle.join().unwrap().unwrap(), 0);
+    assert_eq!(
+        std::fs::read_to_string(&done).unwrap(),
+        "hello-from-mock-pkg"
+    );
+
+    match old_registry {
+        Some(value) => std::env::set_var("NPM_CONFIG_REGISTRY", value),
+        None => std::env::remove_var("NPM_CONFIG_REGISTRY"),
+    }
+    match old_userconfig {
+        Some(value) => std::env::set_var("NPM_CONFIG_USERCONFIG", value),
+        None => std::env::remove_var("NPM_CONFIG_USERCONFIG"),
+    }
+    match old_deno_dir {
+        Some(value) => std::env::set_var("DENO_DIR", value),
+        None => std::env::remove_var("DENO_DIR"),
+    }
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&deno_dir);
 }

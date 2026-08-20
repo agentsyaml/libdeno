@@ -109,6 +109,63 @@ fn run_with_reuse_produces_identical_results() {
 }
 
 #[test]
+fn refresh_rebuilds_after_nested_node_modules_change() {
+    let dir = temp_dir("refresh-nested-node-modules");
+    let nested_pkg = dir.join("node_modules").join("nested-pkg");
+    let nested_dep = nested_pkg.join("node_modules").join("nested-dep");
+    fs::create_dir_all(&nested_dep).unwrap();
+    fs::write(
+        dir.join("package.json"),
+        r#"{"name":"refresh-project","private":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        nested_pkg.join("package.json"),
+        r#"{"name":"nested-pkg","version":"1.0.0","type":"module","main":"index.js"}"#,
+    )
+    .unwrap();
+    fs::write(
+        nested_pkg.join("index.js"),
+        "import { marker } from 'nested-dep';\nexport { marker };",
+    )
+    .unwrap();
+    fs::write(
+        nested_dep.join("package.json"),
+        r#"{"name":"nested-dep","version":"1.0.0","type":"module","main":"a.js"}"#,
+    )
+    .unwrap();
+    fs::write(nested_dep.join("a.js"), "export const marker = 'a';").unwrap();
+    fs::write(nested_dep.join("b.js"), "export const marker = 'b';").unwrap();
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "import { marker } from './node_modules/nested-pkg/index.js';\nDeno.writeTextFileSync(new URL('./out.txt', import.meta.url), marker);",
+    )
+    .unwrap();
+
+    let runtime = build_runtime(&dir);
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
+    assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), "a");
+
+    // The nested package's metadata does not update the project-level
+    // node_modules directory fingerprint. Refresh is the bounded opt-in for
+    // this case; it must rebuild before the next run.
+    fs::write(
+        nested_dep.join("package.json"),
+        r#"{"name":"nested-dep","version":"1.0.0","type":"module","main":"b.js"}"#,
+    )
+    .unwrap();
+    runtime.refresh();
+    assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
+    assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), "b");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn run_with_rebuilds_when_config_changes() {
     // The config fingerprint is content-hashed, so a same-size edit to
     // deno.json ("./a.js" -> "./b.js") must rebuild the stack and the new

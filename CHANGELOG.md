@@ -7,6 +7,20 @@ breaking changes are highlighted per release with migration notes.
 
 ## 0.3.1 (Unreleased)
 
+### Phase 1 / Phase 2 behavior changes
+
+- **Phase 1 resolver state**: reusable runtimes can be explicitly refreshed,
+  and their resolver fingerprint now includes the effective npm registry,
+  project `.npmrc`, and the resolver-supported `$HOME/.npmrc`; forked npm
+  children read the latest managed resolution rather than an
+  initialization-time snapshot. `deno_resolver` 0.88 does not honor
+  `NPM_CONFIG_USERCONFIG`.
+- **Phase 2 resource boundaries**: child requests, permission-broker lines,
+  captured-output readers, subprocess handshake writers, tarball metadata, and
+  lifecycle scripts now have bounded failure paths instead of silently growing
+  or waiting forever. These bounds are compatibility safeguards, not process
+  isolation guarantees.
+
 ### Security / Correctness
 
 - **Bounded child requests**: child-mode requests are capped at 1 MiB, and the
@@ -46,6 +60,12 @@ breaking changes are highlighted per release with migration notes.
   carried with an error.
 - External broker upstream constructor and communication `exit(87)` paths are
   not catchable as `LibdenoError`.
+- The offline Deno/TypeScript version ledger checks local declarations only;
+  matching the corresponding upstream Deno tag remains a manual review step.
+- Trusted Publishing required reviewers and environment tag/repository
+  restrictions are configured outside this repository's workflow YAML.
+- Rust/crates.io and Python/PyPI publication is not atomic; a later retry may
+  be needed if one publisher succeeds before the other fails.
 
 ## 0.3.0
 
@@ -147,9 +167,8 @@ breaking changes are highlighted per release with migration notes.
   output is not stable across rustc upgrades: after a toolchain update the
   on-disk entries are simply recompiled (a wasted compile, never a wrong hit
   — perf-only).
-- **In-process `features` behavior is untested**; the subprocess forwarding
-  path (`run_in_subprocess` / `run_in_subprocess_with_output`) is covered by
-  tests.
+- **`features` behavior is covered**: tests cover default and custom
+  in-process feature sets and subprocess forwarding.
 
 ## 0.2.2
 

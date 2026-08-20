@@ -127,17 +127,45 @@ The resource options are in-process, best-effort controls, not a security
 boundary:
 
 - `max_heap_bytes` requests a V8 old-generation heap ceiling for the isolate.
-  It does not cap total V8 memory, native allocations, V8 external memory,
-  host allocations, or memory used by child processes. It is not a cgroup,
+  Values below 8 MiB are rejected, but the control remains best effort. It
+  does not cap total V8 memory, native allocations, V8 external memory, host
+  allocations, RSS, CPU, or memory used by child processes. It is not a cgroup,
   container, or OS-enforced process-memory limit.
 - `execution_deadline` can interrupt JavaScript when V8 reaches an
   interruptible stack check. It cannot interrupt a blocking syscall, a wait on
   a child process, native code, or a blocked permission broker/hook, and it
   cannot bound host-side memory or other work after the run leaves an
-  interruptible V8 frame. A run can therefore exceed the requested deadline.
+  interruptible V8 frame. A run can therefore exceed the requested deadline;
+  this is not a CPU-time limit and does not replace the HTTP client's separate
+  transport budget.
 
-Neither option provides CPU isolation, a complete execution-time limit, or an
-in-process sandbox. They do not replace a process-level sandbox and resource
+Output capture has its own boundary:
+
+- In-process fd capture is process-global and exclusive. Without
+  `max_capture_bytes`, each captured stream is unbounded for the duration of
+  the run and can grow host memory; the per-stream byte cap retains only the
+  configured prefix and marks truncation. In-process capture is rejected on
+  Windows.
+- `run_in_subprocess_with_output` pipes and drains the direct child's stdout
+  and stderr on every platform. Its cap bounds the retained parent buffers,
+  not the child's CPU, memory, or descendants.
+
+Network and package-install guards are also finite but not isolation controls:
+
+- Remote module bodies and npm metadata are capped at 256 MiB after
+  decompression. Explicit npm `.tgz` downloads are capped at 1 GiB of
+  downloaded bytes, with a coarse default 1 GiB gzip `ISIZE` decompression
+  pre-check (`LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES` overrides it). A gzip
+  multi-member stream can still differ from that trailer estimate.
+- Each HTTP operation has a 300-second wall-clock budget covering retries,
+  backoff, applicable redirects, and body reads. This does not impose a CPU or
+  process lifetime limit on the runtime.
+- npm lifecycle scripts are disabled by default. If enabled, only the direct
+  lifecycle child is supervised for 60 seconds, followed by a five-second
+  kill/wait window; descendants are not supervised.
+
+None of these options provides CPU isolation, a complete execution-time limit,
+an RSS cap, or an in-process sandbox. They do not replace a process-level sandbox and resource
 policy (for example a container, cgroup, seccomp, Apple Seatbelt, or suitable
 `ulimit`) for untrusted code — see [Trusted Execution Model](#trusted-execution-model--read-this-first).
 

@@ -10,6 +10,52 @@ use crate::run;
 use crate::LibdenoError;
 use crate::LibdenoOptions;
 
+/// The request writer is detached because a blocking `write_all` cannot be
+/// joined safely after the handshake deadline. Bound those retained threads
+/// instead of allowing every stalled child to consume another thread forever.
+const MAX_ACTIVE_HANDSHAKE_WRITERS: usize = 32;
+const HANDSHAKE_WRITER_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+static ACTIVE_HANDSHAKE_WRITERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct HandshakeWriterBudget;
+
+impl Drop for HandshakeWriterBudget {
+    fn drop(&mut self) {
+        let previous = ACTIVE_HANDSHAKE_WRITERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(
+            previous > 0,
+            "handshake writer budget released without a reservation"
+        );
+    }
+}
+
+#[cfg(test)]
+fn active_handshake_writers() -> usize {
+    ACTIVE_HANDSHAKE_WRITERS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn reserve_handshake_writer() -> Result<HandshakeWriterBudget, std::io::Error> {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+
+    let mut active = ACTIVE_HANDSHAKE_WRITERS.load(Acquire);
+    loop {
+        if active >= MAX_ACTIVE_HANDSHAKE_WRITERS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "subprocess handshake writer resource budget exhausted: {} active, maximum {}",
+                    active, MAX_ACTIVE_HANDSHAKE_WRITERS
+                ),
+            ));
+        }
+        match ACTIVE_HANDSHAKE_WRITERS.compare_exchange_weak(active, active + 1, AcqRel, Acquire) {
+            Ok(_) => return Ok(HandshakeWriterBudget),
+            Err(next) => active = next,
+        }
+    }
+}
+
 /// Environment variable marking a process spawned by [`run_in_subprocess`].
 const LIBDENO_CHILD_MODE: &str = "LIBDENO_CHILD_MODE";
 
@@ -207,41 +253,84 @@ fn write_child_request(
     payload: Vec<u8>,
 ) -> Result<(), LibdenoError> {
     use std::io::Write;
-    let write_result = match child.stdin.take() {
+    let (write_result, writer_done) = match child.stdin.take() {
         Some(mut stdin) => {
+            // Reserve before spawning. If the bound is reached, kill/reap the
+            // already-created child rather than returning an error with a
+            // live child and no writer capable of completing its handshake.
+            let writer_budget = match reserve_handshake_writer() {
+                Ok(budget) => budget,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(LibdenoError::Io(error));
+                }
+            };
             let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
-            std::thread::spawn(move || {
-                let _ = tx.send(stdin.write_all(&payload));
-            });
-            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(LibdenoError::Io(e)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(LibdenoError::Timeout(
-                    "subprocess handshake timed out after 10s: \
-                         host did not service child mode (stdin not read)"
-                        .to_string(),
-                )),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(LibdenoError::Runtime(
-                    deno_core::anyhow::anyhow!("child stdin writer terminated unexpectedly"),
-                )),
+            let writer = std::thread::Builder::new()
+                .name("libdeno-subprocess-handshake-writer".to_string())
+                .spawn(move || {
+                    let result = stdin.write_all(&payload);
+                    // Do not report completion until the stdin handle is
+                    // dropped and this detached writer is really done.
+                    drop(stdin);
+                    drop(writer_budget);
+                    let _ = tx.send(result);
+                });
+            match writer {
+                Ok(_) => {
+                    let result = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(LibdenoError::Io(e)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            Err(LibdenoError::Timeout(
+                                "subprocess handshake timed out after 10s: \
+                                     host did not service child mode (stdin not read)"
+                                    .to_string(),
+                            ))
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                                "child stdin writer terminated unexpectedly"
+                            )))
+                        }
+                    };
+                    // This receiver is retained on the error path so a kill
+                    // can be followed by a bounded wait for the actual writer
+                    // completion. It is deliberately not a JoinHandle join:
+                    // a platform pipe may remain uncloseable after the child
+                    // is gone, and the budget must reflect that truth.
+                    (result, Some(rx))
+                }
+                Err(error) => (Err(LibdenoError::Io(error)), None),
             }
         }
-        None => Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-            "child has no stdin"
-        ))),
+        None => (
+            Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                "child has no stdin"
+            ))),
+            None,
+        ),
     };
     if let Err(e) = write_result {
-        match child.try_wait() {
-            Ok(Some(status)) => Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+        let error = match child.try_wait() {
+            Ok(Some(status)) => LibdenoError::Runtime(deno_core::anyhow::anyhow!(
                 "child exited with {status} before accepting the run request \
                  (request write failed: {e})"
-            ))),
+            )),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                Err(e)
+                e
             }
+        };
+        if let Some(writer_done) = writer_done {
+            let _ = writer_done.recv_timeout(HANDSHAKE_WRITER_CLEANUP_TIMEOUT);
         }
+        // Preserve the original error variant/message; if the detached writer
+        // is still blocked after the bounded cleanup wait it remains counted
+        // and a future budget error exposes that retained resource.
+        Err(error)
     } else {
         Ok(())
     }
@@ -495,11 +584,17 @@ pub fn maybe_handle_child_mode() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::active_handshake_writers;
     use super::drain_pipe;
+    use super::reserve_handshake_writer;
     use super::token_matches;
     use super::validate_child_request_size;
+    use super::write_child_request;
     use super::LibdenoError;
+    use super::MAX_ACTIVE_HANDSHAKE_WRITERS;
     use super::MAX_CHILD_REQUEST_BYTES;
+
+    static HANDSHAKE_WRITER_BUDGET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn child_request_size_accepts_small_payload() {
@@ -552,5 +647,79 @@ mod tests {
         // Empty tokens fail closed: a legitimate token is never empty.
         assert!(!token_matches("", ""));
         assert!(!token_matches(token, ""));
+    }
+
+    #[test]
+    fn handshake_writer_budget_is_finite_and_releases_exactly() {
+        let _lock = HANDSHAKE_WRITER_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let baseline = active_handshake_writers();
+        assert!(baseline <= MAX_ACTIVE_HANDSHAKE_WRITERS);
+        let available = MAX_ACTIVE_HANDSHAKE_WRITERS - baseline;
+        let mut reservations = Vec::with_capacity(available);
+        for _ in 0..available {
+            reservations.push(reserve_handshake_writer().unwrap());
+        }
+        assert_eq!(active_handshake_writers(), MAX_ACTIVE_HANDSHAKE_WRITERS);
+        let error = match reserve_handshake_writer() {
+            Ok(_) => panic!("handshake writer budget must reject a new reservation at its limit"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(error
+            .to_string()
+            .contains("handshake writer resource budget"));
+        drop(reservations);
+        assert_eq!(active_handshake_writers(), baseline);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handshake_writer_releases_after_normal_completion() {
+        use std::process::Stdio;
+
+        let _lock = HANDSHAKE_WRITER_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let baseline = active_handshake_writers();
+        let mut child = std::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        write_child_request(&mut child, b"normal completion".to_vec()).unwrap();
+        assert!(child.wait().unwrap().success());
+        for _ in 0..100 {
+            if active_handshake_writers() == baseline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(active_handshake_writers(), baseline);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handshake_writer_releases_after_write_error() {
+        use std::process::Stdio;
+
+        let _lock = HANDSHAKE_WRITER_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let baseline = active_handshake_writers();
+        let mut child = std::process::Command::new("true")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = write_child_request(&mut child, vec![b'x'; 4096]);
+        let _ = child.wait();
+        for _ in 0..100 {
+            if active_handshake_writers() == baseline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(active_handshake_writers(), baseline);
     }
 }

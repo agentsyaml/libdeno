@@ -40,6 +40,49 @@ fn runs_plain_js_and_returns_exit_code() {
 }
 
 #[test]
+fn invalid_heap_fails_at_entry_without_polluting_a_concurrent_valid_run() {
+    use std::sync::Arc;
+    use std::sync::Barrier;
+
+    let dir = temp_dir("heap-entry-validation");
+    let valid_entry = dir.join("valid.js");
+    let invalid_entry = dir.join("invalid.js");
+    fs::write(&valid_entry, "Deno.exit(0);").unwrap();
+    fs::write(&invalid_entry, "Deno.exit(0);").unwrap();
+
+    let start = Arc::new(Barrier::new(2));
+    let valid_start = start.clone();
+    let valid_handle = std::thread::spawn(move || {
+        valid_start.wait();
+        run(
+            &valid_entry,
+            &LibdenoOptions {
+                allow_all_permissions: true,
+                max_heap_bytes: Some(128 << 20),
+                ..Default::default()
+            },
+        )
+    });
+
+    start.wait();
+    let invalid = run(
+        &invalid_entry,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            max_heap_bytes: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(invalid, libdeno::LibdenoError::Configuration(ref message) if message.contains("max_heap_bytes")),
+        "invalid heap must fail at the run entry: {invalid:?}"
+    );
+    assert_eq!(valid_handle.join().unwrap().unwrap(), 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn in_process_deno_exit_returns_code() {
     // Deno.exit(n) is intercepted (a WatcherExitHandle lives in the OpState):
     // op_exit terminates the isolate instead of calling std::process::exit, so
@@ -90,6 +133,10 @@ fn missing_entry_is_a_runtime_error() {
     )
     .unwrap_err();
     assert!(matches!(err, libdeno::LibdenoError::Core(_)));
+    assert!(
+        err.to_string().contains("Module not found") || err.to_string().contains("No such file"),
+        "graph build failure lost its root cause: {err}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1352,6 +1399,10 @@ Deno.exit(result === "error" ? 0 : (result === "started" ? 42 : 43));"#,
     .unwrap();
     let options = LibdenoOptions {
         permissions: vec![format!("--allow-read={}", dir.display())],
+        // A narrowed custom feature set must still keep worker-options enabled:
+        // otherwise creating this permissions-bearing Worker terminates the
+        // host instead of delivering the worker's own read denial.
+        features: Some(vec!["kv".into()]),
         ..Default::default()
     };
     let code = run(dir.join("main.js"), &options).unwrap();

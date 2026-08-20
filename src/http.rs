@@ -16,6 +16,7 @@ use http::header::IF_NONE_MATCH;
 use http::header::LOCATION;
 use http::HeaderMap;
 use std::time::Duration;
+use std::time::Instant;
 use url::Url;
 
 use crate::LibdenoError;
@@ -25,10 +26,9 @@ use crate::LibdenoError;
 /// gzip/brotli (enabled in Cargo.toml) at the transport layer before the body
 /// reaches us, so this counts true memory usage, not the wire size.
 const MAX_RESPONSE_BODY_BYTES: usize = 256 << 20;
-/// Cap for npm tarball downloads: some legal packages exceed 256MiB, and
-/// registries serve tarballs with an explicit Content-Length, so a response
-/// claiming more than the module cap gets this larger bound. Still bounded,
-/// so a broken/oversized response fails fast instead of OOMing the host.
+/// Cap for explicit npm `.tgz` downloads: some legal packages exceed 256MiB.
+/// Still bounded, so a broken/oversized response fails fast instead of OOMing
+/// the host.
 ///
 /// This cap counts only the downloaded (compressed) bytes; the decompressed
 /// allocation is NOT size-checked. Upstream tarball_extract reserves space
@@ -38,6 +38,12 @@ const MAX_RESPONSE_BODY_BYTES: usize = 256 << 20;
 /// The registry must therefore be trusted; a hardened build would need to
 /// pre-validate ISIZE against a post-decompression budget.
 const MAX_TARBALL_BODY_BYTES: usize = 1 << 30;
+
+/// Total wall-clock budget for one HTTP operation, including retries,
+/// redirects, backoff, and response-body reads. This is a transport budget,
+/// not `LibdenoOptions::execution_deadline` (that option is not passed into
+/// this client).
+const HTTP_RETRY_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct ReqwestHttpClient {
@@ -69,9 +75,9 @@ impl ReqwestHttpClient {
 /// Reads the full (already auto-decompressed) response body into a Vec,
 /// failing once the accumulated size exceeds the caller-supplied `limit`
 /// instead of buffering an unbounded response. The caller picks the bound:
-/// module fetches pin the module cap, npm registry downloads tier by declared
-/// Content-Length via [`npm_body_limit`]. Over-limit is an error, never a
-/// retry.
+/// module fetches pin the module cap, while npm registry downloads use the
+/// explicit tarball-path check in [`npm_body_limit`]. Over-limit is an error,
+/// never a retry.
 async fn read_body_limited(
     response: &mut reqwest::Response,
     limit: usize,
@@ -82,7 +88,7 @@ async fn read_body_limited(
         .await
         .map_err(|e| format!("failed to read response body: {e}"))?
     {
-        if body.len() + chunk.len() > limit {
+        if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(format!("response body exceeded the {limit}-byte limit"));
         }
         body.extend_from_slice(&chunk);
@@ -90,20 +96,28 @@ async fn read_body_limited(
     Ok(body)
 }
 
-/// Body cap for npm registry downloads: responses declaring more than the
-/// module cap are tarball-sized and get the larger tarball bound; everything
-/// else — and every chunked response without Content-Length — stays on the
-/// module cap.
-///
-/// ponytail: still trusts the *declared* Content-Length for tiering — a
-/// malicious or compromised registry can claim a huge length on any response
-/// (metadata included) and win the 1 GiB budget, so a decompression bomb up
-/// to 1 GiB remains possible. The cap itself is never exceeded. Tighten to
-/// tarball-path checks only if this is abused in practice.
-fn npm_body_limit(content_length: Option<u64>) -> usize {
-    match content_length {
-        Some(len) if len as usize > MAX_RESPONSE_BODY_BYTES => MAX_TARBALL_BODY_BYTES,
-        _ => MAX_RESPONSE_BODY_BYTES,
+/// Body cap for npm registry downloads. The URL path is the only evidence that
+/// permits the larger budget: a metadata/JSON response cannot obtain it by
+/// declaring a large `Content-Length`, and chunked metadata remains on the
+/// module cap. An explicit `.tgz` path is bounded by the tarball cap even when
+/// the registry omits `Content-Length`.
+fn npm_body_limit(is_tarball: bool, _content_length: Option<u64>) -> usize {
+    if is_tarball {
+        MAX_TARBALL_BODY_BYTES
+    } else {
+        MAX_RESPONSE_BODY_BYTES
+    }
+}
+
+fn remaining_http_budget(deadline: Instant) -> Result<Duration, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(format!(
+            "HTTP request exceeded the {}-second wall-clock budget",
+            HTTP_RETRY_WALL_CLOCK_BUDGET.as_secs()
+        ))
+    } else {
+        Ok(remaining)
     }
 }
 
@@ -136,11 +150,11 @@ fn tarball_decompress_budget() -> usize {
 /// upstream falls back to streaming (no reservation) when the reserve fails,
 /// and that path plus this check bound the practical exposure. The
 /// `read_body_limited` cap above bounds the *compressed* bytes already.
-fn guard_tarball_isize(path: &str, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+fn guard_tarball_isize(is_tarball: bool, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     // Only .tgz URLs carry gzip-compressed tar data; registry metadata
     // (JSON, possibly transport-gzip-encoded) must not be size-checked here —
     // its trailer bytes are not an ISIZE and would spuriously fail.
-    if !path.ends_with(".tgz") || bytes.len() < 8 || bytes[..2] != [0x1f, 0x8b] {
+    if !is_tarball || bytes.len() < 8 || bytes[..2] != [0x1f, 0x8b] {
         return Ok(bytes);
     }
     let isize = u32::from_le_bytes([
@@ -171,16 +185,18 @@ impl HttpClient for ReqwestHttpClient {
         // packet must not fail a module fetch for the whole run.
         let max_attempts = 3;
         let mut attempt = 0;
+        let deadline = Instant::now() + HTTP_RETRY_WALL_CLOCK_BUDGET;
         loop {
             attempt += 1;
-            match self
-                .client
-                .get(url.clone())
-                .headers(headers.clone())
-                .send()
-                .await
+            let remaining =
+                remaining_http_budget(deadline).map_err(|e| SendError::Failed(e.into()))?;
+            match tokio::time::timeout(
+                remaining,
+                self.client.get(url.clone()).headers(headers.clone()).send(),
+            )
+            .await
             {
-                Ok(response) => {
+                Ok(Ok(response)) => {
                     let status = response.status();
 
                     // is_redirection() covers 300..=399 including 304, so the
@@ -205,9 +221,23 @@ impl HttpClient for ReqwestHttpClient {
                         // Module fetches are pinned to the module cap: a
                         // malicious module server declaring a huge
                         // Content-Length must not buy a larger budget.
-                        let body = read_body_limited(&mut response, MAX_RESPONSE_BODY_BYTES)
-                            .await
+                        let remaining = remaining_http_budget(deadline)
                             .map_err(|e| SendError::Failed(e.into()))?;
+                        let body = tokio::time::timeout(
+                            remaining,
+                            read_body_limited(&mut response, MAX_RESPONSE_BODY_BYTES),
+                        )
+                        .await
+                        .map_err(|_| {
+                            SendError::Failed(
+                                format!(
+                                    "HTTP request exceeded the {}-second wall-clock budget",
+                                    HTTP_RETRY_WALL_CLOCK_BUDGET.as_secs()
+                                )
+                                .into(),
+                            )
+                        })?
+                        .map_err(|e| SendError::Failed(e.into()))?;
                         return Ok(SendResponse::Success(headers, body));
                     }
 
@@ -217,16 +247,49 @@ impl HttpClient for ReqwestHttpClient {
                     if (status.as_u16() == 429 || status.is_server_error())
                         && attempt < max_attempts
                     {
-                        tokio::time::sleep(std::time::Duration::from_millis(200 * attempt)).await;
+                        let delay = Duration::from_millis(200 * attempt);
+                        let remaining = remaining_http_budget(deadline)
+                            .map_err(|e| SendError::Failed(e.into()))?;
+                        if delay >= remaining {
+                            return Err(SendError::Failed(
+                                format!(
+                                    "HTTP request exceeded the {}-second wall-clock budget",
+                                    HTTP_RETRY_WALL_CLOCK_BUDGET.as_secs()
+                                )
+                                .into(),
+                            ));
+                        }
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
                     return Err(SendError::StatusCode(status));
                 }
-                Err(_) if attempt < max_attempts => {
-                    tokio::time::sleep(std::time::Duration::from_millis(200 * attempt)).await;
+                Ok(Err(_)) if attempt < max_attempts => {
+                    let delay = Duration::from_millis(200 * attempt);
+                    let remaining =
+                        remaining_http_budget(deadline).map_err(|e| SendError::Failed(e.into()))?;
+                    if delay >= remaining {
+                        return Err(SendError::Failed(
+                            format!(
+                                "HTTP request exceeded the {}-second wall-clock budget",
+                                HTTP_RETRY_WALL_CLOCK_BUDGET.as_secs()
+                            )
+                            .into(),
+                        ));
+                    }
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
-                Err(e) => return Err(SendError::Failed(e.into())),
+                Ok(Err(e)) => return Err(SendError::Failed(e.into())),
+                Err(_) => {
+                    return Err(SendError::Failed(
+                        format!(
+                            "HTTP request exceeded the {}-second wall-clock budget",
+                            HTTP_RETRY_WALL_CLOCK_BUDGET.as_secs()
+                        )
+                        .into(),
+                    ))
+                }
             }
         }
     }
@@ -241,6 +304,9 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
         maybe_etag: Option<String>,
         maybe_registry_config: Option<&RegistryConfig>,
     ) -> Result<NpmCacheHttpClientResponse, DownloadError> {
+        // Classify only the original request path. Redirects to opaque CDN
+        // paths must preserve tarball handling, while metadata must not gain it.
+        let is_tarball = url.path().ends_with(".tgz");
         let mut url = url;
         let err = |status_code, message: String| DownloadError {
             status_code,
@@ -272,6 +338,7 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
         let max_attempts = 3;
         let mut attempt = 0;
         let mut redirects_remaining: u32 = 10;
+        let deadline = Instant::now() + HTTP_RETRY_WALL_CLOCK_BUDGET;
         loop {
             attempt += 1;
             let mut request = self.client.get(url.clone());
@@ -282,8 +349,9 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
                 request = request.header(IF_NONE_MATCH, etag);
             }
 
-            match request.send().await {
-                Ok(response) => {
+            let remaining = remaining_http_budget(deadline).map_err(|e| err(None, e))?;
+            match tokio::time::timeout(remaining, request.send()).await {
+                Ok(Ok(response)) => {
                     let status = response.status();
 
                     if status == http::StatusCode::NOT_FOUND {
@@ -299,11 +367,27 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
                             .and_then(|v| v.to_str().ok())
                             .map(String::from);
                         let mut response = response;
-                        let limit = npm_body_limit(response.content_length());
-                        let bytes = read_body_limited(&mut response, limit).await.map_err(|e| {
+                        let limit = npm_body_limit(is_tarball, response.content_length());
+                        let remaining =
+                            remaining_http_budget(deadline).map_err(|e| err(None, e))?;
+                        let bytes = tokio::time::timeout(
+                            remaining,
+                            read_body_limited(&mut response, limit),
+                        )
+                        .await
+                        .map_err(|_| {
+                            err(
+                                None,
+                                format!(
+                                    "npm registry request exceeded the {}-second wall-clock budget",
+                                    HTTP_RETRY_WALL_CLOCK_BUDGET.as_secs()
+                                ),
+                            )
+                        })?
+                        .map_err(|e| {
                             err(None, format!("failed to read npm registry response: {e}"))
                         })?;
-                        let bytes = guard_tarball_isize(url.path(), bytes).map_err(|e| {
+                        let bytes = guard_tarball_isize(is_tarball, bytes).map_err(|e| {
                             err(None, format!("failed to download npm tarball: {e}"))
                         })?;
                         return Ok(NpmCacheHttpClientResponse::Bytes(
@@ -351,7 +435,18 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
                     if (status.as_u16() == 429 || status.is_server_error())
                         && attempt < max_attempts
                     {
-                        let delay = std::time::Duration::from_millis(200 * attempt);
+                        let delay = Duration::from_millis(200 * attempt);
+                        let remaining =
+                            remaining_http_budget(deadline).map_err(|e| err(None, e))?;
+                        if delay >= remaining {
+                            return Err(err(
+                                None,
+                                format!(
+                                    "npm registry request exceeded the {}-second wall-clock budget",
+                                    HTTP_RETRY_WALL_CLOCK_BUDGET.as_secs()
+                                ),
+                            ));
+                        }
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -360,13 +455,32 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
                         format!("npm registry request failed with status {status}"),
                     ));
                 }
-                Err(e) => {
-                    if attempt < max_attempts {
-                        let delay = std::time::Duration::from_millis(200 * attempt);
-                        tokio::time::sleep(delay).await;
-                        continue;
+                Ok(Err(_e)) if attempt < max_attempts => {
+                    let delay = Duration::from_millis(200 * attempt);
+                    let remaining = remaining_http_budget(deadline).map_err(|e| err(None, e))?;
+                    if delay >= remaining {
+                        return Err(err(
+                            None,
+                            format!(
+                                "npm registry request exceeded the {}-second wall-clock budget",
+                                HTTP_RETRY_WALL_CLOCK_BUDGET.as_secs()
+                            ),
+                        ));
                     }
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Ok(Err(e)) => {
                     return Err(err(None, format!("npm registry request failed: {e}")));
+                }
+                Err(_) => {
+                    return Err(err(
+                        None,
+                        format!(
+                            "npm registry request exceeded the {}-second wall-clock budget",
+                            HTTP_RETRY_WALL_CLOCK_BUDGET.as_secs()
+                        ),
+                    ));
                 }
             }
         }
@@ -387,6 +501,15 @@ mod tests {
 
     /// Serves one canned HTTP response per accepted connection, in sequence.
     fn serve_many(responses: Vec<&'static str>) -> String {
+        serve_many_bytes(
+            responses
+                .into_iter()
+                .map(|response| response.as_bytes().to_vec())
+                .collect(),
+        )
+    }
+
+    fn serve_many_bytes(responses: Vec<Vec<u8>>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -394,7 +517,7 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0u8; 2048];
                     let _ = stream.read(&mut buf); // drain the request line + headers
-                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.write_all(&response);
                     let _ = stream.flush();
                 }
             }
@@ -407,6 +530,10 @@ mod tests {
     /// followed by the real response.
     fn serve_then(first: &'static str, second: &'static str) -> String {
         serve_many(vec![first, second])
+    }
+
+    fn serve_then_bytes(first: &'static str, second: Vec<u8>) -> String {
+        serve_many_bytes(vec![first.as_bytes().to_vec(), second])
     }
 
     fn runtime() -> tokio::runtime::Runtime {
@@ -532,29 +659,18 @@ mod tests {
     }
 
     #[test]
-    fn declared_large_content_length_gets_tarball_cap() {
-        // P2: Content-Length tiering now lives only in `npm_body_limit`, for
-        // npm registry downloads: a response claiming more than the module cap
-        // gets the 1GiB tarball bound, everything else — and every chunked
-        // response without Content-Length — stays on the module cap.
-        //
-        // `npm_body_limit` takes the raw content length because
-        // `reqwest::Response::from` re-derives it from a concrete Vec body and
-        // drops a declared header (a stream body yields None), so no mock
-        // response can carry an arbitrary declared length into the helper.
-        //
-        // The module-fetch path no longer reads Content-Length to pick its
-        // bound: `send_no_follow` pins every module request to the module cap,
-        // so a malicious module server declaring a huge Content-Length cannot
-        // buy itself a 1GiB budget. A network test proving that pin would need
-        // to push >256MiB over a socket, so it is asserted here structurally
-        // (the fixed call site) instead.
-        let size = ((256 << 20) + 1) as u64;
-        assert_eq!(npm_body_limit(Some(size)), MAX_TARBALL_BODY_BYTES);
-        // A module-cap-sized declaration stays on the module cap.
-        assert_eq!(npm_body_limit(Some(1024)), MAX_RESPONSE_BODY_BYTES);
-        // Chunked (no Content-Length) stays on the module cap.
-        assert_eq!(npm_body_limit(None), MAX_RESPONSE_BODY_BYTES);
+    fn body_budget_requires_explicit_tgz_path() {
+        // A `.tgz` path is the only evidence that permits the larger budget;
+        // Content-Length is deliberately ignored for tier selection.
+        let large = Some(u64::MAX);
+        assert_eq!(npm_body_limit(true, large), MAX_TARBALL_BODY_BYTES);
+        assert_eq!(npm_body_limit(false, large), MAX_RESPONSE_BODY_BYTES);
+        assert_eq!(
+            npm_body_limit(false, Some((256 << 20) as u64 + 1)),
+            MAX_RESPONSE_BODY_BYTES
+        );
+        // An explicitly named tarball remains eligible even when chunked.
+        assert_eq!(npm_body_limit(true, None), MAX_TARBALL_BODY_BYTES);
     }
 
     #[test]
@@ -599,6 +715,39 @@ mod tests {
     }
 
     #[test]
+    fn npm_download_preserves_tarball_identity_through_opaque_redirect() {
+        let mut body = vec![0x1f, 0x8b]; // gzip magic
+        body.extend_from_slice(&[0u8; 8]);
+        body.extend_from_slice(&((1u32 << 30) + 1).to_le_bytes()); // inflated ISIZE
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        let url = serve_then_bytes(
+            "HTTP/1.1 302 Found\r\nLocation: /cdn/opaque\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            response,
+        );
+        let client = ReqwestHttpClient::new().unwrap();
+        let original_url = Url::parse(&format!("{url}pkg/-/pkg-1.0.0.tgz")).unwrap();
+        runtime().block_on(async {
+            let result = client
+                .download_with_retries_on_any_tokio_runtime(original_url, None, None, None)
+                .await;
+            let err = match result {
+                Err(err) => err,
+                Ok(_) => panic!("expected the inflated tarball trailer to be rejected"),
+            };
+            let message = err.to_string();
+            assert!(
+                message.contains("decompressed bytes") && message.contains("budget"),
+                "unexpected error: {message}"
+            );
+        });
+    }
+
+    #[test]
     fn isize_guard_rejects_inflated_trailer() {
         // A small tarball whose gzip ISIZE trailer claims ~4 GiB must be
         // rejected at download time (upstream extraction would try_reserve
@@ -606,7 +755,7 @@ mod tests {
         let mut bytes = vec![0x1f, 0x8b]; // gzip magic
         bytes.extend_from_slice(&[0u8; 100]);
         bytes.extend_from_slice(&((1u32 << 30) + 1).to_le_bytes()); // ISIZE > 1 GiB budget
-        let err = guard_tarball_isize("/pkg/-/pkg-1.0.0.tgz", bytes).unwrap_err();
+        let err = guard_tarball_isize(true, bytes).unwrap_err();
         assert!(
             err.contains("decompressed bytes") && err.contains("budget"),
             "unexpected error: {err}"
@@ -618,7 +767,21 @@ mod tests {
         let mut bytes = vec![0x1f, 0x8b];
         bytes.extend_from_slice(&[0u8; 100]);
         bytes.extend_from_slice(&1024u32.to_le_bytes());
-        assert!(guard_tarball_isize("/pkg/-/pkg-1.0.0.tgz", bytes).is_ok());
+        assert!(guard_tarball_isize(true, bytes).is_ok());
+    }
+
+    #[test]
+    fn isize_guard_checks_the_last_member_of_a_multi_member_tarball() {
+        // ISIZE is a per-member trailer. Keep this pre-check deliberately
+        // coarse (the extractor remains responsible for full gzip parsing),
+        // but make sure an inflated final member still trips it.
+        let mut bytes = vec![0x1f, 0x8b];
+        bytes.extend_from_slice(&[0u8; 100]);
+        bytes.extend_from_slice(&1024u32.to_le_bytes());
+        bytes.extend_from_slice(&[0x1f, 0x8b]);
+        bytes.extend_from_slice(&[0u8; 100]);
+        bytes.extend_from_slice(&((1u32 << 30) + 1).to_le_bytes());
+        assert!(guard_tarball_isize(true, bytes).is_err());
     }
 
     #[test]
@@ -629,7 +792,7 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 100]);
         bytes.extend_from_slice(&((1u32 << 30) + 1).to_le_bytes());
         assert!(
-            guard_tarball_isize("/pkg/pkg-1.0.0", bytes).is_ok(),
+            guard_tarball_isize(false, bytes).is_ok(),
             "non-.tgz responses must pass through"
         );
     }
@@ -637,6 +800,6 @@ mod tests {
     #[test]
     fn isize_guard_ignores_non_gzip_bytes() {
         let bytes = vec![0u8; 64]; // no gzip magic
-        assert!(guard_tarball_isize("/pkg/-/pkg-1.0.0.tgz", bytes).is_ok());
+        assert!(guard_tarball_isize(true, bytes).is_ok());
     }
 }

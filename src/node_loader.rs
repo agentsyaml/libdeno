@@ -46,28 +46,32 @@ impl FsCjsAnalysisSourceProvider {
 impl node_resolver::analyze::CjsAnalysisSourceProvider for FsCjsAnalysisSourceProvider {
     fn load_source<'a>(&'a self, specifier: &ModuleSpecifier) -> Option<Cow<'a, str>> {
         let path = specifier.to_file_path().ok()?;
-        if !self.permissions.query_read_all() {
-            // Canonicalize first: the exemption must test the *resolved* path so
-            // `..`/symlink traversal can't smuggle a non-npm file past the check.
-            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let read_path = if self.permissions.query_read_all() {
+            canonical
+        } else {
+            // Canonicalize first: the exemption must test the *resolved* path
+            // so `..`/symlink traversal can't smuggle a non-npm file past the
+            // check. Read the path returned by check_open as well, rather than
+            // switching back to the original path after the permission check.
             let in_npm_package = ModuleSpecifier::from_file_path(&canonical)
                 .ok()
                 .map(|url| self.in_npm_pkg_checker.in_npm_package(&url))
                 .unwrap_or(false);
-            if !in_npm_package
-                && self
-                    .permissions
+            if in_npm_package {
+                canonical
+            } else {
+                self.permissions
                     .check_open(
                         Cow::Owned(canonical),
                         OpenAccessKind::Read,
                         Some("CJS analysis"),
                     )
-                    .is_err()
-            {
-                return None;
+                    .ok()?
+                    .into_owned_path()
             }
-        }
-        std::fs::read_to_string(path).ok().map(Cow::Owned)
+        };
+        std::fs::read_to_string(read_path).ok().map(Cow::Owned)
     }
 }
 
@@ -145,5 +149,52 @@ impl deno_runtime::deno_node::NodeRequireLoader for SimpleNodeRequireLoader {
     ) -> Result<bool, PackageJsonLoadError> {
         self.cjs_tracker
             .is_maybe_cjs_from_require(specifier, MediaType::from_specifier(specifier))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use node_resolver::analyze::CjsAnalysisSourceProvider;
+    use std::sync::Arc;
+
+    #[cfg(unix)]
+    #[test]
+    fn cjs_analysis_reads_the_canonical_checked_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir =
+            std::env::temp_dir().join(format!("libdeno-cjs-canonical-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let target = dir.join("target.cjs");
+        let link = dir.join("link.cjs");
+        std::fs::write(&target, "module.exports = 'canonical';").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let parser = Arc::new(
+            deno_runtime::deno_permissions::RuntimePermissionDescriptorParser::new(
+                sys_traits::impls::RealSys,
+            ),
+        );
+        let permissions = crate::permissions::build_permissions(
+            &[format!("--allow-read={}", target.display())],
+            false,
+            false,
+            parser,
+            &dir,
+        )
+        .unwrap();
+        let provider = FsCjsAnalysisSourceProvider::new(
+            permissions,
+            DenoInNpmPackageChecker::new(deno_resolver::npm::CreateInNpmPkgCheckerOptions::Byonm),
+        );
+        let specifier = ModuleSpecifier::from_file_path(&link).unwrap();
+
+        assert_eq!(
+            provider.load_source(&specifier).unwrap().as_ref(),
+            "module.exports = 'canonical';"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

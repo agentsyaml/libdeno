@@ -1,7 +1,7 @@
-"""Phase 1 synchronous API tests.
+"""Synchronous Python alpha API tests.
 
-Capture, async, subprocess, and native-addon coverage is intentionally left for
-Phase 2 or later.
+The binding intentionally does not expose capture, async, subprocess, or
+permission-hook APIs.
 """
 
 import json
@@ -142,6 +142,13 @@ class ApiTests(unittest.TestCase):
                         execution_deadline=deadline,
                     )
 
+        with self.assertRaises(libdeno.ConfigurationError):
+            libdeno.run(
+                loop,
+                allow_all_permissions=True,
+                max_heap_bytes=(8 << 20) - 1,
+            )
+
         with self.assertRaises(libdeno.DenoTimeoutError):
             libdeno.run(loop, allow_all_permissions=True, execution_deadline=0.05)
 
@@ -164,6 +171,11 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(
             libdeno.run(Path(entry), cwd=Path(directory), allow_all_permissions=True),
+            0,
+        )
+        runtime = libdeno.Runtime(os.fsencode(str(directory)))
+        self.assertEqual(
+            runtime.run(os.fsencode(str(entry)), allow_all_permissions=True),
             0,
         )
 
@@ -221,6 +233,28 @@ class ApiTests(unittest.TestCase):
             libdeno.run(InvalidPathLike(), allow_all_permissions=True)
         with self.assertRaises(libdeno.ConfigurationError):
             libdeno.run(entry, cwd=InvalidPathLike(), allow_all_permissions=True)
+
+    def test_none_cwd_uses_the_process_current_directory(self):
+        entry = self.write("default-cwd.js", "const ok = true;")
+        original_cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            self.assertEqual(
+                libdeno.run("default-cwd.js", cwd=None, allow_all_permissions=True),
+                0,
+            )
+            self.assertEqual(
+                libdeno.Runtime(cwd=None).run(
+                    "default-cwd.js", allow_all_permissions=True
+                ),
+                0,
+            )
+            self.assertEqual(
+                libdeno.Runtime().run("default-cwd.js", allow_all_permissions=True),
+                0,
+            )
+        finally:
+            os.chdir(original_cwd)
 
     def test_parallel_python_threads_and_gil_progress(self):
         script = self.write(

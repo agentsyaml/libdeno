@@ -1,5 +1,5 @@
 # Rust and Python production publishing share this workflow: one version tag
-# (vX.Y.Z) publishes the crate to crates.io and wheels to PyPI via trusted
+# (vMAJOR.MINOR.PATCH) publishes the crate to crates.io and wheels to PyPI via trusted
 # publishing (OIDC, no API token secrets), then creates a GitHub Release.
 #
 # The tag version must match the version fields in the root Cargo.toml,
@@ -20,11 +20,16 @@
 # 3. PyPI -> Account -> Publishing -> Add pending publisher (or the existing
 #    project -> Manage -> Publishing): owner `agentsyaml`, repo `libdeno`,
 #    workflow `release.yml`, environment `pypi`.
+# The workflow enforces the exact repository and strict tag contract before any
+# publisher job. Environment required reviewers and tag restrictions are GitHub
+# environment settings outside YAML; configure them on `crates-io` and `pypi`.
 name: Release
 
 on:
   push:
     tags:
+      # GitHub's tag filter cannot express SemVer; the shell guards below are
+      # the authoritative vMAJOR.MINOR.PATCH check.
       - "v*"
 
 concurrency:
@@ -50,6 +55,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch (2026-08-05)
 
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+
       - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
         with:
           tool: cargo-audit
@@ -59,10 +68,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          case "$GITHUB_REF_NAME" in
-            v*) tag="${GITHUB_REF_NAME#v}" ;;
-            *) echo "expected a vX.Y.Z tag, got $GITHUB_REF_NAME"; exit 1 ;;
-          esac
+          semver_tag_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! "$GITHUB_REF_NAME" =~ $semver_tag_re ]]; then
+            echo "expected an exact vMAJOR.MINOR.PATCH tag, got $GITHUB_REF_NAME"
+            exit 1
+          fi
+          tag="${GITHUB_REF_NAME#v}"
           root_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           python_project_version="$(sed -n 's/^version = "\(.*\)"/\1/p' python/pyproject.toml | head -1)"
           python_crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' python/Cargo.toml | head -1)"
@@ -72,11 +83,23 @@ jobs:
             }
           done
 
+      - name: Check offline Deno/TypeScript version ledger
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch --locked --manifest-path Cargo.toml
+          cargo fetch --locked --manifest-path python/Cargo.toml
+          cargo metadata --no-deps --format-version=1 --locked --offline >/dev/null
+          python .github/workflows/check-version-sync.py
+
       - name: Test
         run: cargo test --all-targets --locked
 
-      - name: Package
-        run: cargo package --locked --no-verify
+      - name: Package and verify final crate
+        # `cargo package` verifies the assembled archive by building the
+        # packaged source. This catches missing package files before publish;
+        # cargo publish must still repeat its registry upload/build path.
+        run: cargo package --locked
 
       - name: Audit root lockfile
         run: cargo audit --deny warnings
@@ -113,11 +136,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          case "$GITHUB_REF_NAME" in
-            v*) tag_version="${GITHUB_REF_NAME#v}" ;;
-            *) echo "expected a vX.Y.Z tag, got $GITHUB_REF_NAME"; exit 1 ;;
-          esac
-          test -n "$tag_version"
+          semver_tag_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! "$GITHUB_REF_NAME" =~ $semver_tag_re ]]; then
+            echo "expected an exact vMAJOR.MINOR.PATCH tag, got $GITHUB_REF_NAME"
+            exit 1
+          fi
+          tag_version="${GITHUB_REF_NAME#v}"
           EXPECTED_VERSION="$tag_version" python - <<'PY'
           import os
           import re
@@ -131,6 +155,10 @@ jobs:
 
           versions = {}
           for wheel in wheels:
+              if "-cp39-abi3-" not in wheel.name:
+                  raise SystemExit(
+                      f"{wheel.name}: expected a cp39-abi3 wheel tag"
+                  )
               with zipfile.ZipFile(wheel) as archive:
                   metadata_names = [
                       name
@@ -150,6 +178,25 @@ jobs:
                       raise SystemExit(
                           f"{wheel.name}: expected exactly one non-empty Version field"
                       )
+                  wheel_names = [
+                      name
+                      for name in archive.namelist()
+                      if re.fullmatch(r"[^/]+\.dist-info/WHEEL", name)
+                  ]
+                  if len(wheel_names) != 1:
+                      raise SystemExit(
+                          f"{wheel.name}: expected exactly one *.dist-info/WHEEL, "
+                          f"found {len(wheel_names)}"
+                      )
+                  tags = [
+                      line.split(":", 1)[1].strip()
+                      for line in archive.read(wheel_names[0]).decode("utf-8").splitlines()
+                      if line.startswith("Tag:") and ":" in line
+                  ]
+                  if not any(tag.startswith("cp39-abi3-") for tag in tags):
+                      raise SystemExit(
+                          f"{wheel.name}: WHEEL metadata does not declare a cp39-abi3 tag"
+                      )
                   versions.setdefault(values[0].strip(), []).append(wheel.name)
 
           if len(versions) != 1:
@@ -165,7 +212,7 @@ jobs:
 
   publish-crates:
     name: publish to crates.io
-    if: github.repository == 'agentsyaml/libdeno'
+    if: github.repository == 'agentsyaml/libdeno' && github.ref_type == 'tag'
     needs: [preflight, python-verify]
     runs-on: ubuntu-latest
     environment: crates-io
@@ -197,7 +244,7 @@ jobs:
 
   publish-pypi:
     name: publish to PyPI
-    if: github.repository == 'agentsyaml/libdeno'
+    if: github.repository == 'agentsyaml/libdeno' && github.ref_type == 'tag'
     needs: [preflight, python-verify]
     runs-on: ubuntu-latest
     environment: pypi

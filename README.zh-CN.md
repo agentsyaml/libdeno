@@ -42,7 +42,7 @@ let exit_code = run("app.js", &options).unwrap();
 
 ### 复用解析器栈：`LibdenoRuntime` + `run_with`
 
-`run()` 每次调用都会重建解析器栈（workspace / resolver / npm-installer 工厂、图解析器）。对在同一项目运行大量脚本的长驻宿主，可以一次构建并复用该栈——配置链变化时会自动重建：
+`run()` 每次调用都会重建解析器栈（workspace / resolver / npm-installer 工厂、图解析器）。对在同一项目运行大量脚本的长驻宿主，可以一次构建并复用该栈——项目配置链、`deno.lock`、根目录 `node_modules`、有效 registry 以及 resolver 支持的全局 npmrc（`$HOME/.npmrc`）发生变化时会自动重建。`deno_resolver` 0.88 不读取 `NPM_CONFIG_USERCONFIG`。对于配置链之外的变化（例如嵌套 `node_modules`），可调用 `runtime.refresh()` 强制下一次运行重建；这是显式的有限失效机制，不是递归 watcher/hash：
 
 ```rust
 use libdeno::{LibdenoRuntime, LibdenoOptions, run_with};
@@ -52,7 +52,7 @@ let options = LibdenoOptions { allow_all_permissions: true, ..Default::default()
 let exit_code = run_with(&runtime, "app.js", &options).unwrap();
 ```
 
-相对路径按 runtime 的 cwd 解析（进程 cwd 从不切换，`LibdenoOptions.cwd` 作为解析基准被忽略）——脚本本身观察到的是宿主的 cwd。每次 `run_with` 仍用各自的 `options.permissions` 重建权限相关的 file fetcher / graph loader / graph，因此一次运行的授权不会泄漏给另一次。
+入口与模块的相对路径按 `LibdenoRuntime::new(cwd)` 的 cwd 解析；进程 cwd 从不切换，脚本本身观察到的是宿主的 cwd。`LibdenoOptions.cwd` 可以省略；若提供则必须与 runtime 的目录（按 canonicalize 比较）一致，否则以 `LibdenoError::Configuration` 拒绝。每次 `run_with` 仍用各自的 `options.permissions` 重建权限相关的 file fetcher / graph loader / graph，因此一次运行的授权不会泄漏给另一次。
 
 ### 运行示例
 
@@ -84,7 +84,8 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `run(entry, &options) -> Result<i32, LibdenoError>` | 运行入口到完成，返回脚本请求的退出码。每次调用构建独立的 current-thread 运行时与 worker；普通运行完全并行——各自拥有线程、isolate 与图，不共享任何可变状态（进程级 analysis / npm-snapshot / 磁盘缓存是安全的共享状态；进程 cwd 从不切换）。可在 tokio 运行时内安全调用——自动在独立线程上执行（见下文）。 |
 | `run_with_output(entry, &options) -> Result<RunOutput, LibdenoError>` | 同 `run`，但当 `capture_stdout` / `capture_stderr` 开启时把脚本的 stdout/stderr 捕获进 `RunOutput`。 |
 | `run_async(entry, &options) -> Result<i32, LibdenoError>` | 异步入口：在**调用方**的 tokio 运行时上执行脚本——不派生子线程。必须在 tokio 上下文中 await；future 不是 `Send`，同一线程上第二个 `run_async` 会被 `LibdenoError::Configuration` 拒绝（交错运行会中止进程）。一次只 await 一个——并行运行请用 `run`。 |
-| `LibdenoRuntime::new(cwd)` | 为一个项目目录构建一次解析器栈（async）。被 `run_with` 复用；配置链（deno.json / deno.jsonc / import_map.json / package.json / .npmrc / node_modules）变化时自动重建。 |
+| `LibdenoRuntime::new(cwd)` | 为一个项目目录构建一次解析器栈（async）。被 `run_with` 复用；配置链（deno.json / deno.jsonc / import_map.json / package.json / `.npmrc` / `deno.lock` / `node_modules`）或有效 npm registry / `$HOME/.npmrc` 变化时自动重建。 |
+| `LibdenoRuntime::refresh()` | 强制下一次 reusable run 重建解析器栈，例如发现嵌套 `node_modules` 变化时使用。 |
 | `run_with(&runtime, entry, &options) -> Result<i32, LibdenoError>` | 同 `run`，但复用 `runtime` 的解析器栈。语义与 `run` 一致（普通运行并行、tokio 重入处理、退出码、超时）；相对路径按 runtime 的 cwd 解析，权限相关组件每次调用重建。捕获标志与不匹配的 `options.cwd` 会被 `LibdenoError::Configuration` 拒绝。 |
 | `libdeno::runtime::run_with_output(&runtime, entry, &options) -> Result<RunOutput, LibdenoError>` | 同 `run_with`，但当 `capture_stdout` / `capture_stderr` 开启时把脚本的 stdout/stderr 捕获进 `RunOutput`——长驻宿主对应的 `run_with_output`（后者每次调用重建解析器栈）。其余语义与 `run_with` 一致。 |
 | `run_in_subprocess(entry, &options) -> Result<i32, LibdenoError>` | 在子进程中运行入口。此时 `Deno.exit(n)` 只会终止子进程；宿主进程保持存活并拿到 `n`。宿主需在 `main()` 开头调用 `maybe_handle_child_mode()`。 |
@@ -97,8 +98,8 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `LibdenoOptions.features: Option<Vec<String>>` | 覆盖默认 unstable 特性集（`kv`、`cron`、`ffi`、`webgpu`、`worker-options`）。特性名必须是合法的 deno unstable 特性名；`None`（默认）启用默认特性集。运行不受信任插件的嵌入方可缩小暴露面（例如 `Some(vec!["ffi".into()])`）；op 本身始终受权限管控。 |
 | `LibdenoOptions.args: Vec<String>` | 通过 `process.argv`（argv[0] 之后）暴露给脚本的参数。 |
 | `LibdenoOptions.cwd: Option<PathBuf>` | 相对路径（入口、权限、node_modules 发现）解析的基准目录，默认进程当前目录。进程 cwd 从不切换——脚本观察到的是宿主的 cwd（`Deno.cwd()`），需要按运行指定工作目录时请用 `run_in_subprocess`。 |
-| `LibdenoOptions.max_heap_bytes: Option<usize>` | 进程内、尽力而为的 V8 老生代堆约束（字节）；不覆盖 native 分配、V8 external memory、宿主分配或子进程内存，也不是 OS/进程级内存边界。适用于主 worker **以及** `new Worker(...)` 派生的 web worker。 |
-| `LibdenoOptions.execution_deadline: Option<Duration>` | 进程内、尽力而为的时限；当 V8 到达可中断的 JavaScript stack check 时可中断并返回 `LibdenoError::Timeout`。**不能**中断阻塞系统调用、native code、子进程等待或阻塞的 permission broker/hook，因此运行可能超过请求的时限。 |
+| `LibdenoOptions.max_heap_bytes: Option<usize>` | 进程内、尽力而为的 V8 老生代堆约束（字节）；小于 8 MiB 的值会被拒绝。不覆盖 native 分配、V8 external memory、宿主分配、RSS、CPU 或子进程内存，也不是 OS/进程级边界。适用于主 worker **以及** `new Worker(...)` 派生的 web worker。 |
+| `LibdenoOptions.execution_deadline: Option<Duration>` | 进程内、尽力而为的时限；当 V8 到达可中断的 JavaScript stack check 时可中断并返回 `LibdenoError::Timeout`。**不能**中断阻塞系统调用、native code、子进程等待或阻塞的 permission broker/hook，因此运行可能超过请求的时限，也不是 CPU 时间上限。 |
 | `LibdenoError` | 枚举：`Entry`（入口解析失败）、`Permission`（权限字符串非法）、`Configuration`（选项无法构成合法配置，如 v0.2.0 起空权限列表未显式选择）、`Runtime`（运行时启动 / 脚本失败——脚本 JS 异常走这里）、`Core`（保留；不会为脚本错误构造）、`Io`、`Timeout`（超时；消息说明具体原因）。 |
 
 支持的权限标志：`--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-import[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`，以及 `-A` / `--allow-all`。`--allow-import` 管控远程模块加载（没有 `--allow-net` 兜底）；静态与动态文件导入由 `--allow-read` 管控。
@@ -126,6 +127,13 @@ println!("exit={} stdout={:?}", out.exit_code, out.stdout);
 `LibdenoOptions.max_capture_bytes` 限制每个流的缓冲区（stdout 与 stderr 各一份额度）：流超限时停止捕获、丢弃多余输出并置位 `RunOutput.capture_truncated`，防止冗长或恶意的脚本无限撑大宿主内存。`None`（默认）不限量。
 
 输出捕获仅限 unix：Windows 上 Rust std 的 stdout/stderr 绕过被重定向的 CRT fd，因此 `capture_stdout`/`capture_stderr` 在那里会以 `LibdenoError::Configuration` 错误失败（请改用 `run_in_subprocess_with_output`——子进程自己的 fd 被管道回传，Windows 上也可用）。`run_with` 不支持捕获——请用 `run_with_output`，长驻宿主复用解析器栈时用 `libdeno::runtime::run_with_output(&runtime, ...)`。
+
+### 资源与监督边界
+
+- 远程模块响应体与 npm 元数据在解压后限制为 256 MiB；明确的 npm `.tgz` 路径下载限制为 1 GiB，并按默认 1 GiB 的 gzip `ISIZE` 解压预算预检（可用 `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES` 调整）。这是粗粒度防护，不是多成员 gzip 的精确总量核算。
+- 每个 HTTP 操作有 300 秒墙钟预算，覆盖重试、退避、适用的重定向和响应体读取；它与 `execution_deadline` 分离。
+- npm 生命周期脚本默认关闭。启用时只监督直接子进程：运行预算 60 秒，随后最多等待 5 秒完成 kill/wait；后代进程不受监督。
+- 子进程模式只把 `Deno.exit` 与直接运行时终止限制在直接子进程内，不承诺完整进程树清理，也不提供 RSS 或 CPU 硬隔离；需要这些边界时请使用 OS 级 supervisor 或 sandbox。
 
 完整 API 文档见 [`docs/api.md`](docs/api.md)（英文）。常见嵌入形态（npm 插件 + 输出捕获）的端到端示例见 [`examples/npm-plugin.md`](examples/npm-plugin.md)（英文）。
 

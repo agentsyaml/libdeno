@@ -61,8 +61,17 @@ fn run(
 #[pymethods]
 impl Runtime {
     #[new]
-    fn new(py: Python<'_>, cwd: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let cwd = path_from_python(cwd, "cwd")?;
+    #[pyo3(
+        signature = (cwd=None),
+        text_signature = "(cwd=None)"
+    )]
+    fn new(py: Python<'_>, cwd: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
+        let cwd = match cwd {
+            Some(cwd) => path_from_python(&cwd, "cwd")?,
+            None => std::env::current_dir().map_err(|error| {
+                DenoIOError::new_err(format!("failed to get current directory: {error}"))
+            })?,
+        };
         let result: Result<libdeno::LibdenoRuntime, String> = py.detach(|| {
             let tokio_runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

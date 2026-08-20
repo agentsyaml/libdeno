@@ -22,9 +22,14 @@ use crate::RunLease;
 /// pipeline once; [`run_with`], [`Self::run_async`], and
 /// [`Self::run_with_output_async`] then reuse it across runs. The stack is
 /// rebuilt automatically when the config discovery chain changes (deno.json /
-/// deno.jsonc / import_map.json / package.json / .npmrc / node_modules at the
-/// project root and its ancestors), so long-lived hosts serving the same
-/// project skip the per-run factory construction entirely.
+/// deno.jsonc / import_map.json / package.json / `.npmrc`, `deno.lock`, and
+/// `node_modules` at the project root and its ancestors), or when the effective
+/// npm registry or the resolver-supported global npmrc changes. The npm
+/// fingerprint includes the effective registry URL and `$HOME/.npmrc` by
+/// canonical path and content, so long-lived hosts serving the same project
+/// skip the per-run factory construction while still observing those changes.
+/// deno_resolver 0.88 reads `$HOME/.npmrc` and does not honor
+/// `NPM_CONFIG_USERCONFIG`.
 ///
 /// The runtime is single-threaded by design: the module loader stack is
 /// `Rc<dyn ModuleLoader>`-based. Synchronous `run_with` executes on a fresh
@@ -46,8 +51,18 @@ pub struct LibdenoRuntime {
 }
 
 struct RuntimeState {
-    fingerprint: Vec<(u64, u64)>,
+    fingerprint: ConfigFingerprint,
     shared: Arc<SharedServices>,
+    /// Monotonic invalidation generation requested by [`LibdenoRuntime::refresh`].
+    refresh_generation: u64,
+    /// Generation covered by the currently installed resolver stack.
+    built_generation: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ConfigFingerprint {
+    config: Vec<(u64, u64)>,
+    npm_cache: crate::npm_cache::NpmCacheKey,
 }
 
 impl LibdenoRuntime {
@@ -69,8 +84,22 @@ impl LibdenoRuntime {
             state: Arc::new(std::sync::Mutex::new(RuntimeState {
                 fingerprint,
                 shared,
+                refresh_generation: 0,
+                built_generation: 0,
             })),
         })
+    }
+
+    /// Marks the resolver stack stale. The next [`run_with`],
+    /// [`Self::run_async`], or [`Self::run_with_output_async`] call rebuilds
+    /// the permission-free stack before executing. Use this after filesystem
+    /// changes below the discovered config chain, such as edits inside nested
+    /// `node_modules`; registry and `$HOME/.npmrc` changes are detected by the
+    /// effective npm fingerprint. This is an explicit bounded
+    /// invalidation mechanism, not a recursive watcher or tree hash.
+    pub fn refresh(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.refresh_generation = state.refresh_generation.wrapping_add(1);
     }
 
     /// Runs `entry` on the caller's tokio runtime using this runtime's shared
@@ -303,9 +332,16 @@ fn run_with_sync(
 /// reusable entry points; all permission-bound run state remains per-call.
 async fn shared_for_run(runtime: &LibdenoRuntime) -> Result<Arc<SharedServices>, LibdenoError> {
     let fp = config_fingerprint(&runtime.cwd);
-    let stale = {
+    let (stale, build_generation) = {
         let state = runtime.state.lock().unwrap_or_else(|e| e.into_inner());
-        fp != state.fingerprint
+        (
+            needs_rebuild(
+                fp != state.fingerprint,
+                state.refresh_generation,
+                state.built_generation,
+            ),
+            state.refresh_generation,
+        )
     };
     if stale {
         let cwd = runtime.cwd.clone();
@@ -313,8 +349,14 @@ async fn shared_for_run(runtime: &LibdenoRuntime) -> Result<Arc<SharedServices>,
             .await
             .map_err(LibdenoError::Runtime)?;
         let mut state = runtime.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.fingerprint = fp;
-        state.shared = rebuilt.clone();
+        // Do not consume a refresh that arrived while SharedServices::new was
+        // running. The current run may use this stack, but the next run must
+        // rebuild again. This is an epoch check, not a clearable bool.
+        if state.refresh_generation == build_generation {
+            state.fingerprint = fp;
+            state.shared = rebuilt.clone();
+            state.built_generation = build_generation;
+        }
         Ok(rebuilt)
     } else {
         Ok(runtime
@@ -326,18 +368,25 @@ async fn shared_for_run(runtime: &LibdenoRuntime) -> Result<Arc<SharedServices>,
     }
 }
 
+fn needs_rebuild(
+    fingerprint_changed: bool,
+    refresh_generation: u64,
+    built_generation: u64,
+) -> bool {
+    fingerprint_changed || refresh_generation != built_generation
+}
+
 /// Fingerprint of the config discovery chain rooted at `cwd`: walking up from
 /// the project directory, the content hash of every small config file
 /// (deno.json / deno.jsonc / import_map.json / package.json / .npmrc), the
 /// (mtime, size) of deno.lock (potentially large, so no content read), plus
 /// the (mtime, 0) of every node_modules directory (its mtime moves on direct
-/// package add/remove, flipping BYONM <-> managed). `run_with` rebuilds the
-/// resolver stack when this changes. The walk order is deterministic, so Vec
-/// equality is the comparison.
-// ponytail: the node_modules entry only reflects *direct* children (a nested
-// package install deep inside the tree does not touch the root dir's mtime);
-// add a content tree hash if that case needs invalidation.
-fn config_fingerprint(cwd: &Path) -> Vec<(u64, u64)> {
+/// package add/remove, flipping BYONM <-> managed). The npm cache key is also
+/// included unchanged, covering the effective registry, project `.npmrc`, and
+/// the resolver-supported `$HOME/.npmrc`. `run_with` rebuilds the resolver
+/// stack when this changes. The walk order is deterministic, so equality is
+/// the comparison.
+fn config_fingerprint(cwd: &Path) -> ConfigFingerprint {
     const CONFIG_FILES: [&str; 5] = [
         "deno.json",
         "deno.jsonc",
@@ -373,7 +422,10 @@ fn config_fingerprint(cwd: &Path) -> Vec<(u64, u64)> {
         }
         dir = parent;
     }
-    entries
+    ConfigFingerprint {
+        config: entries,
+        npm_cache: crate::npm_cache::compute_key(cwd),
+    }
 }
 
 /// Content hash of a small config file — catches same-size same-mtime edits
@@ -409,4 +461,26 @@ pub(crate) fn has_watcher_exited(worker: &deno_runtime::worker::MainWorker) -> b
         .borrow()
         .try_borrow::<deno_runtime::deno_os::WatcherExited>()
         .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_rebuild;
+
+    #[test]
+    fn refresh_during_rebuild_survives_old_commit() {
+        let build_generation = 0;
+        let mut refresh_generation = build_generation;
+
+        // A rebuild starts, then refresh() runs before that rebuild commits.
+        refresh_generation += 1;
+        // The old rebuild records only the generation it observed.
+        let built_generation = build_generation;
+        assert!(needs_rebuild(false, refresh_generation, built_generation));
+
+        // The next rebuild observes the new generation and clears the stale
+        // state only by installing a stack built for that same generation.
+        let built_generation = refresh_generation;
+        assert!(!needs_rebuild(false, refresh_generation, built_generation));
+    }
 }

@@ -45,13 +45,17 @@ use crate::http::ReqwestHttpClient;
 /// npm process state propagated to `child_process.fork` children (mirrors
 /// deno_lib's `NpmProcessStateProvider` so the forked child can restore the
 /// npm resolution snapshot).
-#[derive(Debug)]
 pub struct NpmProcessStateProviderImpl {
-    kind: NpmProcessStateKind,
+    kind: NpmProcessStateProviderKind,
     local_node_modules_path: Option<String>,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+enum NpmProcessStateProviderKind {
+    Managed(deno_resolver::npm::managed::NpmResolutionCellRc),
+    Byonm,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 enum NpmProcessStateKind {
     Snapshot(deno_npm::resolution::SerializedNpmResolutionSnapshot),
     Byonm,
@@ -61,25 +65,47 @@ enum NpmProcessStateKind {
 /// child_process.fork). WARNING: when the registry URL is of the form
 /// `https://user:pass@host/`, those credentials ride along in this serialized
 /// string. The hand-off is same-process/same-user (not a privilege boundary),
-/// but the string must never be logged or shipped across machines.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// but the string must never be logged or shipped across machines. The
+/// provider keeps only the resolution cell and serializes it at fork time, so
+/// it does not retain or expose an obsolete snapshot through its debug
+/// representation.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct NpmProcessState {
     kind: NpmProcessStateKind,
     local_node_modules_path: Option<String>,
 }
 
+impl std::fmt::Debug for NpmProcessStateProviderImpl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NpmProcessStateProviderImpl")
+            .field(
+                "kind",
+                &match &self.kind {
+                    NpmProcessStateProviderKind::Managed(_) => "managed",
+                    NpmProcessStateProviderKind::Byonm => "byonm",
+                },
+            )
+            .field("local_node_modules_path", &self.local_node_modules_path)
+            .finish()
+    }
+}
+
 impl deno_runtime::deno_process::NpmProcessStateProvider for NpmProcessStateProviderImpl {
     fn get_npm_process_state(&self) -> String {
-        match deno_core::serde_json::to_string(&NpmProcessState {
-            kind: self.kind.clone(),
+        let kind = match &self.kind {
+            NpmProcessStateProviderKind::Managed(resolution) => NpmProcessStateKind::Snapshot(
+                resolution.serialized_valid_snapshot().into_serialized(),
+            ),
+            NpmProcessStateProviderKind::Byonm => NpmProcessStateKind::Byonm,
+        };
+        // The string is written to a private inherited fd by deno_process. Do
+        // not log serialization failures: the serialized state may contain
+        // registry credentials.
+        deno_core::serde_json::to_string(&NpmProcessState {
+            kind,
             local_node_modules_path: self.local_node_modules_path.clone(),
-        }) {
-            Ok(json) => json,
-            Err(e) => {
-                eprintln!("libdeno: failed to serialize npm process state: {e}");
-                "{}".to_string()
-            }
-        }
+        })
+        .unwrap_or_else(|_| "{}".to_string())
     }
 }
 
@@ -89,6 +115,62 @@ impl deno_runtime::deno_process::NpmProcessStateProvider for NpmProcessStateProv
 /// runtime (node, node-gyp, ...) must be available on PATH.
 #[derive(Debug)]
 pub struct ShellLifecycleScriptsExecutor;
+
+/// A lifecycle script is arbitrary package code. Keep one script from
+/// pinning the npm install forever, while leaving enough room for ordinary
+/// native-addon builds. The direct child is supervised; descendants are not
+/// claimed to be part of this boundary until platform process-tree support is
+/// added.
+// ponytail: direct-child supervision now; add process groups/Job Objects after
+// the platform-specific lifecycle research is available.
+const LIFECYCLE_SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const LIFECYCLE_KILL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn supervise_lifecycle_script(
+    mut child: tokio::process::Child,
+    package: &str,
+    event: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<std::process::ExitStatus> {
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(anyhow::anyhow!(
+            "lifecycle script `{event}` for package `{package}` wait failed: {error}"
+        )),
+        Err(_) => {
+            let kill_error = child.start_kill().err();
+            let wait_result = tokio::time::timeout(LIFECYCLE_KILL_WAIT_TIMEOUT, child.wait()).await;
+            match (kill_error, wait_result) {
+                (None, Ok(Ok(status))) => Err(anyhow::anyhow!(
+                    "lifecycle script `{event}` for package `{package}` timed out after \
+                     {timeout:?}; direct child killed with {status}; process-tree descendants \
+                     are not supervised"
+                )),
+                (Some(kill_error), Ok(Ok(status))) => Err(anyhow::anyhow!(
+                    "lifecycle script `{event}` for package `{package}` timed out after \
+                     {timeout:?}; direct-child kill failed: {kill_error}; wait returned {status}; \
+                     process-tree descendants are not supervised"
+                )),
+                (kill_error, Ok(Err(wait_error))) => Err(anyhow::anyhow!(
+                    "lifecycle script `{event}` for package `{package}` timed out after \
+                     {timeout:?}; kill result: {}; wait failed: {wait_error}; process-tree \
+                     descendants are not supervised",
+                    kill_error
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "sent".to_string())
+                )),
+                (kill_error, Err(_)) => Err(anyhow::anyhow!(
+                    "lifecycle script `{event}` for package `{package}` timed out after \
+                     {timeout:?}; kill result: {}; direct child did not exit within \
+                     {LIFECYCLE_KILL_WAIT_TIMEOUT:?}; process-tree descendants are not supervised",
+                    kill_error
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "sent".to_string())
+                )),
+            }
+        }
+    }
+}
 
 #[async_trait::async_trait(?Send)]
 impl deno_npm_installer::lifecycle_scripts::LifecycleScriptsExecutor
@@ -126,7 +208,7 @@ impl deno_npm_installer::lifecycle_scripts::LifecycleScriptsExecutor
                 cmd.args(["/d", "/s", "/C"]);
                 #[cfg(not(windows))]
                 cmd.arg("-c");
-                let status = cmd
+                let child = cmd
                     .arg(script)
                     .current_dir(cwd)
                     .env("PATH", &path)
@@ -135,8 +217,16 @@ impl deno_npm_installer::lifecycle_scripts::LifecycleScriptsExecutor
                     .env("npm_lifecycle_script", script)
                     .env("npm_package_name", name)
                     .env("npm_package_version", pkg.package.id.nv.version.to_string())
-                    .status()
-                    .await?;
+                    .spawn()
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "lifecycle script `{event}` for package `{name}` could not start: \
+                             {error}"
+                        )
+                    })?;
+                let status =
+                    supervise_lifecycle_script(child, name, event, LIFECYCLE_SCRIPT_TIMEOUT)
+                        .await?;
                 if !status.success() {
                     return Err(anyhow::anyhow!(
                         "lifecycle script `{event}` for package `{name}` failed with {status}"
@@ -152,19 +242,18 @@ impl deno_npm_installer::lifecycle_scripts::LifecycleScriptsExecutor
 
 /// Builds the provider from the resolver factory's npm resolver, matching
 /// deno_lib::npm::create_npm_process_state_provider. The serialized snapshot
-/// (see `NpmProcessState`) may embed registry credentials — the resulting
-/// string is handed to forked npm child processes, so it must never be logged
-/// or sent off-machine.
+/// (see `NpmProcessState`) may embed registry credentials — it is generated
+/// only when deno_process is about to fork and must never be logged or sent
+/// off-machine.
 pub fn create_npm_process_state_provider(
     resolver_factory: &Arc<ResolverFactory<RealSys>>,
 ) -> deno_core::anyhow::Result<deno_runtime::deno_process::NpmProcessStateProviderRc> {
     use deno_resolver::npm::NpmResolver;
     match resolver_factory.npm_resolver()? {
         NpmResolver::Managed(managed) => {
-            let resolution = managed.resolution();
             Ok(deno_fs::sync::MaybeArc::new(NpmProcessStateProviderImpl {
-                kind: NpmProcessStateKind::Snapshot(
-                    resolution.serialized_valid_snapshot().into_serialized(),
+                kind: NpmProcessStateProviderKind::Managed(
+                    resolver_factory.npm_resolution().clone(),
                 ),
                 local_node_modules_path: managed
                     .root_node_modules_path()
@@ -173,7 +262,7 @@ pub fn create_npm_process_state_provider(
         }
         NpmResolver::Byonm(byonm) => {
             Ok(deno_fs::sync::MaybeArc::new(NpmProcessStateProviderImpl {
-                kind: NpmProcessStateKind::Byonm,
+                kind: NpmProcessStateProviderKind::Byonm,
                 local_node_modules_path: byonm
                     .root_node_modules_path()
                     .map(|p| p.to_string_lossy().to_string()),
@@ -490,5 +579,82 @@ impl RuntimeServices {
             graph_loader,
             graph,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deno_runtime::deno_process::NpmProcessStateProvider;
+
+    #[test]
+    fn npm_process_state_provider_reads_latest_snapshot_for_repeated_forks() {
+        let resolution = deno_fs::sync::MaybeArc::new(
+            deno_resolver::npm::managed::NpmResolutionCell::from_serialized(None),
+        );
+        let provider = NpmProcessStateProviderImpl {
+            kind: NpmProcessStateProviderKind::Managed(resolution.clone()),
+            local_node_modules_path: None,
+        };
+        let initial = provider.get_npm_process_state();
+
+        let id = deno_npm::NpmPackageId::from_serialized("state-pkg@1.0.0").unwrap();
+        let snapshot = deno_npm::resolution::SerializedNpmResolutionSnapshot {
+            root_packages: std::collections::HashMap::new(),
+            packages: vec![
+                deno_npm::resolution::SerializedNpmResolutionSnapshotPackage {
+                    id,
+                    system: Default::default(),
+                    dist: None,
+                    dependencies: std::collections::HashMap::new(),
+                    optional_dependencies: std::collections::HashSet::new(),
+                    optional_peer_dependencies: std::collections::HashSet::new(),
+                    extra: None,
+                    is_deprecated: false,
+                    has_bin: false,
+                    has_scripts: false,
+                },
+            ],
+        }
+        .into_valid()
+        .unwrap();
+        resolution.set_snapshot(deno_npm::resolution::NpmResolutionSnapshot::new(snapshot));
+
+        // Each call represents a separate fork request; both must observe the
+        // cell after managed npm resolution has completed.
+        let first_fork = provider.get_npm_process_state();
+        let second_fork = provider.get_npm_process_state();
+        assert_ne!(initial, first_fork);
+        assert_eq!(first_fork, second_fork);
+        assert!(first_fork.contains("state-pkg@1.0.0"));
+        assert!(!format!("{provider:?}").contains("state-pkg@1.0.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_supervision_times_out_and_reaps_direct_child() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime.block_on(async {
+            let child = tokio::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap();
+            supervise_lifecycle_script(
+                child,
+                "lifecycle-test-package",
+                "install",
+                std::time::Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err()
+        });
+        let message = error.to_string();
+        assert!(message.contains("lifecycle-test-package"));
+        assert!(message.contains("install"));
+        assert!(message.contains("timed out"));
+        assert!(message.contains("direct child"));
     }
 }

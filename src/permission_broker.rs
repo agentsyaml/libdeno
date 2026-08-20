@@ -42,6 +42,12 @@ pub struct PermissionRequest {
 /// the process: the upstream check path blocks on the bridge while the bridge
 /// thread is inside the hook waiting for that same check.
 ///
+/// The hook is invoked inline. There is intentionally no detached timeout
+/// worker: an arbitrary `Fn` cannot be safely cancelled, and leaving it alive
+/// after a timeout would let it retain state or make a decision after the
+/// request was closed. A hook that does not return therefore produces no allow
+/// response and stalls the upstream check, as documented above.
+///
 /// A blocked hook also defeats `execution_deadline`: the permission-check
 /// thread is parked in the bridge read, so `terminate_execution` has no JS
 /// stack to throw into and the event loop (and its timers) are never polled.
@@ -249,9 +255,37 @@ struct BrokerResponseLine {
     reason: Option<String>,
 }
 
+/// Maximum bytes in one newline-delimited broker request, including the
+/// newline. `deno_permissions` currently reads its response with an
+/// unbounded `read_line`; this local hook endpoint must bound the request it
+/// accepts so an untrusted peer cannot make the bridge allocate forever.
+#[cfg(unix)]
+const MAX_BROKER_LINE_BYTES: usize = 64 * 1024;
+
+#[cfg(unix)]
+fn read_broker_line<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::BufRead;
+    use std::io::Read;
+
+    let mut line = Vec::with_capacity(MAX_BROKER_LINE_BYTES.min(4096));
+    let read = reader
+        .by_ref()
+        .take((MAX_BROKER_LINE_BYTES + 1) as u64)
+        .read_until(b'\n', &mut line)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if read > MAX_BROKER_LINE_BYTES || line.last() != Some(&b'\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "permission broker request line exceeds the configured limit",
+        ));
+    }
+    Ok(Some(line))
+}
+
 #[cfg(unix)]
 fn serve_broker_connection(stream: std::os::unix::net::UnixStream, hook: &PermissionPrompt) {
-    use std::io::BufRead;
     use std::io::BufReader;
     use std::io::Write;
     let reader_stream = match stream.try_clone() {
@@ -263,14 +297,9 @@ fn serve_broker_connection(stream: std::os::unix::net::UnixStream, hook: &Permis
     };
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break, // broker disconnected (EOF / error)
-            Ok(_) => {}
-        }
-        let response = match deno_core::serde_json::from_str::<BrokerRequest>(line.trim()) {
+    // EOF, malformed framing, and oversized requests all stop the bridge.
+    while let Ok(Some(line)) = read_broker_line(&mut reader) {
+        let response = match deno_core::serde_json::from_slice::<BrokerRequest>(&line) {
             Ok(req) => {
                 let request = PermissionRequest {
                     name: req.permission,
@@ -362,5 +391,41 @@ mod tests {
         }));
         assert_eq!(id, 7);
         assert_eq!(result, "deny");
+    }
+
+    #[test]
+    fn oversized_broker_request_disconnects_without_calling_hook() {
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let called_by_hook = called.clone();
+        let hook: PermissionPrompt = Arc::new(move |_req: &PermissionRequest| {
+            called_by_hook.store(true, Ordering::SeqCst);
+            true
+        });
+        let bridge = std::thread::spawn(move || serve_broker_connection(server, &hook));
+
+        // No newline is needed: the bounded reader reaches its max+1 sentinel
+        // and closes the connection instead of growing a request buffer.
+        client
+            .write_all(&vec![b'x'; MAX_BROKER_LINE_BYTES + 1])
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        bridge.join().unwrap();
+
+        assert!(
+            response.is_empty(),
+            "oversized requests must be disconnected"
+        );
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "oversized requests must not reach the hook"
+        );
     }
 }

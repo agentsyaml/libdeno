@@ -14,6 +14,8 @@
 
 use std::borrow::Cow;
 use std::future::Future;
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -29,8 +31,10 @@ use deno_core::RequestedModuleType;
 use deno_core::ResolutionKind;
 use deno_error::JsErrorBox;
 use deno_graph::BuildOptions;
+use deno_graph::CheckJsOption;
 use deno_graph::GraphKind;
 use deno_graph::ModuleGraph;
+use deno_graph::WalkOptions;
 use deno_media_type::MediaType;
 use deno_resolver::loader::LoadedModuleOrAsset;
 use deno_resolver::loader::LoadedModuleSource;
@@ -52,6 +56,8 @@ pub struct GraphModuleLoader {
     file_fetcher: Arc<RealFileFetcher>,
     graph_loader: Arc<RealGraphLoader>,
     graph: Arc<tokio::sync::Mutex<ModuleGraph>>,
+    /// Canonical runtime cwd used when deno_core supplies no referrer.
+    cwd: PathBuf,
     /// Live permissions container (shallow clone) used for permission-gated
     /// reads during CJS analysis — revocations stay honored; do NOT deep-clone.
     permissions: PermissionsContainer,
@@ -89,13 +95,29 @@ impl GraphModuleLoader {
         graph_loader: Arc<RealGraphLoader>,
         graph: Arc<tokio::sync::Mutex<ModuleGraph>>,
     ) -> Self {
+        let cwd = runtime
+            .shared
+            .resolver_factory
+            .workspace_factory()
+            .initial_cwd()
+            .clone();
         Self {
             shared: runtime.shared.clone(),
             file_fetcher: runtime.file_fetcher.clone(),
             graph_loader,
             graph,
+            cwd,
             permissions,
         }
+    }
+
+    fn resolve_referrer(referrer: &str, cwd: &Path) -> Result<ModuleSpecifier, JsErrorBox> {
+        if referrer.is_empty() {
+            return ModuleSpecifier::from_directory_path(cwd)
+                .map_err(|_| JsErrorBox::generic("Invalid cwd for module resolution"));
+        }
+        ModuleSpecifier::parse(referrer)
+            .map_err(|e| JsErrorBox::generic(format!("Invalid referrer: {e}")))
     }
 
     fn resolve_specifier(
@@ -122,15 +144,7 @@ impl GraphModuleLoader {
                 .map_err(|e| JsErrorBox::generic(format!("Invalid module specifier: {e}")));
         }
 
-        let referrer_url = if referrer.is_empty() {
-            ModuleSpecifier::from_directory_path(
-                std::env::current_dir().map_err(|e| JsErrorBox::generic(e.to_string()))?,
-            )
-            .map_err(|_| JsErrorBox::generic("Invalid cwd for module resolution"))?
-        } else {
-            ModuleSpecifier::parse(referrer)
-                .map_err(|e| JsErrorBox::generic(format!("Invalid referrer: {e}")))?
-        };
+        let referrer_url = Self::resolve_referrer(referrer, &self.cwd)?;
 
         let mode = ResolutionMode::Import;
 
@@ -172,9 +186,7 @@ impl ModuleLoader for GraphModuleLoader {
                 // node: builtins come from the extension module map; nothing to load.
                 return Ok(());
             }
-            build_graph(&services, &graph_loader, &graph, &specifier)
-                .await
-                .map_err(|e| JsErrorBox::generic(format!("Failed to load \"{specifier}\": {e}")))
+            build_graph(&services, &graph_loader, &graph, &specifier).await
         })
     }
 
@@ -257,7 +269,7 @@ impl ModuleLoader for GraphModuleLoader {
                     )),
                 )
                 .await
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+                .map_err(JsErrorBox::from_err)?;
 
             match loaded {
                 LoadedModuleOrAsset::Module(module) => {
@@ -330,8 +342,11 @@ async fn build_graph(
     graph_loader: &RealGraphLoader,
     graph: &tokio::sync::Mutex<ModuleGraph>,
     specifier: &ModuleSpecifier,
-) -> Result<(), deno_core::anyhow::Error> {
-    let jsr_version_resolver = shared.resolver_factory.jsr_version_resolver()?;
+) -> Result<(), JsErrorBox> {
+    let jsr_version_resolver = shared
+        .resolver_factory
+        .jsr_version_resolver()
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
     let graph_resolver = shared.graph_resolver.clone();
     // ponytail: the graph lock covers the whole build below, including the
     // slow work (remote module fetches with 30s connect / 300s total timeouts,
@@ -350,18 +365,11 @@ async fn build_graph(
     // deno_graph records load failures in the graph's error table (not on the
     // module node), so "node exists" alone is not "loaded fine": a transient
     // failure would otherwise poison the module for the rest of the run and
-    // every worker sharing the graph. Retry only when the node exists without
-    // an error for this specifier.
-    // ponytail: this only checks the ROOT specifier's own error-table entry.
-    // If the root already exists but one of its DEPENDENCIES failed to load
-    // earlier, we skip the rebuild and return Ok; the dependency error then
-    // still surfaces on the later load() through the graph error table
-    // (self-healing on the next build). A full reachable-dependency error
-    // scan is too costly for this hot path; revisit only if stale dependency
-    // failures show up in practice.
+    // every worker sharing the graph. Validate the reachable root before
+    // taking the shortcut; a failure falls through to a fresh build/retry.
     if graph.get(specifier).is_some() {
         let failed = graph.module_errors().any(|e| e.specifier() == specifier);
-        if !failed {
+        if !failed && validate_root(&graph, specifier).is_ok() {
             return Ok(());
         }
     }
@@ -397,7 +405,28 @@ async fn build_graph(
             },
         )
         .await;
+
+    // ModuleGraph::build records load and resolution failures in the graph
+    // instead of returning a Result. Validate only this root so unrelated
+    // graph roots do not poison this prepare_load call. Keep the graph error
+    // as the source error.
+    validate_root(&graph, specifier)?;
     Ok(())
+}
+
+fn validate_root(graph: &ModuleGraph, specifier: &ModuleSpecifier) -> Result<(), JsErrorBox> {
+    graph
+        .walk(
+            std::iter::once(specifier),
+            WalkOptions {
+                check_js: CheckJsOption::True,
+                kind: GraphKind::CodeOnly,
+                follow_dynamic: false,
+                prefer_fast_check_graph: false,
+            },
+        )
+        .validate()
+        .map_err(JsErrorBox::from_err)
 }
 
 fn as_deno_resolver_requested_module_type<'a>(
@@ -501,5 +530,22 @@ mod tests {
             as_deno_resolver_requested_module_type(&RequestedModuleType::Bytes),
             ResolverRequestedModuleType::Bytes
         ));
+    }
+
+    #[test]
+    fn empty_referrer_uses_runtime_cwd() {
+        let runtime_cwd = std::env::temp_dir().join("libdeno-runtime-cwd");
+        let host_cwd = std::env::temp_dir().join("libdeno-host-cwd");
+        let runtime_referrer = GraphModuleLoader::resolve_referrer("", &runtime_cwd).unwrap();
+        let host_referrer = GraphModuleLoader::resolve_referrer("", &host_cwd).unwrap();
+
+        assert_eq!(runtime_referrer.to_file_path().unwrap(), runtime_cwd);
+        assert_ne!(runtime_referrer, host_referrer);
+
+        let explicit = ModuleSpecifier::parse("file:///explicit/referrer.js").unwrap();
+        assert_eq!(
+            GraphModuleLoader::resolve_referrer(explicit.as_str(), &host_cwd).unwrap(),
+            explicit
+        );
     }
 }

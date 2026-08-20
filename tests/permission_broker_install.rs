@@ -101,6 +101,36 @@ fn broker_install_is_install_once_and_excludes_the_hook() {
         "a broker must not decide construction, got: {err:?}"
     );
 
+    // Invalid V8 heap constraints are rejected as configuration before the
+    // entry module executes, rather than being passed through to V8 as 0.
+    let invalid_heap = LibdenoOptions {
+        allow_all_permissions: true,
+        max_heap_bytes: Some(0),
+        ..Default::default()
+    };
+    let err = run(&entry, &invalid_heap).unwrap_err();
+    assert!(
+        matches!(err, LibdenoError::Configuration(ref message) if message.contains("max_heap_bytes")),
+        "invalid heap size must be a Configuration error, got: {err:?}"
+    );
+
     drop(server);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn missing_external_broker_preserves_upstream_exit_87_boundary() {
+    // PermissionBroker::new is upstream's non-fallible constructor: an
+    // initial connection failure exits with 87 rather than returning a
+    // LibdenoError. Keep this process separate because exit(87) is deliberate.
+    let path = std::env::temp_dir().join(format!(
+        "libdeno-missing-broker-{}-{}.sock",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_broker_host"))
+        .env("LIBDENO_TEST_BROKER_PATH", &path)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(87));
 }

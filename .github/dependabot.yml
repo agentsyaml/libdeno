@@ -7,9 +7,10 @@
 # cargo is intentionally NOT enabled: the deno stack publishes new releases
 # weekly, so cargo dependabot would open a PR (and trigger a fresh V8 snapshot
 # rebuild in CI) every week. Dependency bumps are instead driven by humans via
-# `cargo update`, validated by CI's cargo audit + --locked. This keeps PR noise
-# down and V8 snapshot churn deliberate. Note: dtolnay/rust-toolchain has no
-# version tags — its pin is a dated stable-branch SHA and updates manually.
+# `cargo update`, validated by CI's cargo audit + --locked and the offline
+# Deno/TypeScript version ledger. This keeps PR noise down and V8 snapshot
+# churn deliberate. Note: dtolnay/rust-toolchain has no version tags — its pin
+# is a dated stable-branch SHA and updates manually.
 version: 2
 updates:
   - package-ecosystem: github-actions

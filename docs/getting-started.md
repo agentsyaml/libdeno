@@ -7,7 +7,8 @@ libdeno.
 
 - Rust toolchain (edition 2021). A recent stable toolchain is required to
   build the Deno dependency stack.
-- Linux / macOS (Windows is not currently covered by the build configuration).
+- Linux / macOS / Windows. The Rust main API and subprocess paths are covered
+  by the Windows compatibility CI job.
 - Network access on the first build (crates.io) and, at runtime, whenever a
   remote module or npm package needs to be fetched.
 
@@ -71,6 +72,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `run` blocks until the script finishes and returns the exit code the script
 requested. Each call builds its own current-thread tokio runtime and worker,
 so multiple invocations are fully independent.
+
+## Platform notes
+
+Windows supports the Rust main API and the subprocess execution paths.
+In-process output capture is the exception: fd-level capture is not supported on
+Windows because Rust's standard output handles bypass the redirected CRT fd.
+Use `run_in_subprocess_with_output` for per-process stdout/stderr capture; its
+child pipes are supported on Windows.
 
 ## Entry resolution
 

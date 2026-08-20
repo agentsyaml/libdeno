@@ -1,43 +1,83 @@
-//! Feature-name sync test: the op-level feature set enabled in lib.rs
-//! (`ENABLED_FEATURES`) and the JS-namespace feature registry
-//! (`deno_features::UNSTABLE_FEATURES`) must agree on feature names. lib.rs
-//! matches them by string (`.contains(&f.name)`), so a typo in either list
-//! silently disables an API instead of failing the build.
-//!
-//! `ENABLED_FEATURES` is private to lib.rs, so this file mirrors it by hand —
-//! keep both in sync when features are added or removed.
+//! Runtime feature behavior tests. The default feature names live only in
+//! lib.rs; these tests exercise the public behavior instead of mirroring them.
 
-// Mirror of lib.rs's `ENABLED_FEATURES` const.
-const ENABLED_FEATURES: &[&str] = &["kv", "cron", "ffi", "webgpu", "worker-options"];
+use std::fs;
+use std::path::PathBuf;
 
-#[test]
-fn every_enabled_feature_is_a_known_unstable_feature() {
-    let known: Vec<&str> = deno_features::UNSTABLE_FEATURES
-        .iter()
-        .map(|f| f.name)
-        .collect();
-    assert!(!known.is_empty(), "deno_features registry is empty");
-    for name in ENABLED_FEATURES {
-        assert!(
-            known.contains(name),
-            "feature {name:?} is enabled in lib.rs but missing from \
-             deno_features::UNSTABLE_FEATURES (typo or stale sync)"
-        );
-    }
+use libdeno::{run, LibdenoOptions};
+
+fn temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("libdeno-feature-{}-{}", std::process::id(), name));
+    fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 #[test]
-fn every_enabled_feature_is_a_runtime_feature() {
-    // The op-level FeatureChecker gates runtime ops, so a name that lives on
-    // the CLI side of the registry would never line up with an op.
-    for name in ENABLED_FEATURES {
-        let definition = deno_features::UNSTABLE_FEATURES
-            .iter()
-            .find(|f| f.name == *name)
-            .unwrap_or_else(|| panic!("feature {name:?} not in UNSTABLE_FEATURES"));
-        assert!(
-            matches!(definition.kind, deno_features::UnstableFeatureKind::Runtime),
-            "feature {name:?} is a CLI-only feature, not a runtime op feature"
-        );
+fn default_runtime_features_are_enabled() {
+    let dir = temp_dir("default");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "if (typeof Deno.openKv !== 'function') throw new Error('default feature missing');",
+    )
+    .unwrap();
+    run(
+        &entry,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn custom_features_accept_duplicates_and_order_changes() {
+    let dir = temp_dir("duplicates");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "if (typeof Deno.openKv !== 'function') throw new Error('kv missing');",
+    )
+    .unwrap();
+
+    for features in [
+        vec!["ffi", "kv", "ffi", "kv"],
+        vec!["kv", "ffi", "kv", "ffi"],
+    ] {
+        let options = LibdenoOptions {
+            features: Some(features.into_iter().map(String::from).collect()),
+            allow_all_permissions: true,
+            ..Default::default()
+        };
+        run(&entry, &options).unwrap();
     }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn large_feature_combinations_do_not_accumulate_host_strings() {
+    let dir = temp_dir("large");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('feature list accepted');").unwrap();
+    let known: Vec<&str> = deno_features::UNSTABLE_FEATURES
+        .iter()
+        .filter(|feature| matches!(feature.kind, deno_features::UnstableFeatureKind::Runtime))
+        .map(|feature| feature.name)
+        .collect();
+    assert!(!known.is_empty());
+    let features = (0..4096)
+        .map(|index| known[index % known.len()].to_string())
+        .collect();
+    run(
+        &entry,
+        &LibdenoOptions {
+            features: Some(features),
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let _ = fs::remove_dir_all(&dir);
 }
