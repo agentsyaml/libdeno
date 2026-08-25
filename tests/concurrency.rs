@@ -29,8 +29,9 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Two ordinary runs from two host threads must both succeed and overlap in
-/// time: runs are fully parallel — the only exclusivity is capture.
+/// Two ordinary runs from two host threads must both observe the other run's
+/// started marker: this proves overlap directly instead of relying on a wall
+/// clock threshold that is sensitive to CI load.
 #[test]
 fn parallel_runs_overlap_in_time() {
     let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -38,27 +39,33 @@ fn parallel_runs_overlap_in_time() {
     let dir_b = temp_dir("par-b");
     let entry_a = dir_a.join("main.js");
     let entry_b = dir_b.join("main.js");
-    // 1.5s sleeps: serialized execution would take >= 3.0s (+ startup); the
-    // 2.8s bound proves overlap with generous slack for CI noise.
-    fs::write(&entry_a, "await new Promise(r => setTimeout(r, 1500));").unwrap();
-    fs::write(&entry_b, "await new Promise(r => setTimeout(r, 1500));").unwrap();
+    let started_a = dir_a.join("started");
+    let started_b = dir_b.join("started");
+    let script = |started: &PathBuf, other: &PathBuf| {
+        format!(
+            "Deno.writeTextFileSync({started:?}, '1');\n\
+             let overlap = false;\n\
+             const deadline = Date.now() + 5000;\n\
+             while (Date.now() < deadline) {{\n\
+               try {{ Deno.statSync({other:?}); overlap = true; break; }}\n\
+               catch {{ await new Promise((resolve) => setTimeout(resolve, 10)); }}\n\
+             }}\n\
+             Deno.exit(overlap ? 0 : 42);"
+        )
+    };
+    fs::write(&entry_a, script(&started_a, &started_b)).unwrap();
+    fs::write(&entry_b, script(&started_b, &started_a)).unwrap();
     let options = LibdenoOptions {
         allow_all_permissions: true,
         ..Default::default()
     };
-    let start = Instant::now();
     let (a, b) = std::thread::scope(|s| {
         let ha = s.spawn(|| run(&entry_a, &options).unwrap());
         let hb = s.spawn(|| run(&entry_b, &options).unwrap());
         (ha.join().unwrap(), hb.join().unwrap())
     });
-    let elapsed = start.elapsed();
     assert_eq!(a, 0);
     assert_eq!(b, 0);
-    assert!(
-        elapsed.as_secs_f64() < 2.8,
-        "runs did not overlap: {elapsed:?} (>= 3.0s means serialized)"
-    );
     let _ = fs::remove_dir_all(&dir_a);
     let _ = fs::remove_dir_all(&dir_b);
 }

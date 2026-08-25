@@ -2,8 +2,8 @@
 // permission-free half of the module pipeline (workspace/resolver/npm
 // installer factories, graph resolver, npm process state) once, and
 // `run_with` reuses it across script runs instead of rebuilding it every
-// time. The stack is rebuilt automatically when the project's config chain
-// changes (fingerprint check). Permission-bound pieces (the file fetcher,
+// time. The stack is rebuilt automatically when the accepted resolver input
+// manifest changes. Permission-bound pieces (the file fetcher,
 // the graph loader and the module graph) stay strictly per-run in
 // `RuntimeServices` — see services.rs. The async methods use the caller's
 // tokio runtime while reusing the same shared resolver stack.
@@ -11,7 +11,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::npm_cache::ResolverInputManifest;
 use crate::services::SharedServices;
+use crate::timing::{ExecutionTiming, Phase};
 use crate::LibdenoError;
 use crate::LibdenoOptions;
 use crate::RunLease;
@@ -21,48 +23,46 @@ use crate::RunLease;
 /// [`LibdenoRuntime::new`] builds the permission-free half of the module
 /// pipeline once; [`run_with`], [`Self::run_async`], and
 /// [`Self::run_with_output_async`] then reuse it across runs. The stack is
-/// rebuilt automatically when the config discovery chain changes (deno.json /
-/// deno.jsonc / import_map.json / package.json / `.npmrc`, `deno.lock`, and
-/// `node_modules` at the project root and its ancestors), or when the effective
-/// npm registry or the resolver-supported global npmrc changes. The npm
-/// fingerprint includes the effective registry URL and `$HOME/.npmrc` by
-/// canonical path and content, so long-lived hosts serving the same project
-/// skip the per-run factory construction while still observing those changes.
-/// deno_resolver 0.88 reads `$HOME/.npmrc` and does not honor
-/// `NPM_CONFIG_USERCONFIG`.
+/// rebuilt automatically when the accepted resolver input manifest changes.
+/// The manifest comes from the actual discovered workspace, parsed config /
+/// package semantics, effective auth-free npm routing, `JSR_URL`, lockfile, and
+/// BYONM
+/// node_modules inputs. Managed installation output is deliberately excluded
+/// from the BYONM probe. deno_resolver 0.88 reads `$HOME/.npmrc` and does not
+/// honor `NPM_CONFIG_USERCONFIG`.
 ///
 /// The runtime is single-threaded by design: the module loader stack is
 /// `Rc<dyn ModuleLoader>`-based. Synchronous `run_with` executes on a fresh
 /// current-thread tokio runtime, while the reusable async methods use the
-/// caller's runtime. `LibdenoRuntime` itself is `Clone` + `Send` + `Sync` (its
-/// only state is an `Arc<Mutex<RuntimeState>>` around the resolver stack), so
-/// it can be shared across host threads and used concurrently — ordinary runs
-/// are fully parallel; only a captured run is exclusive (see `RunLease`). The
-/// async methods return `!Send` futures and must be awaited without
-/// interleaving on their V8-pinned thread; use `LocalSet` when the caller owns
-/// a multi-thread tokio runtime.
+/// caller's runtime. `LibdenoRuntime` itself is `Clone` + `Send` + `Sync`; its
+/// state is an `Arc<Mutex<RuntimeState>>` around the resolver stack plus a
+/// per-runtime rebuild gate, so it can be shared across host threads and used
+/// concurrently — ordinary runs are fully parallel; only a captured run is
+/// exclusive (see `RunLease`). The async methods return `!Send` futures and
+/// must be awaited without interleaving on their V8-pinned thread; use
+/// `LocalSet` when the caller owns a multi-thread tokio runtime.
 #[derive(Clone)]
 pub struct LibdenoRuntime {
     cwd: PathBuf,
-    /// The current resolver stack and the fingerprint it was built for;
-    /// `run_with` recomputes the fingerprint and swaps `shared` under the
-    /// guard when they diverge (the rebuild itself happens outside the lock).
+    /// The current resolver stack and the accepted manifest it was built for;
+    /// `run_with` swaps `shared` under this short-lived guard when a candidate
+    /// passes its publish checks. No guard is held across an await.
     state: Arc<std::sync::Mutex<RuntimeState>>,
+    /// Singleflight gate for this runtime only. `tokio::sync::Mutex` is a
+    /// synchronization primitive rather than a handle/task-local resource,
+    /// so its lock future may be awaited by callers on different current-
+    /// thread Tokio runtimes. Different `LibdenoRuntime` values have different
+    /// gates and still build in parallel.
+    rebuild_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct RuntimeState {
-    fingerprint: ConfigFingerprint,
+    input_manifest: ResolverInputManifest,
     shared: Arc<SharedServices>,
     /// Monotonic invalidation generation requested by [`LibdenoRuntime::refresh`].
     refresh_generation: u64,
     /// Generation covered by the currently installed resolver stack.
     built_generation: u64,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct ConfigFingerprint {
-    config: Vec<(u64, u64)>,
-    npm_cache: crate::npm_cache::NpmCacheKey,
 }
 
 impl LibdenoRuntime {
@@ -78,24 +78,25 @@ impl LibdenoRuntime {
         let shared = SharedServices::new(cwd.clone(), vec![cwd.clone()])
             .await
             .map_err(LibdenoError::Runtime)?;
-        let fingerprint = config_fingerprint(&cwd);
+        let input_manifest = shared.input_manifest.clone();
         Ok(Self {
             cwd,
             state: Arc::new(std::sync::Mutex::new(RuntimeState {
-                fingerprint,
+                input_manifest,
                 shared,
                 refresh_generation: 0,
                 built_generation: 0,
             })),
+            rebuild_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
     /// Marks the resolver stack stale. The next [`run_with`],
     /// [`Self::run_async`], or [`Self::run_with_output_async`] call rebuilds
     /// the permission-free stack before executing. Use this after filesystem
-    /// changes below the discovered config chain, such as edits inside nested
-    /// `node_modules`; registry and `$HOME/.npmrc` changes are detected by the
-    /// effective npm fingerprint. This is an explicit bounded
+    /// changes below the discovered resolver inputs, such as edits inside
+    /// nested `node_modules`; npm routing and workspace changes are detected by
+    /// the accepted manifest. This is an explicit bounded
     /// invalidation mechanism, not a recursive watcher or tree hash.
     pub fn refresh(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -134,16 +135,24 @@ impl LibdenoRuntime {
         entry: impl AsRef<Path>,
         options: &LibdenoOptions,
     ) -> Result<crate::RunOutput, LibdenoError> {
-        crate::check_async_context()?;
-        reject_unusable_cwd(self, options)?;
-        let entry = entry.as_ref().to_path_buf();
-        let runtime = self;
-        crate::run_with_output_async_guarded(options, async move {
-            let shared = shared_for_run(runtime).await?;
-            crate::run_inner_with(shared, runtime.cwd.clone(), &entry, options).await
-        })
-        .await
+        run_with_output_async_observed(self, entry, options, ExecutionTiming::disabled()).await
     }
+}
+
+pub(crate) async fn run_with_output_async_observed(
+    runtime: &LibdenoRuntime,
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+) -> Result<crate::RunOutput, LibdenoError> {
+    crate::check_async_context()?;
+    reject_unusable_cwd(runtime, options)?;
+    let entry = entry.as_ref().to_path_buf();
+    crate::run_with_output_async_guarded(options, timing.clone(), async move {
+        let shared = shared_for_run(runtime, timing.clone()).await?;
+        crate::run_inner_with(shared, runtime.cwd.clone(), &entry, options, timing).await
+    })
+    .await
 }
 
 /// Runs `entry` through a prebuilt [`LibdenoRuntime`]'s resolver stack.
@@ -205,14 +214,15 @@ pub fn run_with(
     // Same tokio re-entry handling as run(): building a runtime inside a
     // tokio runtime panics, so run on a fresh thread instead of rejecting
     // async hosts.
+    let timing = ExecutionTiming::disabled();
     if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run_with_sync(&runtime, &entry, &options))
+        std::thread::spawn(move || run_with_sync(&runtime, &entry, &options, timing))
             .join()
             .map_err(|_| {
                 LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
             })?
     } else {
-        run_with_sync(&runtime, &entry, &options)
+        run_with_sync(&runtime, &entry, &options, timing)
     }
 }
 
@@ -257,29 +267,55 @@ pub fn run_with_output(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<crate::RunOutput, LibdenoError> {
+    run_with_output_observed(runtime, entry, options, ExecutionTiming::disabled())
+}
+
+pub(crate) fn run_with_output_observed(
+    runtime: &LibdenoRuntime,
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+) -> Result<crate::RunOutput, LibdenoError> {
+    run_with_output_observed_cancellable(runtime, entry, options, timing, None)
+}
+
+pub(crate) fn run_with_output_observed_cancellable(
+    runtime: &LibdenoRuntime,
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+    cancellation: Option<crate::limits::CancellationContext>,
+) -> Result<crate::RunOutput, LibdenoError> {
     reject_unusable_cwd(runtime, options)?;
-    let _lease = RunLease::acquire(options.capture_stdout || options.capture_stderr)?;
+    let _lease = {
+        let _admission = timing.span(Phase::Admission);
+        RunLease::acquire(options.capture_stdout || options.capture_stderr)?
+    };
     crate::limits::capture_spawned_ipc_marker();
     let entry = entry.as_ref().to_path_buf();
     let options = options.clone();
     let runtime = runtime.clone();
     if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run_with_sync_output(&runtime, &entry, &options))
-            .join()
-            .map_err(|_| {
-                LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
-            })?
+        std::thread::spawn(move || {
+            run_with_sync_output_cancellable(&runtime, &entry, &options, timing, cancellation)
+        })
+        .join()
+        .map_err(|_| {
+            LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
+        })?
     } else {
-        run_with_sync_output(&runtime, &entry, &options)
+        run_with_sync_output_cancellable(&runtime, &entry, &options, timing, cancellation)
     }
 }
 
 /// Capture + [`run_with_sync`]; the Windows rejection and byte-cap handling
 /// mirror `crate::run_sync_output`.
-fn run_with_sync_output(
+fn run_with_sync_output_cancellable(
     runtime: &LibdenoRuntime,
     entry: &Path,
     options: &LibdenoOptions,
+    timing: ExecutionTiming,
+    cancellation: Option<crate::limits::CancellationContext>,
 ) -> Result<crate::RunOutput, LibdenoError> {
     #[cfg(windows)]
     if options.capture_stdout || options.capture_stderr {
@@ -293,8 +329,13 @@ fn run_with_sync_output(
         options.max_capture_bytes,
     )
     .map_err(LibdenoError::Io)?;
-    let result = run_with_sync(runtime, entry, options);
-    let capture_result = capture.finish().map_err(LibdenoError::Io);
+    let result = run_with_sync_cancellable(runtime, entry, options, timing.clone(), cancellation);
+    let capture_result = if options.capture_stdout || options.capture_stderr {
+        let _output_drain = timing.span(Phase::OutputDrain);
+        capture.finish().map_err(LibdenoError::Io)
+    } else {
+        capture.finish().map_err(LibdenoError::Io)
+    };
     match result {
         Err(error) => Err(error),
         Ok(exit_code) => {
@@ -316,139 +357,135 @@ fn run_with_sync(
     runtime: &LibdenoRuntime,
     entry: &Path,
     options: &LibdenoOptions,
+    timing: ExecutionTiming,
+) -> Result<i32, LibdenoError> {
+    run_with_sync_cancellable(runtime, entry, options, timing, None)
+}
+
+fn run_with_sync_cancellable(
+    runtime: &LibdenoRuntime,
+    entry: &Path,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+    cancellation: Option<crate::limits::CancellationContext>,
 ) -> Result<i32, LibdenoError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
     rt.block_on(async {
-        let shared = shared_for_run(runtime).await?;
-        crate::run_inner_with(shared, runtime.cwd.clone(), entry, options).await
+        let shared = shared_for_run(runtime, timing.clone()).await?;
+        crate::run_inner_with_cancellation(
+            shared,
+            runtime.cwd.clone(),
+            entry,
+            options,
+            timing,
+            cancellation,
+        )
+        .await
     })
 }
 
-/// Returns the current shared resolver stack, rebuilding it when the project
-/// configuration fingerprint changes. The helper is shared by sync and async
+/// Returns the current shared resolver stack, rebuilding it when the accepted
+/// resolver input manifest changes. The helper is shared by sync and async
 /// reusable entry points; all permission-bound run state remains per-call.
-async fn shared_for_run(runtime: &LibdenoRuntime) -> Result<Arc<SharedServices>, LibdenoError> {
-    let fp = config_fingerprint(&runtime.cwd);
-    let (stale, build_generation) = {
-        let state = runtime.state.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            needs_rebuild(
-                fp != state.fingerprint,
+async fn shared_for_run(
+    runtime: &LibdenoRuntime,
+    timing: ExecutionTiming,
+) -> Result<Arc<SharedServices>, LibdenoError> {
+    let initial_shared = {
+        let (manifest, refresh_generation, built_generation, shared) = {
+            let state = runtime.state.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                state.input_manifest.clone(),
                 state.refresh_generation,
                 state.built_generation,
-            ),
-            state.refresh_generation,
-        )
-    };
-    if stale {
-        let cwd = runtime.cwd.clone();
-        let rebuilt = SharedServices::new(cwd.clone(), vec![cwd])
-            .await
-            .map_err(LibdenoError::Runtime)?;
-        let mut state = runtime.state.lock().unwrap_or_else(|e| e.into_inner());
-        // Do not consume a refresh that arrived while SharedServices::new was
-        // running. The current run may use this stack, but the next run must
-        // rebuild again. This is an epoch check, not a clearable bool.
-        if state.refresh_generation == build_generation {
-            state.fingerprint = fp;
-            state.shared = rebuilt.clone();
-            state.built_generation = build_generation;
+                state.shared.clone(),
+            )
+        };
+        let probe_changed = {
+            let _probe = timing.span(Phase::ResolverManifestProbe);
+            !manifest.is_reusable().unwrap_or(false)
+        };
+        if singleflight_build_generation(probe_changed, refresh_generation, built_generation)
+            .is_none()
+        {
+            let _reuse = timing.span(Phase::ResolverReuse);
+            Some(shared)
+        } else {
+            None
         }
-        Ok(rebuilt)
-    } else {
-        Ok(runtime
+    };
+    if let Some(shared) = initial_shared {
+        return Ok(shared);
+    }
+
+    // The first probe only avoids taking the gate on the common path. A
+    // caller that waited for another builder must probe and check state again
+    // after acquiring the gate; otherwise it could duplicate the build.
+    let _rebuild_guard = runtime.rebuild_lock.lock().await;
+    let Some(build_generation) = ({
+        let (manifest, refresh_generation, built_generation) = {
+            let state = runtime.state.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                state.input_manifest.clone(),
+                state.refresh_generation,
+                state.built_generation,
+            )
+        };
+        let probe_changed = {
+            let _probe = timing.span(Phase::ResolverManifestProbe);
+            !manifest.is_reusable().unwrap_or(false)
+        };
+        singleflight_build_generation(probe_changed, refresh_generation, built_generation)
+    }) else {
+        let _reuse = timing.span(Phase::ResolverReuse);
+        return Ok(runtime
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .shared
-            .clone())
+            .clone());
+    };
+
+    let cwd = runtime.cwd.clone();
+    let _rebuild = timing.span(Phase::ResolverRebuild);
+    let candidate = SharedServices::new_with_timing(cwd.clone(), vec![cwd], Some(timing.clone()))
+        .await
+        .map_err(LibdenoError::Runtime)?;
+
+    let mut state = runtime.state.lock().unwrap_or_else(|e| e.into_inner());
+    // SharedServices::new returns only a stable candidate. A refresh arriving
+    // during that build still lets this run use it, but prevents publication;
+    // the next entry observes the old generation and rebuilds.
+    if can_publish(build_generation, state.refresh_generation) {
+        state.input_manifest = candidate.input_manifest.clone();
+        state.shared = candidate.clone();
+        state.built_generation = build_generation;
     }
+    Ok(candidate)
 }
 
-fn needs_rebuild(
-    fingerprint_changed: bool,
+/// Returns the refresh generation a singleflight builder should capture, or
+/// `None` when the post-gate double-check can reuse the published state.
+fn singleflight_build_generation(
+    manifest_changed: bool,
     refresh_generation: u64,
     built_generation: u64,
-) -> bool {
-    fingerprint_changed || refresh_generation != built_generation
+) -> Option<u64> {
+    needs_rebuild(manifest_changed, refresh_generation, built_generation)
+        .then_some(refresh_generation)
 }
 
-/// Fingerprint of the config discovery chain rooted at `cwd`: walking up from
-/// the project directory, the content hash of every small config file
-/// (deno.json / deno.jsonc / import_map.json / package.json / .npmrc), the
-/// (mtime, size) of deno.lock (potentially large, so no content read), plus
-/// the (mtime, 0) of every node_modules directory (its mtime moves on direct
-/// package add/remove, flipping BYONM <-> managed). The npm cache key is also
-/// included unchanged, covering the effective registry, project `.npmrc`, and
-/// the resolver-supported `$HOME/.npmrc`. `run_with` rebuilds the resolver
-/// stack when this changes. The walk order is deterministic, so equality is
-/// the comparison.
-fn config_fingerprint(cwd: &Path) -> ConfigFingerprint {
-    const CONFIG_FILES: [&str; 5] = [
-        "deno.json",
-        "deno.jsonc",
-        "import_map.json",
-        "package.json",
-        ".npmrc",
-    ];
-    let mut entries = Vec::new();
-    let mut dir = Some(cwd.to_path_buf());
-    while let Some(dir_path) = dir {
-        for name in CONFIG_FILES {
-            if let Some(fp) = file_fingerprint(&dir_path.join(name)) {
-                entries.push(fp);
-            }
-        }
-        // deno.lock is read once at stack construction; an external update
-        // (e.g. `deno install`) must rebuild even when package.json is
-        // untouched. (mtime, size) is enough — lockfiles are not edited
-        // in-place, so same-size same-mtime writes do not occur here.
-        if let Some(fp) = lock_fingerprint(&dir_path.join("deno.lock")) {
-            entries.push(fp);
-        }
-        if let Ok(meta) = std::fs::metadata(dir_path.join("node_modules")) {
-            if meta.is_dir() {
-                if let Some(fp) = meta_fingerprint(&meta) {
-                    entries.push((fp, 0));
-                }
-            }
-        }
-        let parent = dir_path.parent().map(|p| p.to_path_buf());
-        if parent.as_deref() == Some(dir_path.as_path()) {
-            break; // reached the filesystem root
-        }
-        dir = parent;
-    }
-    ConfigFingerprint {
-        config: entries,
-        npm_cache: crate::npm_cache::compute_key(cwd),
-    }
+/// Pure publication gate for a candidate already accepted by the stable
+/// builder.
+fn can_publish(build_generation: u64, current_generation: u64) -> bool {
+    build_generation == current_generation
 }
 
-/// Content hash of a small config file — catches same-size same-mtime edits
-/// that (mtime, size) would miss. Config files are tiny, so the read is
-/// negligible per `run_with` entry.
-fn file_fingerprint(path: &Path) -> Option<(u64, u64)> {
-    crate::npm_cache::content_hash(path).map(|hash| (hash, 0))
-}
-
-/// (mtime, size) fingerprint for deno.lock: content-hashing a potentially
-/// large lockfile on every `run_with` is not worth it (see `config_fingerprint`).
-fn lock_fingerprint(path: &Path) -> Option<(u64, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta_fingerprint(&meta)?;
-    Some((mtime, meta.len()))
-}
-
-fn meta_fingerprint(meta: &std::fs::Metadata) -> Option<u64> {
-    meta.modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_nanos() as u64)
+fn needs_rebuild(manifest_changed: bool, refresh_generation: u64, built_generation: u64) -> bool {
+    manifest_changed || built_generation != refresh_generation
 }
 
 /// True when the script called `Deno.exit(n)`: op_exit terminated the isolate
@@ -465,22 +502,36 @@ pub(crate) fn has_watcher_exited(worker: &deno_runtime::worker::MainWorker) -> b
 
 #[cfg(test)]
 mod tests {
+    use super::can_publish;
     use super::needs_rebuild;
+    use super::singleflight_build_generation;
 
     #[test]
-    fn refresh_during_rebuild_survives_old_commit() {
-        let build_generation = 0;
-        let mut refresh_generation = build_generation;
+    fn publish_rejects_refresh_during_build() {
+        assert!(!can_publish(0, 1));
+        assert!(needs_rebuild(false, 1, 0));
+    }
 
-        // A rebuild starts, then refresh() runs before that rebuild commits.
-        refresh_generation += 1;
-        // The old rebuild records only the generation it observed.
-        let built_generation = build_generation;
-        assert!(needs_rebuild(false, refresh_generation, built_generation));
+    #[test]
+    fn stable_builder_hands_generation_gate_a_publishable_candidate() {
+        // Probe stability is now guaranteed by SharedServices::new before
+        // this generation-only publication gate is reached.
+        assert!(can_publish(0, 0));
+    }
 
-        // The next rebuild observes the new generation and clears the stale
-        // state only by installing a stack built for that same generation.
-        let built_generation = refresh_generation;
-        assert!(!needs_rebuild(false, refresh_generation, built_generation));
+    #[test]
+    fn second_singleflight_caller_reuses_published_candidate() {
+        // Caller one wins the gate and builds generation zero.
+        assert_eq!(singleflight_build_generation(true, 0, 0), Some(0));
+        // After it publishes, caller two's post-gate double-check does not
+        // start another build.
+        assert_eq!(singleflight_build_generation(false, 0, 0), None);
+    }
+
+    #[test]
+    fn refresh_generation_remains_effective_after_rejected_publish() {
+        assert_eq!(singleflight_build_generation(false, 1, 0), Some(1));
+        assert!(needs_rebuild(false, 1, 0));
+        assert_eq!(singleflight_build_generation(false, 1, 1), None);
     }
 }

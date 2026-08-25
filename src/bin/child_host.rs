@@ -6,6 +6,8 @@
 
 fn main() {
     libdeno::maybe_handle_child_mode();
+    #[cfg(feature = "execution-control")]
+    libdeno::maybe_handle_supervisor_mode();
 
     // `child_process.fork` launches the configured exec path in normal mode
     // with deno-style `run [flags] <entry> [args]` arguments.

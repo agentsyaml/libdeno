@@ -48,8 +48,8 @@ for key in required:
 
 deno = exactly_one(
     r'^\s*const\s+DENO_VERSION\s*:\s*&str\s*=\s*"([^"]+)"\s*;',
-    (ROOT / "src/lib.rs").read_text(encoding="utf-8"),
-    "src/lib.rs DENO_VERSION",
+    (ROOT / "src/deno_runtime_adapter.rs").read_text(encoding="utf-8"),
+    "src/deno_runtime_adapter.rs DENO_VERSION",
 )
 ts = exactly_one(
     r'^\s*const\s+TS_VERSION\s*:\s*&str\s*=\s*"([^"]+)"\s*;',

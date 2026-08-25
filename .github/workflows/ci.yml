@@ -45,7 +45,16 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Lint execution-control feature
+        run: cargo clippy --all-targets --features execution-control,phase-diagnostics -- -D warnings
+
       - name: Test
         # --locked keeps CI in sync with the committed Cargo.lock (the release
         # publish is --locked too, so lockfile drift fails here, not at tag).
         run: cargo test --all-targets --locked
+
+      - name: Test execution-control feature
+        run: cargo test --all-targets --features execution-control,phase-diagnostics --locked
+
+      - name: Check docs.rs mode
+        run: DOCS_RS=1 cargo check --no-default-features --lib --locked

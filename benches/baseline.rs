@@ -22,7 +22,15 @@ const ALL_SCENARIOS: &[&str] = &[
     "runtime_construct",
     "fresh_runtime_run",
     "runtime_reuse_async",
+    "large_inprocess_phase",
+    "large_subprocess_capture_off",
+    "large_subprocess_capture_on",
+    "large_subprocess_parallel_1",
+    "large_subprocess_parallel_4",
+    "large_subprocess_parallel_n",
 ];
+
+const LARGE_MODULE_COUNT: usize = 64;
 
 struct Fixture {
     root: PathBuf,
@@ -68,6 +76,269 @@ impl Drop for Fixture {
             );
         }
     }
+}
+
+struct LargeFixture {
+    root: PathBuf,
+    entry: PathBuf,
+}
+
+impl LargeFixture {
+    fn new() -> Self {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libdeno-baseline-large-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("node_modules/fixture-cjs")).expect("create large fixture");
+
+        for index in 0..LARGE_MODULE_COUNT {
+            let source = match index + 1 < LARGE_MODULE_COUNT {
+                true => format!(
+                    "import {{ value as next }} from './module_{:03}.ts';\n\
+                     export const value = next + 1;\n",
+                    index + 1
+                ),
+                false => "export const value = 1;\n".to_string(),
+            };
+            fs::write(root.join(format!("module_{index:03}.ts")), source)
+                .expect("write large TypeScript module");
+        }
+        fs::write(
+            root.join("main.ts"),
+            format!(
+                "import {{ value }} from './module_000.ts';\n\
+                 import './node_modules/fixture-cjs/index.cjs';\n\
+                 if (value !== {LARGE_MODULE_COUNT}) throw new Error('large fixture mismatch');\n"
+            ),
+        )
+        .expect("write large fixture entry");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"libdeno-large-fixture","private":true,"dependencies":{"fixture-cjs":"1.0.0"}}"#,
+        )
+        .expect("write large fixture package manifest");
+        fs::write(
+            root.join("node_modules/fixture-cjs/package.json"),
+            r#"{"name":"fixture-cjs","version":"1.0.0","main":"index.cjs","type":"commonjs"}"#,
+        )
+        .expect("write deterministic CJS package manifest");
+        fs::write(
+            root.join("node_modules/fixture-cjs/index.cjs"),
+            "module.exports = require('./leaf.cjs') + 1;\n",
+        )
+        .expect("write deterministic CJS entry");
+        fs::write(
+            root.join("node_modules/fixture-cjs/leaf.cjs"),
+            "module.exports = 41;\n",
+        )
+        .expect("write deterministic CJS dependency");
+
+        Self {
+            entry: root.join("main.ts"),
+            root,
+        }
+    }
+}
+
+impl Drop for LargeFixture {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.root) {
+            eprintln!(
+                "large benchmark fixture cleanup failed ({}): {error}",
+                self.root.display()
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ResourceSample {
+    threads: Option<u64>,
+    fds: Option<u64>,
+    rss_bytes: Option<u64>,
+}
+
+fn resource_sample() -> ResourceSample {
+    ResourceSample {
+        threads: benchmark_thread_count(),
+        fds: benchmark_fd_count(),
+        rss_bytes: benchmark_rss_bytes(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn benchmark_thread_count() -> Option<u64> {
+    let text = fs::read_to_string("/proc/self/status").ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("Threads:")?.trim().parse().ok())
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_thread_count() -> Option<u64> {
+    let output = Command::new("ps")
+        .args(["-M", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    output.status.success().then(|| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .skip(1)
+            .count() as u64
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn benchmark_thread_count() -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn benchmark_fd_count() -> Option<u64> {
+    let directory = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    Some(fs::read_dir(directory).ok()?.count() as u64)
+}
+
+#[cfg(not(unix))]
+fn benchmark_fd_count() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn benchmark_rss_bytes() -> Option<u64> {
+    let text = fs::read_to_string("/proc/self/status").ok()?;
+    let kilobytes: u64 = text
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:")?.split_whitespace().next())?
+        .parse()
+        .ok()?;
+    kilobytes.checked_mul(1024)
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_rss_bytes() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    u64::try_from(usage.ru_maxrss).ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn benchmark_rss_bytes() -> Option<u64> {
+    None
+}
+
+fn resource_value(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "NA".to_string())
+}
+
+#[derive(Clone, Copy, Default)]
+struct PhaseFields {
+    admission_ns: Option<u128>,
+    queue_wait_ns: Option<u128>,
+    resolver_manifest_probe_ns: Option<u128>,
+    resolver_reuse_ns: Option<u128>,
+    resolver_rebuild_ns: Option<u128>,
+    permission_runtime_services_ns: Option<u128>,
+    graph_build_ns: Option<u128>,
+    main_worker_bootstrap_ns: Option<u128>,
+    user_execution_ns: Option<u128>,
+    output_drain_ns: Option<u128>,
+    cancel_kill_reap_ns: Option<u128>,
+    parent_threads_before: Option<u64>,
+    parent_threads_after: Option<u64>,
+    parent_fds_before: Option<u64>,
+    parent_fds_after: Option<u64>,
+    parent_rss_bytes_before: Option<u64>,
+    parent_rss_bytes_after: Option<u64>,
+}
+
+impl PhaseFields {
+    fn add_worker(&mut self, worker: Self) {
+        self.admission_ns = sum_phase(self.admission_ns, worker.admission_ns);
+        self.queue_wait_ns = sum_phase(self.queue_wait_ns, worker.queue_wait_ns);
+        self.resolver_manifest_probe_ns = sum_phase(
+            self.resolver_manifest_probe_ns,
+            worker.resolver_manifest_probe_ns,
+        );
+        self.resolver_reuse_ns = sum_phase(self.resolver_reuse_ns, worker.resolver_reuse_ns);
+        self.resolver_rebuild_ns = sum_phase(self.resolver_rebuild_ns, worker.resolver_rebuild_ns);
+        self.permission_runtime_services_ns = sum_phase(
+            self.permission_runtime_services_ns,
+            worker.permission_runtime_services_ns,
+        );
+        self.graph_build_ns = sum_phase(self.graph_build_ns, worker.graph_build_ns);
+        self.main_worker_bootstrap_ns = sum_phase(
+            self.main_worker_bootstrap_ns,
+            worker.main_worker_bootstrap_ns,
+        );
+        self.user_execution_ns = sum_phase(self.user_execution_ns, worker.user_execution_ns);
+        self.output_drain_ns = sum_phase(self.output_drain_ns, worker.output_drain_ns);
+        self.cancel_kill_reap_ns = sum_phase(self.cancel_kill_reap_ns, worker.cancel_kill_reap_ns);
+        // Parallel phase rows aggregate durations; one worker's resource
+        // snapshot must not be presented as the whole parallel round.
+        self.parent_threads_before = None;
+        self.parent_threads_after = None;
+        self.parent_fds_before = None;
+        self.parent_fds_after = None;
+        self.parent_rss_bytes_before = None;
+        self.parent_rss_bytes_after = None;
+    }
+}
+
+fn sum_phase(left: Option<u128>, right: Option<u128>) -> Option<u128> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn phase_value(value: Option<u128>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "NA".to_string())
+}
+
+#[cfg(feature = "phase-diagnostics")]
+fn phase_fields(report: &libdeno::ExecutionReport) -> PhaseFields {
+    let snapshot = report.phase_diagnostics();
+    PhaseFields {
+        admission_ns: Some(snapshot.admission_ns),
+        queue_wait_ns: Some(snapshot.queue_wait_ns),
+        resolver_manifest_probe_ns: snapshot.resolver_manifest_probe_ns,
+        resolver_reuse_ns: snapshot.resolver_reuse_ns,
+        resolver_rebuild_ns: snapshot.resolver_rebuild_ns,
+        permission_runtime_services_ns: snapshot.permission_runtime_services_ns,
+        graph_build_ns: snapshot.graph_build_ns,
+        main_worker_bootstrap_ns: snapshot.main_worker_bootstrap_ns,
+        user_execution_ns: snapshot.user_execution_ns,
+        output_drain_ns: snapshot.output_drain_ns,
+        cancel_kill_reap_ns: snapshot.cancel_kill_reap_ns,
+        parent_threads_before: snapshot.parent_threads_before,
+        parent_threads_after: snapshot.parent_threads_after,
+        parent_fds_before: snapshot.parent_fds_before,
+        parent_fds_after: snapshot.parent_fds_after,
+        parent_rss_bytes_before: snapshot.parent_rss_bytes_before,
+        parent_rss_bytes_after: snapshot.parent_rss_bytes_after,
+    }
+}
+
+#[cfg(not(feature = "phase-diagnostics"))]
+fn phase_fields(_report: &libdeno::ExecutionReport) -> PhaseFields {
+    PhaseFields::default()
 }
 
 fn options(root: &Path) -> libdeno::LibdenoOptions {
@@ -116,17 +387,127 @@ fn selected_scenarios() -> Vec<&'static str> {
 }
 
 fn row(scenario: &str, iteration: usize, elapsed_ns: u128, status: &str) {
+    row_with_resources_and_phase(
+        scenario,
+        iteration,
+        elapsed_ns,
+        status,
+        ResourceSample::default(),
+        ResourceSample::default(),
+        PhaseFields::default(),
+    );
+}
+
+fn row_with_resources(
+    scenario: &str,
+    iteration: usize,
+    elapsed_ns: u128,
+    status: &str,
+    before: ResourceSample,
+    after: ResourceSample,
+) {
+    row_with_resources_and_phase(
+        scenario,
+        iteration,
+        elapsed_ns,
+        status,
+        before,
+        after,
+        PhaseFields::default(),
+    );
+}
+
+fn row_with_resources_and_phase(
+    scenario: &str,
+    iteration: usize,
+    elapsed_ns: u128,
+    status: &str,
+    before: ResourceSample,
+    after: ResourceSample,
+    phase: PhaseFields,
+) {
     let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{scenario}\t{iteration}\t{elapsed_ns}\t{status}")
-        .expect("write benchmark TSV row");
+    let fields = [
+        resource_value(before.threads),
+        resource_value(after.threads),
+        resource_value(before.fds),
+        resource_value(after.fds),
+        resource_value(before.rss_bytes),
+        resource_value(after.rss_bytes),
+        phase_value(phase.admission_ns),
+        phase_value(phase.queue_wait_ns),
+        phase_value(phase.resolver_manifest_probe_ns),
+        phase_value(phase.resolver_reuse_ns),
+        phase_value(phase.resolver_rebuild_ns),
+        phase_value(phase.permission_runtime_services_ns),
+        phase_value(phase.graph_build_ns),
+        phase_value(phase.main_worker_bootstrap_ns),
+        phase_value(phase.user_execution_ns),
+        phase_value(phase.output_drain_ns),
+        phase_value(phase.cancel_kill_reap_ns),
+        resource_value(phase.parent_threads_before),
+        resource_value(phase.parent_threads_after),
+        resource_value(phase.parent_fds_before),
+        resource_value(phase.parent_fds_after),
+        resource_value(phase.parent_rss_bytes_before),
+        resource_value(phase.parent_rss_bytes_after),
+    ];
+    writeln!(
+        stdout,
+        "{scenario}\t{iteration}\t{elapsed_ns}\t{status}\t{}",
+        fields.join("\t"),
+    )
+    .expect("write benchmark TSV row");
 }
 
 fn record(scenario: &str, iteration: usize, start: Instant, result: Result<(), String>) {
+    record_with_phase(
+        scenario,
+        iteration,
+        start,
+        result.map(|()| PhaseFields::default()),
+    );
+}
+
+fn record_with_phase(
+    scenario: &str,
+    iteration: usize,
+    start: Instant,
+    result: Result<PhaseFields, String>,
+) {
     let elapsed_ns = start.elapsed().as_nanos();
     match result {
-        Ok(()) => row(scenario, iteration, elapsed_ns, "ok"),
+        Ok(phase) => row_with_resources_and_phase(
+            scenario,
+            iteration,
+            elapsed_ns,
+            "ok",
+            ResourceSample::default(),
+            ResourceSample::default(),
+            phase,
+        ),
         Err(error) => {
             row(scenario, iteration, elapsed_ns, "error");
+            panic!("{scenario} iteration {iteration} failed: {error}");
+        }
+    }
+}
+
+fn record_with_resources_and_phase(
+    scenario: &str,
+    iteration: usize,
+    start: Instant,
+    before: ResourceSample,
+    result: Result<PhaseFields, String>,
+) {
+    let elapsed_ns = start.elapsed().as_nanos();
+    let after = resource_sample();
+    match result {
+        Ok(phase) => row_with_resources_and_phase(
+            scenario, iteration, elapsed_ns, "ok", before, after, phase,
+        ),
+        Err(error) => {
+            row_with_resources(scenario, iteration, elapsed_ns, "error", before, after);
             panic!("{scenario} iteration {iteration} failed: {error}");
         }
     }
@@ -321,6 +702,204 @@ fn runtime_reuse_async(iters: usize, fixture: &Fixture, options: &libdeno::Libde
     }
 }
 
+fn large_options(root: &Path, capture_stdout: bool) -> libdeno::LibdenoOptions {
+    libdeno::LibdenoOptions {
+        allow_all_permissions: true,
+        cwd: Some(root.to_path_buf()),
+        capture_stdout,
+        ..Default::default()
+    }
+}
+
+fn build_subprocess_executor(fixture: &LargeFixture) -> libdeno::Executor {
+    let host = std::env::current_exe().expect("resolve benchmark host executable");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build subprocess-executor Tokio runtime");
+    runtime
+        .block_on(
+            libdeno::Executor::builder(&fixture.root)
+                .backend(libdeno::ExecutionBackend::Subprocess)
+                .host_executable(host)
+                .build(),
+        )
+        .unwrap_or_else(|error| panic!("build subprocess executor: {error}"))
+}
+
+fn build_inprocess_executor(fixture: &LargeFixture) -> libdeno::Executor {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build in-process-executor Tokio runtime");
+    runtime
+        .block_on(
+            libdeno::Executor::builder(&fixture.root)
+                .backend(libdeno::ExecutionBackend::InProcess)
+                .build(),
+        )
+        .unwrap_or_else(|error| panic!("build in-process executor: {error}"))
+}
+
+fn check_executor(
+    result: Result<libdeno::ExecutionResult, libdeno::ExecutionFailure>,
+) -> Result<PhaseFields, String> {
+    match result {
+        Ok(result) if result.exit_code() == 0 => Ok(phase_fields(result.report())),
+        Ok(result) => Err(format!(
+            "executor returned exit code {}",
+            result.exit_code()
+        )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn check_inprocess_phase(
+    result: Result<libdeno::ExecutionResult, libdeno::ExecutionFailure>,
+) -> Result<PhaseFields, String> {
+    let phase = check_executor(result)?;
+    #[cfg(feature = "phase-diagnostics")]
+    if !(phase.resolver_manifest_probe_ns.is_some() || phase.resolver_reuse_ns.is_some())
+        || phase.graph_build_ns.is_none()
+        || phase.main_worker_bootstrap_ns.is_none()
+        || phase.user_execution_ns.is_none()
+    {
+        return Err(
+            "large_inprocess_phase did not report all required executor phases".to_string(),
+        );
+    }
+    Ok(phase)
+}
+
+fn large_inprocess_phase(iters: usize, fixture: &LargeFixture) {
+    let executor = build_inprocess_executor(fixture);
+    let options = large_options(&fixture.root, false);
+    for iteration in 0..iters {
+        let before = resource_sample();
+        let start = Instant::now();
+        let result = std::hint::black_box(executor.execute(libdeno::ExecutionRequest::new(
+            &fixture.entry,
+            options.clone(),
+        )));
+        record_with_resources_and_phase(
+            "large_inprocess_phase",
+            iteration,
+            start,
+            before,
+            check_inprocess_phase(result),
+        );
+    }
+}
+
+fn large_subprocess_sequential(
+    scenario: &str,
+    iters: usize,
+    fixture: &LargeFixture,
+    capture_stdout: bool,
+) {
+    let executor = build_subprocess_executor(fixture);
+    let options = large_options(&fixture.root, capture_stdout);
+    for iteration in 0..iters {
+        let before = resource_sample();
+        let start = Instant::now();
+        let result = std::hint::black_box(executor.execute(libdeno::ExecutionRequest::new(
+            &fixture.entry,
+            options.clone(),
+        )));
+        record_with_resources_and_phase(scenario, iteration, start, before, check_executor(result));
+    }
+}
+
+fn parallelism_n() -> usize {
+    let value = std::env::var("LIBDENO_BENCH_PARALLELISM").unwrap_or_else(|_| "8".to_string());
+    let parsed = value.parse::<usize>().unwrap_or_else(|_| {
+        panic!("LIBDENO_BENCH_PARALLELISM must be a positive integer, got {value:?}")
+    });
+    if parsed == 0 {
+        panic!("LIBDENO_BENCH_PARALLELISM must be a positive integer");
+    }
+    parsed
+}
+
+fn large_subprocess_parallel(
+    scenario: &str,
+    iters: usize,
+    fixture: &LargeFixture,
+    capture_stdout: bool,
+    concurrency: usize,
+) {
+    let executor = build_subprocess_executor(fixture);
+    let options = large_options(&fixture.root, capture_stdout);
+    for iteration in 0..iters {
+        let before = resource_sample();
+        let barrier = Arc::new(Barrier::new(concurrency + 1));
+        let mut workers = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let barrier = Arc::clone(&barrier);
+            let executor = executor.clone();
+            let entry = fixture.entry.clone();
+            let options = options.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                check_executor(std::hint::black_box(
+                    executor.execute(libdeno::ExecutionRequest::new(entry, options)),
+                ))
+            }));
+        }
+
+        let start = Instant::now();
+        barrier.wait();
+        // `elapsed_ns` below is the parent makespan; phase columns are the
+        // explicit sum of every worker report, not the last joined worker.
+        let mut result = Ok(());
+        let mut phase = PhaseFields::default();
+        for worker in workers {
+            match worker.join() {
+                Ok(Ok(worker_phase)) => phase.add_worker(worker_phase),
+                Ok(Err(error)) => result = Err(error),
+                Err(_) => result = Err("parallel subprocess worker panicked".to_string()),
+            }
+        }
+        record_with_resources_and_phase(scenario, iteration, start, before, result.map(|()| phase));
+    }
+}
+
+fn with_large_fixture(run: impl FnOnce(&LargeFixture)) {
+    let fixture = LargeFixture::new();
+    let root = fixture.root.clone();
+    run(&fixture);
+    drop(fixture);
+    assert!(
+        !root.exists(),
+        "benchmark fixture must be removed after the scenario"
+    );
+}
+
+fn large_subprocess_scenario(scenario: &str, iters: usize) {
+    with_large_fixture(|fixture| match scenario {
+        "large_subprocess_capture_off" => {
+            large_subprocess_sequential(scenario, iters, fixture, false)
+        }
+        "large_subprocess_capture_on" => {
+            large_subprocess_sequential(scenario, iters, fixture, true)
+        }
+        "large_subprocess_parallel_1" => {
+            large_subprocess_parallel(scenario, iters, fixture, false, 1)
+        }
+        "large_subprocess_parallel_4" => {
+            large_subprocess_parallel(scenario, iters, fixture, false, 4)
+        }
+        "large_subprocess_parallel_n" => {
+            large_subprocess_parallel(scenario, iters, fixture, false, parallelism_n())
+        }
+        _ => unreachable!("validated large benchmark scenario"),
+    });
+}
+
+fn large_inprocess_scenario(iters: usize) {
+    with_large_fixture(|fixture| large_inprocess_phase(iters, fixture));
+}
+
 fn child_main() -> ! {
     let root = PathBuf::from(
         std::env::var_os(FIXTURE_ENV).expect("child benchmark fixture path is missing"),
@@ -343,6 +922,12 @@ fn child_main() -> ! {
 }
 
 fn main() {
+    // The benchmark executable is also the explicit host for the real
+    // Executor::Subprocess scenarios. Legacy benchmark child mode remains a
+    // separate fixture path below.
+    if libdeno::maybe_handle_child_mode() {
+        unreachable!("child mode exits from maybe_handle_child_mode");
+    }
     if std::env::var("LIBDENO_BENCH_CHILD").ok().as_deref() == Some("1")
         && std::env::var_os(FIXTURE_ENV).is_some()
     {
@@ -359,7 +944,9 @@ fn main() {
     );
     eprintln!("results are diagnostic data, not a CI performance gate");
 
-    println!("scenario\titeration\telapsed_ns\tstatus");
+    println!(
+        "scenario\titeration\telapsed_ns\tstatus\tthreads_before\tthreads_after\tfds_before\tfds_after\trss_bytes_before\trss_bytes_after\tphase_admission_ns\tphase_queue_wait_ns\tphase_resolver_manifest_probe_ns\tphase_resolver_reuse_ns\tphase_resolver_rebuild_ns\tphase_permission_runtime_services_ns\tphase_graph_build_ns\tphase_main_worker_bootstrap_ns\tphase_user_execution_ns\tphase_output_drain_ns\tphase_cancel_kill_reap_ns\tparent_threads_before\tparent_threads_after\tparent_fds_before\tparent_fds_after\tparent_rss_bytes_before\tparent_rss_bytes_after"
+    );
     let fixture = Fixture::new();
     let options = options(&fixture.root);
     for scenario in scenarios {
@@ -373,7 +960,19 @@ fn main() {
             "runtime_construct" => runtime_construct(iters, &fixture),
             "fresh_runtime_run" => fresh_runtime_run(iters, &fixture, &options),
             "runtime_reuse_async" => runtime_reuse_async(iters, &fixture, &options),
+            "large_inprocess_phase" => large_inprocess_scenario(iters),
+            scenario @ ("large_subprocess_capture_off"
+            | "large_subprocess_capture_on"
+            | "large_subprocess_parallel_1"
+            | "large_subprocess_parallel_4"
+            | "large_subprocess_parallel_n") => large_subprocess_scenario(scenario, iters),
             _ => unreachable!("validated benchmark scenario"),
         }
     }
+    let fixture_root = fixture.root.clone();
+    drop(fixture);
+    assert!(
+        !fixture_root.exists(),
+        "benchmark fixture must be removed after all scenarios"
+    );
 }

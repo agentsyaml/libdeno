@@ -18,6 +18,9 @@
 //! ```
 
 mod analysis_cache;
+mod deno_resolver_adapter;
+mod deno_runtime_adapter;
+mod executor;
 mod graph;
 mod http;
 mod limits;
@@ -33,6 +36,9 @@ mod permissions;
 pub mod runtime;
 mod services;
 mod subprocess;
+#[cfg(feature = "execution-control")]
+mod supervisor;
+mod timing;
 mod worker_factory;
 
 use std::path::{Path, PathBuf};
@@ -43,27 +49,35 @@ use deno_core::error::AnyError;
 use deno_core::ModuleSpecifier;
 use deno_runtime::deno_fs::FileSystem;
 use deno_runtime::deno_fs::RealFs;
-use deno_runtime::deno_inspector_server::MainInspectorSessionChannel;
-use deno_runtime::deno_node::NodeExtInitServices;
-use deno_runtime::deno_web::BlobStore;
-use deno_runtime::deno_web::InMemoryBroadcastChannel;
-use deno_runtime::worker::MainWorker;
-use deno_runtime::worker::WorkerOptions;
-use deno_runtime::worker::WorkerServiceOptions;
-use deno_runtime::BootstrapOptions;
 
+#[cfg(feature = "phase-diagnostics")]
+#[doc(hidden)]
+pub use executor::PhaseDiagnostics;
+#[cfg(feature = "execution-control")]
+#[doc(hidden)]
+pub use executor::{
+    AdmissionConfig, CancelOutcome, ExecutionCleanupStrength, ExecutionHandle, ExecutionState,
+    ExecutionTransportStatus, ShutdownReport, SubmissionOptions, SubmitError,
+};
+pub use executor::{
+    CapabilityAvailability, CapabilityOutcome, CapabilityReport, ExecutionBackend,
+    ExecutionCapability, ExecutionError, ExecutionFailure, ExecutionOutput, ExecutionReport,
+    ExecutionRequest, ExecutionResult, Executor, ExecutorBuilder, UnsupportedCapability,
+};
 pub use permission_broker::{
     install_permission_broker, install_permission_hook, PermissionPrompt, PermissionRequest,
 };
 pub use runtime::{run_with, LibdenoRuntime};
 pub use subprocess::{maybe_handle_child_mode, run_in_subprocess, run_in_subprocess_with_output};
+#[cfg(feature = "execution-control")]
+#[doc(hidden)]
+pub use subprocess::{maybe_handle_supervisor_mode, run_in_supervised_subprocess};
 
 use module_loader::GraphModuleLoader;
-use node_loader::SimpleNodeRequireLoader;
 use permissions::build_permissions;
 use services::{RuntimeServices, SharedServices};
 use sys_traits::impls::RealSys;
-use worker_factory::create_web_worker_factory;
+use timing::{ExecutionTiming, Phase};
 
 /// Concurrency protocol for in-process runs: ordinary runs are fully
 /// parallel (each runs its own thread + isolate + graph, sharing nothing
@@ -214,7 +228,10 @@ pub struct LibdenoOptions {
     /// budget). When a stream exceeds it, capture stops, the excess is
     /// dropped, and [`RunOutput::capture_truncated`] is set — a verbose or
     /// hostile script can no longer grow host memory without limit. `None`
-    /// (default) captures without a bound.
+    /// (default) captures without a bound for legacy/in-process capture. The
+    /// execution-control supervisor path uses a bounded 64 KiB per-stream
+    /// default, honors explicit values through 96 KiB, and rejects larger
+    /// explicit values with [`LibdenoError::Configuration`] before spawning.
     pub max_capture_bytes: Option<usize>,
     /// Runtime feature flags exposed to the script, overriding the default
     /// set (`kv`, `cron`, `ffi`, `webgpu`, `worker-options`). Feature names
@@ -236,13 +253,14 @@ pub struct RunOutput {
     /// The exit code the script requested (0 on normal completion).
     pub exit_code: i32,
     /// Captured stdout bytes; empty unless [`LibdenoOptions::capture_stdout`]
-    /// was set. Unbounded: a verbose or hostile script grows this without
-    /// limit for the run's duration — set [`LibdenoOptions::max_capture_bytes`]
-    /// for a memory bound; `execution_deadline` is not a memory bound.
+    /// was set. Legacy/in-process capture is unbounded unless
+    /// [`LibdenoOptions::max_capture_bytes`] is set; supervisor capture is
+    /// bounded by its supervisor-specific default and maximum.
     pub stdout: Vec<u8>,
     /// Captured stderr bytes; empty unless [`LibdenoOptions::capture_stderr`]
-    /// was set. Same unbounded-growth caveat as [`Self::stdout`]; use
-    /// [`LibdenoOptions::max_capture_bytes`] for a memory bound.
+    /// was set. Same legacy/in-process unbounded-growth caveat as
+    /// [`Self::stdout`]; supervisor capture is bounded by its
+    /// supervisor-specific default and maximum.
     pub stderr: Vec<u8>,
     /// True when a captured stream hit [`LibdenoOptions::max_capture_bytes`]
     /// and was truncated. False when no capture was requested or when both
@@ -391,24 +409,151 @@ pub fn run_with_output(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<RunOutput, LibdenoError> {
+    run_with_output_observed(entry, options, ExecutionTiming::disabled())
+}
+
+/// Internal equivalent of [`run_with_output`] that attaches observations to an
+/// existing executor-owned sink.  The sink is crate-private so the legacy API
+/// remains unchanged.
+pub(crate) fn run_with_output_observed(
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+) -> Result<RunOutput, LibdenoError> {
     // Capture is process-global (fd-level redirection): take the exclusivity
     // lease before the run starts so a concurrent run can be rejected cleanly
     // (see RunLease). Ordinary runs take the lease too — they must not start
     // while a captured run is active — but otherwise run fully in parallel.
-    let _lease = RunLease::acquire(options.capture_stdout || options.capture_stderr)?;
+    let _lease = {
+        let _admission = timing.span(Phase::Admission);
+        RunLease::acquire(options.capture_stdout || options.capture_stderr)?
+    };
     // Capture the entry-time child-IPC marker (and write it back so fork children inherit it).
     limits::capture_spawned_ipc_marker();
     let entry = entry.as_ref().to_path_buf();
     let options = options.clone();
     if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run_sync_output(&entry, &options))
+        std::thread::spawn(move || run_sync_output(&entry, &options, timing))
             .join()
             .map_err(|_| {
                 LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
             })?
     } else {
-        run_sync_output(&entry, &options)
+        run_sync_output(&entry, &options, timing)
     }
+}
+
+#[cfg(feature = "execution-control")]
+pub(crate) fn run_with_output_observed_cancellable(
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+    cancellation: Option<limits::CancellationContext>,
+) -> Result<RunOutput, LibdenoError> {
+    let _lease = {
+        let _admission = timing.span(Phase::Admission);
+        RunLease::acquire(options.capture_stdout || options.capture_stderr)?
+    };
+    limits::capture_spawned_ipc_marker();
+    let entry = entry.as_ref().to_path_buf();
+    let options = options.clone();
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let cancellation = cancellation.clone();
+        std::thread::spawn(move || {
+            run_sync_output_cancellable(&entry, &options, timing, cancellation)
+        })
+        .join()
+        .map_err(|_| {
+            LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
+        })?
+    } else {
+        run_sync_output_cancellable(&entry, &options, timing, cancellation)
+    }
+}
+
+#[cfg(feature = "execution-control")]
+pub(crate) fn run_with_output_observed_cancellable_until(
+    runtime: &LibdenoRuntime,
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+    cancellation: Option<limits::CancellationContext>,
+    absolute_deadline: Option<std::time::Instant>,
+) -> Result<RunOutput, LibdenoError> {
+    let deadline_guard =
+        limits::AbsoluteDeadlineGuard::new(absolute_deadline, cancellation.clone());
+    let result = crate::runtime::run_with_output_observed_cancellable(
+        runtime,
+        entry,
+        options,
+        timing,
+        cancellation,
+    );
+    drop(deadline_guard);
+    result
+}
+
+#[cfg(feature = "execution-control")]
+fn run_sync_output_cancellable(
+    entry: &Path,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+    cancellation: Option<limits::CancellationContext>,
+) -> Result<RunOutput, LibdenoError> {
+    #[cfg(windows)]
+    if options.capture_stdout || options.capture_stderr {
+        return Err(LibdenoError::Configuration(
+            CAPTURE_UNSUPPORTED_ON_WINDOWS.to_string(),
+        ));
+    }
+    let capture = output::OutputCapture::new(
+        options.capture_stdout,
+        options.capture_stderr,
+        options.max_capture_bytes,
+    )
+    .map_err(LibdenoError::Io)?;
+    let result = run_sync_cancellable(entry, options, timing.clone(), cancellation);
+    let capture_result = capture.finish().map_err(LibdenoError::Io);
+    match result {
+        Err(error) => Err(error),
+        Ok(exit_code) => {
+            let (stdout, stderr, capture_truncated) = capture_result?;
+            Ok(RunOutput {
+                exit_code,
+                stdout,
+                stderr,
+                capture_truncated,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn run_sync_cancellable(
+    entry: &Path,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+    cancellation: Option<limits::CancellationContext>,
+) -> Result<i32, LibdenoError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| LibdenoError::Runtime(deno_core::anyhow::anyhow!(error)))?;
+    runtime.block_on(async {
+        let cwd_raw = options.cwd.clone().unwrap_or(std::env::current_dir()?);
+        let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
+        let main_module = resolve_entry(entry, &cwd).map_err(LibdenoError::Entry)?;
+        let config_start_paths = main_module
+            .to_file_path()
+            .ok()
+            .and_then(|path| path.parent().map(|dir| vec![dir.to_path_buf()]))
+            .unwrap_or_else(|| vec![cwd.clone()]);
+        let shared =
+            SharedServices::new_with_timing(cwd.clone(), config_start_paths, Some(timing.clone()))
+                .await
+                .map_err(LibdenoError::Runtime)?;
+        run_inner_with_cancellation(shared, cwd, entry, options, timing, cancellation).await
+    })
 }
 
 /// Shared message for the Windows capture rejection (sync and async entry
@@ -420,7 +565,11 @@ pub(crate) const CAPTURE_UNSUPPORTED_ON_WINDOWS: &str =
      bypass the redirected CRT fd); use run_in_subprocess_with_output \
      instead — the child's own fds are piped, so it works on Windows";
 
-fn run_sync_output(entry: &Path, options: &LibdenoOptions) -> Result<RunOutput, LibdenoError> {
+fn run_sync_output(
+    entry: &Path,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+) -> Result<RunOutput, LibdenoError> {
     // Windows: Rust std's stdout/stderr write via GetStdHandle, bypassing the
     // CRT fd that dup2 redirects, so console output cannot be captured
     // in-process there. Report a clean error instead of silently returning
@@ -437,8 +586,13 @@ fn run_sync_output(entry: &Path, options: &LibdenoOptions) -> Result<RunOutput, 
         options.max_capture_bytes,
     )
     .map_err(LibdenoError::Io)?;
-    let result = run_sync(entry, options);
-    let capture_result = capture.finish().map_err(LibdenoError::Io);
+    let result = run_sync(entry, options, timing.clone());
+    let capture_result = if options.capture_stdout || options.capture_stderr {
+        let _output_drain = timing.span(Phase::OutputDrain);
+        capture.finish().map_err(LibdenoError::Io)
+    } else {
+        capture.finish().map_err(LibdenoError::Io)
+    };
     match result {
         Err(error) => Err(error),
         Ok(exit_code) => {
@@ -506,7 +660,8 @@ pub async fn run_with_output_async(
 ) -> Result<RunOutput, LibdenoError> {
     check_async_context()?;
     let entry = entry.as_ref().to_path_buf();
-    run_with_output_async_guarded(options, run_inner(&entry, options)).await
+    let timing = ExecutionTiming::disabled();
+    run_with_output_async_guarded(options, timing.clone(), run_inner(&entry, options, timing)).await
 }
 
 /// Thread-local guard: one `run_async` at a time per thread (see
@@ -558,6 +713,7 @@ pub(crate) fn check_async_context() -> Result<(), LibdenoError> {
 /// isolate remain on the caller's thread.
 pub(crate) async fn run_with_output_async_guarded<F>(
     options: &LibdenoOptions,
+    timing: ExecutionTiming,
     run: F,
 ) -> Result<RunOutput, LibdenoError>
 where
@@ -571,7 +727,10 @@ where
     // Same lease protocol as the sync path: capture is process-global and
     // exclusive; the lease is an atomic RAII guard, so it is safe to hold
     // across awaits.
-    let _lease = RunLease::acquire(options.capture_stdout || options.capture_stderr)?;
+    let _lease = {
+        let _admission = timing.span(Phase::Admission);
+        RunLease::acquire(options.capture_stdout || options.capture_stderr)?
+    };
     // Capture the entry-time child-IPC marker (fork children inherit it).
     limits::capture_spawned_ipc_marker();
     #[cfg(windows)]
@@ -587,7 +746,12 @@ where
     )
     .map_err(LibdenoError::Io)?;
     let result = run.await;
-    let capture_result = capture.finish().map_err(LibdenoError::Io);
+    let capture_result = if options.capture_stdout || options.capture_stderr {
+        let _output_drain = timing.span(Phase::OutputDrain);
+        capture.finish().map_err(LibdenoError::Io)
+    } else {
+        capture.finish().map_err(LibdenoError::Io)
+    };
     match result {
         Err(error) => Err(error),
         Ok(exit_code) => {
@@ -602,46 +766,27 @@ where
     }
 }
 
-/// The default unstable runtime surface. Keep this as the only default list;
-/// tests exercise it through the runtime rather than mirroring the names.
-const DEFAULT_RUNTIME_FEATURES: &[&str] = &["kv", "cron", "ffi", "webgpu", "worker-options"];
-
-/// FeatureChecker::enable_feature requires `&'static str`, while a host's
-/// feature list arrives as owned `String`s. The deno registry already owns the
-/// static names, so map through it and retain first-seen order without leaking
-/// host-provided strings or retaining the input set.
-fn static_feature_names(features: &[String]) -> Result<Vec<&'static str>, String> {
-    let mut names = Vec::with_capacity(features.len().min(deno_features::UNSTABLE_FEATURES.len()));
-    for feature in features {
-        let Some(name) = deno_features::UNSTABLE_FEATURES
-            .iter()
-            .find(|definition| definition.name == feature)
-            .map(|definition| definition.name)
-        else {
-            return Err(feature.clone());
-        };
-        // FeatureChecker rejects duplicate enables; preserve the old
-        // duplicate-tolerant behavior while keeping caller order.
-        if !names.contains(&name) {
-            names.push(name);
-        }
-    }
-    Ok(names)
-}
-
 /// The actual run: a fresh current-thread runtime and the run lifecycle. Must
 /// not be called from inside a tokio runtime (tokio panics on nested
 /// runtimes); [`run_with_output`] routes such callers onto a fresh thread
 /// first.
-fn run_sync(entry: &Path, options: &LibdenoOptions) -> Result<i32, LibdenoError> {
+fn run_sync(
+    entry: &Path,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+) -> Result<i32, LibdenoError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| LibdenoError::Runtime(deno_core::anyhow::anyhow!(e)))?;
-    runtime.block_on(run_inner(entry, options))
+    runtime.block_on(run_inner(entry, options, timing))
 }
 
-async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, LibdenoError> {
+async fn run_inner(
+    entry: &Path,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+) -> Result<i32, LibdenoError> {
     // Canonicalize once so entry resolution, permission grants and
     // node_modules discovery all agree on the resolution base: unix getcwd
     // already canonicalizes (e.g. /var -> /private/var), so a symlinked
@@ -656,10 +801,13 @@ async fn run_inner(entry: &Path, options: &LibdenoOptions) -> Result<i32, Libden
         .ok()
         .and_then(|p| p.parent().map(|d| vec![d.to_path_buf()]))
         .unwrap_or_else(|| vec![cwd.clone()]);
-    let shared = SharedServices::new(cwd.clone(), config_start_paths)
-        .await
-        .map_err(LibdenoError::Runtime)?;
-    run_inner_with(shared, cwd, entry, options).await
+    let shared = {
+        let _rebuild = timing.span(Phase::ResolverRebuild);
+        SharedServices::new_with_timing(cwd.clone(), config_start_paths, Some(timing.clone()))
+            .await
+            .map_err(LibdenoError::Runtime)?
+    };
+    run_inner_with(shared, cwd, entry, options, timing).await
 }
 
 /// The per-run half of a [`run`]/[`run_with`] against an already-built
@@ -669,11 +817,25 @@ pub(crate) async fn run_inner_with(
     cwd: PathBuf,
     entry: &Path,
     options: &LibdenoOptions,
+    timing: ExecutionTiming,
 ) -> Result<i32, LibdenoError> {
+    run_inner_with_cancellation(shared, cwd, entry, options, timing, None).await
+}
+
+pub(crate) async fn run_inner_with_cancellation(
+    shared: Arc<SharedServices>,
+    cwd: PathBuf,
+    entry: &Path,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+    cancellation: Option<crate::limits::CancellationContext>,
+) -> Result<i32, LibdenoError> {
+    cancellation_checkpoint(cancellation.as_ref())?;
     // Validate before permission construction, graph setup, or MainWorker/V8
     // bootstrap. All ordinary, reusable, async, and subprocess-backed runs
-    // converge here, so an invalid cap cannot fall through to V8 defaults.
+    // converge here, so invalid resource limits cannot reach backend defaults.
     limits::validate_max_heap_bytes(options.max_heap_bytes)?;
+    limits::validate_execution_deadline(options.execution_deadline)?;
 
     // rustls needs an explicit CryptoProvider (aws-lc-rs and ring are both
     // enabled in the dep graph); the deno CLI does the same. Only install when
@@ -686,21 +848,29 @@ pub(crate) async fn run_inner_with(
         );
     }
     let main_module = resolve_entry(entry, &cwd).map_err(LibdenoError::Entry)?;
+    cancellation_checkpoint(cancellation.as_ref())?;
 
     let fs: Arc<dyn FileSystem> = Arc::new(RealFs);
-    let permission_parser =
-        Arc::new(deno_runtime::deno_permissions::RuntimePermissionDescriptorParser::new(RealSys));
-    let permissions = build_permissions(
-        &options.permissions,
-        options.allow_all_permissions,
-        options.prompt,
-        permission_parser.clone(),
-        &cwd,
-    )?;
-    check_entry_read_permission(&permissions, &main_module)?;
-    let services = Arc::new(
-        RuntimeServices::new(shared, cwd, permissions.clone()).map_err(LibdenoError::Runtime)?,
-    );
+    let (permissions, services) = {
+        let _permission_services = timing.span(Phase::PermissionRuntimeServices);
+        let permission_parser = Arc::new(
+            deno_runtime::deno_permissions::RuntimePermissionDescriptorParser::new(RealSys),
+        );
+        let permissions = build_permissions(
+            &options.permissions,
+            options.allow_all_permissions,
+            options.prompt,
+            permission_parser,
+            &cwd,
+        )?;
+        check_entry_read_permission(&permissions, &main_module)?;
+        let services = Arc::new(
+            RuntimeServices::new(shared, permissions.clone(), timing.clone())
+                .map_err(LibdenoError::Runtime)?,
+        );
+        (permissions, services)
+    };
+    cancellation_checkpoint(cancellation.as_ref())?;
 
     // has_node_modules_dir must come AFTER RuntimeServices::new: that runs
     // initialize_npm_resolution_if_managed, which decides Managed vs BYONM.
@@ -716,140 +886,29 @@ pub(crate) async fn run_inner_with(
             NpmResolver::Byonm(byonm) => byonm.root_node_modules_path().is_some(),
         }
     };
+    cancellation_checkpoint(cancellation.as_ref())?;
 
     let module_loader: Rc<dyn deno_core::ModuleLoader> = Rc::new(GraphModuleLoader::new(
         services.clone(),
         permissions.clone(),
     ));
 
-    let node_resolver = services.shared.resolver_factory.node_resolver()?.clone();
-    let pkg_json_resolver = services.shared.resolver_factory.pkg_json_resolver().clone();
-    let cjs_tracker = services.shared.resolver_factory.cjs_tracker()?.clone();
-    let in_npm_pkg_checker = services
-        .shared
-        .resolver_factory
-        .in_npm_package_checker()?
-        .clone();
-    let node_require_loader: deno_runtime::deno_node::NodeRequireLoaderRc = Rc::new(
-        SimpleNodeRequireLoader::new(cjs_tracker, in_npm_pkg_checker),
-    );
-    let node_sys = services.shared.sys.clone();
-    let node_services = Some(NodeExtInitServices {
-        node_require_loader: node_require_loader.clone(),
-        node_resolver: node_resolver.clone(),
-        pkg_json_resolver: pkg_json_resolver.clone(),
-        sys: node_sys.clone(),
-    });
-
-    let blob_store = BlobStore::default_arc();
-    let broadcast_channel = InMemoryBroadcastChannel::default();
-    // Default: "everything enabled" like `deno run --unstable` — an embedded
-    // runtime has no flag surface unless the host opts in via
-    // `LibdenoOptions.features`. worker-options gates the worker
-    // `permissions`/`env`/`net` options in `new Worker(...)` (op_create_worker
-    // exits the process if the feature is off), so a custom set that omits it
-    // breaks worker permission narrowing. JS namespace IDs and
-    // FeatureChecker names must stay in sync.
-    let enabled_features: Vec<&str> = match &options.features {
-        Some(features) => {
-            // worker-options is force-enabled regardless of the custom set:
-            // it gates the worker `permissions`/`env`/`net` options, and
-            // op_create_worker EXITS the process when the feature is off —
-            // a host shrinking the surface for untrusted plugins must not
-            // hand a plugin a way to kill the host.
-            let mut names = static_feature_names(features).map_err(|bad| {
-                LibdenoError::Configuration(format!("unknown runtime feature: {bad}"))
-            })?;
-            if !names.contains(&"worker-options") {
-                names.push("worker-options");
-            }
-            names
-        }
-        None => DEFAULT_RUNTIME_FEATURES.to_vec(),
+    let (mut worker, isolate_handle) = {
+        let _bootstrap = timing.span(Phase::MainWorkerBootstrap);
+        deno_runtime_adapter::build_main_worker(deno_runtime_adapter::MainWorkerInput {
+            main_module: &main_module,
+            options,
+            has_node_modules_dir,
+            fs,
+            module_loader,
+            permissions,
+            services: services.clone(),
+        })?
     };
-    let feature_checker = {
-        let mut fc = deno_runtime::FeatureChecker::default();
-        for feature in &enabled_features {
-            fc.enable_feature(feature);
-        }
-        Arc::new(fc)
-    };
-    let unstable_ids: Vec<i32> = deno_features::UNSTABLE_FEATURES
-        .iter()
-        .filter(|f| enabled_features.contains(&f.name))
-        .map(|f| f.id)
-        .collect();
-
-    let worker_services = WorkerServiceOptions {
-        blob_store: blob_store.clone(),
-        broadcast_channel: broadcast_channel.clone(),
-        deno_rt_native_addon_loader: None,
-        feature_checker: feature_checker.clone(),
-        fs: fs.clone(),
-        module_loader: module_loader.clone(),
-        node_services: node_services.clone(),
-        npm_process_state_provider: Some(services.shared.npm_process_state_provider.clone()),
-        permissions: permissions.clone(),
-        root_cert_store_provider: None,
-        fetch_dns_resolver: deno_runtime::deno_fetch::dns::Resolver::default(),
-        shared_array_buffer_store: None,
-        compiled_wasm_module_store: None,
-        // In-process V8 code cache, keyed by specifier + source hash (limits.rs).
-        v8_code_cache: Some(limits::in_process_code_cache()),
-        bundle_provider: None,
-    };
-
-    // Must match deno_runtime's release tag: scripts feature-detect
-    // Deno.version.deno. deno_runtime 0.265.0 == Deno v2.9.5.
-    const DENO_VERSION: &str = "2.9.5";
-
-    let main_bootstrap = BootstrapOptions {
-        deno_version: DENO_VERSION.to_string(),
-        user_agent: format!(
-            "libdeno/{}/Deno/{}",
-            env!("CARGO_PKG_VERSION"),
-            DENO_VERSION
-        ),
-        has_node_modules_dir,
-        location: Some(main_module.clone()),
-        args: options.args.clone(),
-        unstable_features: unstable_ids,
-        // fork() IPC pipe; gated on the marker captured at run() entry (limits.rs).
-        node_ipc_init: limits::node_ipc_init(),
-        ..Default::default()
-    };
-
-    // Factory for `new Worker(...)`; nested workers reuse the same loader,
-    // services and snapshot, and inherit the main worker's heap cap.
-    let create_web_worker_cb: Arc<deno_runtime::ops::worker_host::CreateWebWorkerCb> =
-        create_web_worker_factory(
-            blob_store,
-            broadcast_channel,
-            feature_checker,
-            fs.clone(),
-            services.clone(),
-            MainInspectorSessionChannel::default(),
-            main_bootstrap.clone(),
-            options.max_heap_bytes,
-        )?;
-
-    let worker_options = WorkerOptions {
-        bootstrap: main_bootstrap,
-        create_web_worker_cb,
-        extensions: vec![],
-        startup_snapshot: Some(STARTUP_SNAPSHOT),
-        residual_lazy_js_sources: RESIDUAL_LAZY_JS,
-        residual_lazy_esm_sources: RESIDUAL_LAZY_ESM,
-        create_params: limits::isolate_create_params(options.max_heap_bytes),
-        ..Default::default()
-    };
-
-    let mut worker =
-        MainWorker::bootstrap_from_options(&main_module, worker_services, worker_options);
+    cancellation_checkpoint(cancellation.as_ref())?;
 
     // Intercept Deno.exit: a WatcherExitHandle in the OpState makes op_exit
     // terminate the isolate (the CLI's --watch path); ExitCode op state carries n.
-    let isolate_handle = worker.js_runtime.v8_isolate().thread_safe_handle();
     worker
         .js_runtime
         .op_state()
@@ -858,20 +917,27 @@ pub(crate) async fn run_inner_with(
             isolate_handle.clone(),
         ));
 
-    let run_result = match limits::run_worker(
+    let run_result = match limits::run_worker_cancellable(
         &mut worker,
         &main_module,
         options.execution_deadline,
         isolate_handle.clone(),
+        timing.clone(),
+        cancellation,
     )
     .await
     {
         Ok(result) => result,
         // Deadline fired: isolate terminated; the run lease releases on return.
-        Err(deadline) => {
+        Err(limits::ExecutionTermination::Deadline(deadline)) => {
             return Err(LibdenoError::Timeout(format!(
                 "execution deadline of {deadline:?} exceeded; isolate terminated"
             )))
+        }
+        Err(limits::ExecutionTermination::Cancelled) => {
+            return Err(LibdenoError::Timeout(
+                "execution cancellation requested; isolate terminated".to_string(),
+            ))
         }
     };
 
@@ -884,6 +950,17 @@ pub(crate) async fn run_inner_with(
     // graph build has populated the resolution, so the snapshot is real.
     services.save_npm_snapshot_cache();
     Ok(exit_code)
+}
+
+fn cancellation_checkpoint(
+    cancellation: Option<&crate::limits::CancellationContext>,
+) -> Result<(), LibdenoError> {
+    if cancellation.is_some_and(crate::limits::CancellationContext::is_requested) {
+        return Err(LibdenoError::Timeout(
+            "execution cancellation requested; isolate terminated".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the entry module: a file path, or a directory / package.json whose

@@ -83,6 +83,36 @@ jobs:
             }
           done
 
+      - name: Verify changelog release section
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED_VERSION="${GITHUB_REF_NAME#v}" python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["EXPECTED_VERSION"]
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          heading_re = re.compile(
+              rf"^##[ \t]+{re.escape(version)}(?:[ \t]+(?P<suffix>.*?))?[ \t]*$",
+              re.MULTILINE,
+          )
+          matches = list(heading_re.finditer(changelog))
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"CHANGELOG.md must contain exactly one ## {version} heading; "
+                  f"found {len(matches)}"
+              )
+
+          suffix = matches[0].group("suffix") or ""
+          if "(Unreleased)" in suffix:
+              raise SystemExit(
+                  f"CHANGELOG.md section ## {version} is still marked (Unreleased)"
+              )
+          print(f"validated released CHANGELOG.md section ## {version}")
+          PY
+
       - name: Check offline Deno/TypeScript version ledger
         shell: bash
         run: |
@@ -94,6 +124,9 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets --locked
+
+      - name: Test execution-control feature
+        run: cargo test --all-targets --features execution-control,phase-diagnostics --locked
 
       - name: Package and verify final crate
         # `cargo package` verifies the assembled archive by building the

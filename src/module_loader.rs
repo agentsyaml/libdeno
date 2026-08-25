@@ -41,11 +41,13 @@ use deno_resolver::loader::LoadedModuleSource;
 use deno_resolver::loader::RequestedModuleType as ResolverRequestedModuleType;
 use node_resolver::NodeResolutionKind;
 use node_resolver::ResolutionMode;
+use url::Url;
 
 use deno_runtime::deno_permissions::PermissionsContainer;
 
 use crate::node_loader::FsCjsAnalysisSourceProvider;
 use crate::services::{RealFileFetcher, RealGraphLoader, RuntimeServices, SharedServices};
+use crate::timing::{ExecutionTiming, Phase};
 
 pub struct GraphModuleLoader {
     shared: Arc<SharedServices>,
@@ -61,6 +63,15 @@ pub struct GraphModuleLoader {
     /// Live permissions container (shallow clone) used for permission-gated
     /// reads during CJS analysis — revocations stay honored; do NOT deep-clone.
     permissions: PermissionsContainer,
+    timing: ExecutionTiming,
+}
+
+struct RuntimeJsrUrlProvider<'a>(&'a Url);
+
+impl deno_graph::source::JsrUrlProvider for RuntimeJsrUrlProvider<'_> {
+    fn url(&self) -> &Url {
+        self.0
+    }
 }
 
 impl GraphModuleLoader {
@@ -108,6 +119,7 @@ impl GraphModuleLoader {
             graph,
             cwd,
             permissions,
+            timing: runtime.timing.clone(),
         }
     }
 
@@ -181,12 +193,13 @@ impl ModuleLoader for GraphModuleLoader {
         let graph_loader = self.graph_loader.clone();
         let graph = self.graph.clone();
         let specifier = module_specifier.clone();
+        let timing = self.timing.clone();
         Box::pin(async move {
             if matches!(specifier.scheme(), "node") {
                 // node: builtins come from the extension module map; nothing to load.
                 return Ok(());
             }
-            build_graph(&services, &graph_loader, &graph, &specifier).await
+            build_graph(&services, &graph_loader, &graph, &specifier, &timing).await
         })
     }
 
@@ -342,11 +355,14 @@ async fn build_graph(
     graph_loader: &RealGraphLoader,
     graph: &tokio::sync::Mutex<ModuleGraph>,
     specifier: &ModuleSpecifier,
+    timing: &ExecutionTiming,
 ) -> Result<(), JsErrorBox> {
+    let _graph_build = timing.span(Phase::GraphBuild);
     let jsr_version_resolver = shared
         .resolver_factory
         .jsr_version_resolver()
         .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let jsr_url_provider = RuntimeJsrUrlProvider(&shared.jsr_url);
     let graph_resolver = shared.graph_resolver.clone();
     // ponytail: the graph lock covers the whole build below, including the
     // slow work (remote module fetches with 30s connect / 300s total timeouts,
@@ -389,7 +405,7 @@ async fn build_graph(
                 executor: Default::default(),
                 locker: None,
                 file_system: &shared.sys,
-                jsr_url_provider: &deno_graph::source::DefaultJsrUrlProvider,
+                jsr_url_provider: &jsr_url_provider,
                 jsr_version_resolver: Cow::Borrowed(&**jsr_version_resolver),
                 passthrough_jsr_specifiers: false,
                 // The shared cross-run analysis cache (see analysis_cache.rs):
@@ -547,5 +563,14 @@ mod tests {
             GraphModuleLoader::resolve_referrer(explicit.as_str(), &host_cwd).unwrap(),
             explicit
         );
+    }
+
+    #[test]
+    fn jsr_url_provider_uses_runtime_registry() {
+        use deno_graph::source::JsrUrlProvider;
+
+        let url = Url::parse("http://127.0.0.1:4545/").unwrap();
+        let provider = RuntimeJsrUrlProvider(&url);
+        assert_eq!(provider.url(), &url);
     }
 }

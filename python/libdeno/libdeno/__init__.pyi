@@ -42,6 +42,8 @@ def run(
 class Runtime:
     def __init__(self, cwd: Union[_PathArg, None] = ...) -> None: ...
 
+    def refresh(self) -> None: ...
+
     def run(
         self,
         entry: _PathArg,

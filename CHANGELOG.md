@@ -5,7 +5,7 @@ breaking changes are highlighted per release with migration notes.
 
 [keep a changelog]: https://keepachangelog.com/en/1.1.0/
 
-## 0.3.1 (Unreleased)
+## 0.3.2
 
 ### Phase 1 / Phase 2 behavior changes
 

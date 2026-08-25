@@ -13,11 +13,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::OnceLock;
+
 use deno_cache_dir::file_fetcher::CacheSetting;
 use deno_cache_dir::file_fetcher::NullBlobStore;
 use deno_cache_dir::GlobalHttpCacheRc;
 use deno_cache_dir::GlobalOrLocalHttpCache;
-use deno_config::deno_json::NodeModulesDirMode;
 use deno_graph::GraphKind;
 use deno_graph::ModuleGraph;
 use deno_npm_installer::graph::NpmCachingStrategy;
@@ -25,22 +29,16 @@ use deno_npm_installer::lifecycle_scripts::LifecycleScriptsExecutorOptions;
 use deno_npm_installer::LogReporter;
 use deno_npm_installer::NpmInstallerFactory;
 use deno_npm_installer::NpmInstallerFactoryOptions;
-use deno_resolver::cjs::IsCjsResolutionMode;
-use deno_resolver::deno_json::CompilerOptionsOverrides;
-use deno_resolver::factory::ConfigDiscoveryOption;
 use deno_resolver::factory::ResolverFactory;
-use deno_resolver::factory::ResolverFactoryOptions;
-use deno_resolver::factory::WorkspaceFactory;
-use deno_resolver::factory::WorkspaceFactoryOptions;
 use deno_resolver::file_fetcher::PermissionedFileFetcher;
 use deno_resolver::file_fetcher::PermissionedFileFetcherOptions;
-use deno_resolver::loader::AllowJsonImports;
 use deno_resolver::loader::MemoryFiles;
-use node_resolver::analyze::NodeCodeTranslatorMode;
 use sys_traits::impls::RealSys;
+use url::Url;
 
 use crate::graph::GraphResolver;
 use crate::http::ReqwestHttpClient;
+use crate::timing::{ExecutionTiming, Phase};
 
 /// npm process state propagated to `child_process.fork` children (mirrors
 /// deno_lib's `NpmProcessStateProvider` so the forked child can restore the
@@ -248,44 +246,21 @@ impl deno_npm_installer::lifecycle_scripts::LifecycleScriptsExecutor
 pub fn create_npm_process_state_provider(
     resolver_factory: &Arc<ResolverFactory<RealSys>>,
 ) -> deno_core::anyhow::Result<deno_runtime::deno_process::NpmProcessStateProviderRc> {
-    use deno_resolver::npm::NpmResolver;
-    match resolver_factory.npm_resolver()? {
-        NpmResolver::Managed(managed) => {
-            Ok(deno_fs::sync::MaybeArc::new(NpmProcessStateProviderImpl {
-                kind: NpmProcessStateProviderKind::Managed(
-                    resolver_factory.npm_resolution().clone(),
-                ),
-                local_node_modules_path: managed
-                    .root_node_modules_path()
-                    .map(|p| p.to_string_lossy().to_string()),
-            }))
-        }
-        NpmResolver::Byonm(byonm) => {
-            Ok(deno_fs::sync::MaybeArc::new(NpmProcessStateProviderImpl {
-                kind: NpmProcessStateProviderKind::Byonm,
-                local_node_modules_path: byonm
-                    .root_node_modules_path()
-                    .map(|p| p.to_string_lossy().to_string()),
-            }))
-        }
-    }
+    let (managed_resolution, local_node_modules_path) =
+        crate::deno_resolver_adapter::npm_process_state_inputs(resolver_factory)?;
+    let kind = managed_resolution
+        .map(NpmProcessStateProviderKind::Managed)
+        .unwrap_or(NpmProcessStateProviderKind::Byonm);
+    Ok(deno_fs::sync::MaybeArc::new(NpmProcessStateProviderImpl {
+        kind,
+        local_node_modules_path,
+    }))
 }
 
 pub type RealFileFetcher = PermissionedFileFetcher<NullBlobStore, RealSys, ReqwestHttpClient>;
 pub type RealGraphLoader =
     deno_resolver::file_fetcher::DenoGraphLoader<NullBlobStore, RealSys, ReqwestHttpClient>;
 pub type RealNpmInstallerFactory = NpmInstallerFactory<ReqwestHttpClient, LogReporter, RealSys>;
-
-/// Resolves the project lockfile path exactly as deno_npm_installer's
-/// maybe_lockfile does (deno_resolver::lockfile): deno.json's `lock` setting,
-/// else `<package.json dir>/deno.lock`, else None.
-fn resolve_lockfile_path(resolver_factory: &Arc<ResolverFactory<RealSys>>) -> Option<PathBuf> {
-    resolver_factory
-        .workspace_factory()
-        .workspace_directory()
-        .ok()
-        .and_then(|dir| dir.workspace.resolve_lockfile_path().ok().flatten())
-}
 
 /// The permission-free half of the resolver pipeline, built once and reused
 /// across runs (and web workers): the workspace/resolver factories, the
@@ -297,6 +272,10 @@ fn resolve_lockfile_path(resolver_factory: &Arc<ResolverFactory<RealSys>>) -> Op
 pub struct SharedServices {
     pub sys: RealSys,
     pub resolver_factory: Arc<ResolverFactory<RealSys>>,
+    /// The resolved JSR registry URL shared by graph resolution and the HTTP
+    /// cache. `deno_resolver` reads this from `JSR_URL` when the factory is
+    /// created.
+    pub jsr_url: Url,
     /// One reqwest client shared by the npm installer and every per-run file
     /// fetcher: reqwest::Client is Arc-backed, so all clones share the
     /// connection pool and the single builder config from http.rs.
@@ -318,9 +297,19 @@ pub struct SharedServices {
     pub module_info_cache: Arc<crate::analysis_cache::ModuleInfoCache>,
     /// npm process state for `child_process.fork` (npm snapshot propagation).
     pub npm_process_state_provider: deno_runtime::deno_process::NpmProcessStateProviderRc,
+    /// Accepted resolver inputs from the same construction attempt. Runtime
+    /// invalidation probes this manifest; it is never reconstructed into a
+    /// cache key from a cwd.
+    pub(crate) input_manifest: crate::npm_cache::ResolverInputManifest,
+    /// Immutable resolver-bound identity shared by snapshot lookup and save.
+    /// It is `None` for lockfile-backed, BYONM, or credential-bearing
+    /// configuration.
+    npm_snapshot_key: Option<Arc<crate::npm_cache::ManagedNpmSnapshotKey>>,
 }
 
 impl SharedServices {
+    const MAX_STABLE_BUILD_ATTEMPTS: usize = 2;
+
     /// Builds the permission-free resolver stack once: workspace/resolver
     /// factories, the shared http client and disk caches, the npm installer
     /// factory (including the Wave 1 snapshot-cache resolution callback), the
@@ -332,23 +321,61 @@ impl SharedServices {
         initial_cwd: PathBuf,
         config_start_paths: Vec<PathBuf>,
     ) -> deno_core::anyhow::Result<Arc<Self>> {
+        Self::new_with_timing(initial_cwd, config_start_paths, None).await
+    }
+
+    /// Internal construction seam used by the executor observer. The
+    /// resolver stack itself remains exactly the same; only the accepted
+    /// manifest stability probe is timed.
+    pub(crate) async fn new_with_timing(
+        initial_cwd: PathBuf,
+        config_start_paths: Vec<PathBuf>,
+        timing: Option<ExecutionTiming>,
+    ) -> deno_core::anyhow::Result<Arc<Self>> {
+        for attempt in 0..Self::MAX_STABLE_BUILD_ATTEMPTS {
+            let candidate = match Self::build_once(initial_cwd.clone(), config_start_paths.clone())
+                .await
+            {
+                Ok(candidate) => candidate,
+                Err(error) if error.to_string() == crate::npm_cache::RESOLVER_INPUTS_CHANGED => {
+                    if attempt + 1 < Self::MAX_STABLE_BUILD_ATTEMPTS {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+            #[cfg(test)]
+            invoke_stability_test_hook();
+            let stable = if let Some(timing) = timing.as_ref() {
+                let _probe = timing.span(Phase::ResolverManifestProbe);
+                candidate.input_manifest.is_current().unwrap_or(false)
+            } else {
+                candidate.input_manifest.is_current().unwrap_or(false)
+            };
+            if stable_build_decision(attempt, stable)? {
+                return Ok(candidate);
+            }
+        }
+        Err(deno_core::anyhow::anyhow!(
+            crate::npm_cache::RESOLVER_INPUTS_CHANGED
+        ))
+    }
+
+    async fn build_once(
+        initial_cwd: PathBuf,
+        config_start_paths: Vec<PathBuf>,
+    ) -> deno_core::anyhow::Result<Arc<Self>> {
         let sys = RealSys;
 
-        let workspace_factory = Arc::new(WorkspaceFactory::new(
-            sys.clone(),
+        // Force the actual memoized discovery before any resolver identity is
+        // captured. All later resolver components use this same factory.
+        let workspace_factory = crate::deno_resolver_adapter::new_workspace_factory(
             initial_cwd.clone(),
-            WorkspaceFactoryOptions {
-                // Discover deno.json (import maps, jsx, etc.) walking up from the
-                // main module's directory, like the CLI does.
-                config_discovery: ConfigDiscoveryOption::Discover {
-                    start_paths: config_start_paths,
-                },
-                // Auto == the CLI default: use the existing node_modules if present
-                // (BYONM), otherwise install into it on demand (managed).
-                node_modules_dir: Some(NodeModulesDirMode::Auto),
-                ..Default::default()
-            },
-        ));
+            config_start_paths.clone(),
+        );
+        workspace_factory.workspace_directory()?;
+        workspace_factory.npmrc_with_path()?;
 
         // Cross-run analysis caches wired into the resolver stack (see
         // analysis_cache.rs): in-memory CJS analysis, a process-global
@@ -357,52 +384,22 @@ impl SharedServices {
         let node_analysis_cache: deno_resolver::cjs::analyzer::NodeAnalysisCacheRc =
             crate::analysis_cache::node_analysis_cache();
 
-        let resolver_factory = Arc::new(ResolverFactory::new(
+        let resolver_factory = crate::deno_resolver_adapter::new_resolver_factory(
             workspace_factory.clone(),
-            ResolverFactoryOptions {
-                compiler_options_overrides: CompilerOptionsOverrides {
-                    no_transpile: false,
-                    force_check_js: false,
-                    source_map_base: None,
-                    preserve_jsx: false,
-                    // Untyped execution cannot honor verbatim semantics safely.
-                    force_disable_verbatim_module_syntax: true,
-                },
-                // CJS detection is Disabled by default in the CLI (only `deno node`
-                // enables ImplicitTypeCommonJs). Ambiguous user files are treated as
-                // ESM; CJS npm packages are still detected via the in_npm_package
-                // branch of the CJS tracker.
-                is_cjs_resolution_mode: IsCjsResolutionMode::Disabled,
-                // Enable CJS -> ESM translation in the module loader.
-                node_code_translator_mode: NodeCodeTranslatorMode::ModuleLoader,
-                node_resolver_options: Default::default(),
-                npm_system_info: Default::default(),
-                allow_json_imports: AllowJsonImports::WithAttribute,
-                require_modules: vec![],
-                newest_dependency_date: None,
-                // Cross-run CJS analysis cache (content-hash keyed, process-
-                // global — see analysis_cache.rs). node_resolution_cache and
-                // package_json_cache stay None deliberately: upstream's
-                // thread-local stores are keyed by path only with no
-                // invalidation path, so in-process filesystem changes (an
-                // `npm install` between runs, an edited package.json) would
-                // serve stale resolutions forever.
-                node_analysis_cache: Some(node_analysis_cache),
-                node_resolution_cache: None,
-                package_json_cache: None,
-                package_json_dep_resolution: None,
-                specified_import_map: None,
-                unstable_sloppy_imports: false,
-                on_mapped_resolution_diagnostic: None,
-            },
-        ));
+            node_analysis_cache,
+        );
 
-        // Lockfile path exactly as deno_npm_installer's maybe_lockfile
-        // resolves it (deno_resolver::lockfile): deno.json's `lock` setting,
-        // else `<package.json dir>/deno.lock`, else None. Projects with a
-        // lockfile keep the original ResolveFromLockfile path; the in-process
-        // snapshot cache only serves lockfile-free projects.
-        let deno_lock_path = resolve_lockfile_path(&resolver_factory);
+        // The manifest and optional key are captured from the same parsed
+        // workspace/resolver inputs. No cwd-based fingerprint is performed
+        // after this point.
+        let input_manifest = crate::npm_cache::resolver_input_manifest(
+            initial_cwd.clone(),
+            config_start_paths,
+            &workspace_factory,
+            &resolver_factory,
+        )?;
+        let npm_snapshot_key =
+            crate::npm_cache::managed_snapshot_key(&input_manifest).map(Arc::new);
 
         // The installer factory is intentionally non-Send: it holds a
         // `Box<dyn Fn()>` (the lockfile snapshot resolver) and is used only
@@ -439,15 +436,8 @@ impl SharedServices {
                 // returns None so deno_npm_installer goes through its
                 // maybe_lockfile -> ResolveFromLockfile path unchanged.
                 resolve_npm_resolution_snapshot: Box::new({
-                    let lock_path = deno_lock_path.clone();
-                    let cwd = initial_cwd.clone();
-                    move || {
-                        if lock_path.as_deref().is_some_and(|p| p.exists()) {
-                            return Ok(None);
-                        }
-                        let key = crate::npm_cache::compute_key(&cwd);
-                        Ok(crate::npm_cache::get(&key))
-                    }
+                    let snapshot_key = npm_snapshot_key.clone();
+                    move || Ok(snapshot_key.as_deref().and_then(crate::npm_cache::get))
                 }),
             },
         ));
@@ -474,6 +464,7 @@ impl SharedServices {
         Ok(Arc::new(Self {
             sys,
             resolver_factory,
+            jsr_url: workspace_factory.jsr_url().clone(),
             http_client,
             http_cache,
             global_http_cache,
@@ -481,8 +472,40 @@ impl SharedServices {
             graph_resolver,
             module_info_cache,
             npm_process_state_provider,
+            input_manifest,
+            npm_snapshot_key,
         }))
     }
+}
+
+#[cfg(test)]
+type StabilityTestHook = Box<dyn Fn() + Send>;
+
+#[cfg(test)]
+static STABILITY_TEST_HOOK: OnceLock<Mutex<Option<(std::thread::ThreadId, StabilityTestHook)>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn invoke_stability_test_hook() {
+    let hooks = STABILITY_TEST_HOOK.get_or_init(|| Mutex::new(None));
+    let current_thread = std::thread::current().id();
+    if let Some((owner, hook)) = hooks.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if owner == &current_thread {
+            hook();
+        }
+    }
+}
+
+fn stable_build_decision(attempt: usize, stable: bool) -> deno_core::anyhow::Result<bool> {
+    if stable {
+        return Ok(true);
+    }
+    if attempt + 1 < SharedServices::MAX_STABLE_BUILD_ATTEMPTS {
+        return Ok(false);
+    }
+    Err(deno_core::anyhow::anyhow!(
+        crate::npm_cache::RESOLVER_INPUTS_CHANGED
+    ))
 }
 
 /// Per-run services: everything permission-bound that must be rebuilt for
@@ -491,8 +514,6 @@ impl SharedServices {
 pub struct RuntimeServices {
     /// The permission-free resolver stack (shared with web workers).
     pub shared: Arc<SharedServices>,
-    /// Canonical project cwd; the identity half of the npm snapshot cache key.
-    cwd: PathBuf,
     /// Per-run file fetcher (permission-gated reads; the live permissions
     /// container is passed per fetch call).
     pub file_fetcher: Arc<RealFileFetcher>,
@@ -501,6 +522,8 @@ pub struct RuntimeServices {
     pub graph_loader: Arc<RealGraphLoader>,
     /// Per-run module graph. `prepare_load` builds it, `load` reads from it.
     pub graph: Arc<tokio::sync::Mutex<ModuleGraph>>,
+    /// Shared sink for this run and its web workers.
+    pub(crate) timing: ExecutionTiming,
 }
 
 impl RuntimeServices {
@@ -513,16 +536,22 @@ impl RuntimeServices {
     /// their snapshot comes from the on-disk lockfile (and the resolve
     /// callback never serves them).
     pub fn save_npm_snapshot_cache(&self) {
-        let lock_path = resolve_lockfile_path(&self.shared.resolver_factory);
-        if lock_path.as_deref().is_some_and(|p| p.exists()) {
+        // Do not save a candidate after its accepted inputs changed. This also
+        // re-checks lockfile/auth transitions so lookup and save stay paired.
+        if !self.shared.input_manifest.is_current().unwrap_or(false) {
             return;
         }
         use deno_resolver::npm::NpmResolver;
         let Ok(NpmResolver::Managed(managed)) = self.shared.resolver_factory.npm_resolver() else {
             return;
         };
-        let key = crate::npm_cache::compute_key(&self.cwd);
-        crate::npm_cache::insert(key, managed.resolution().serialized_valid_snapshot());
+        let Some(snapshot_key) = self.shared.npm_snapshot_key.as_ref() else {
+            return;
+        };
+        crate::npm_cache::insert(
+            snapshot_key.clone(),
+            managed.resolution().serialized_valid_snapshot(),
+        );
     }
 
     /// Builds the per-run permission-bound components over an existing
@@ -530,8 +559,8 @@ impl RuntimeServices {
     /// this run's live permissions container) and a fresh module graph.
     pub fn new(
         shared: Arc<SharedServices>,
-        cwd: PathBuf,
         permissions: deno_runtime::deno_permissions::PermissionsContainer,
+        timing: ExecutionTiming,
     ) -> deno_core::anyhow::Result<Self> {
         let in_npm_pkg_checker = shared.resolver_factory.in_npm_package_checker()?.clone();
         let file_fetcher = Arc::new(PermissionedFileFetcher::new(
@@ -574,10 +603,10 @@ impl RuntimeServices {
         )));
         Ok(Self {
             shared,
-            cwd,
             file_fetcher,
             graph_loader,
             graph,
+            timing,
         })
     }
 }
@@ -586,6 +615,19 @@ impl RuntimeServices {
 mod tests {
     use super::*;
     use deno_runtime::deno_process::NpmProcessStateProvider;
+
+    static STABILITY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn set_stability_test_hook(hook: impl Fn() + Send + 'static) {
+        let hooks = STABILITY_TEST_HOOK.get_or_init(|| Mutex::new(None));
+        *hooks.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((std::thread::current().id(), Box::new(hook)));
+    }
+
+    fn clear_stability_test_hook() {
+        let hooks = STABILITY_TEST_HOOK.get_or_init(|| Mutex::new(None));
+        *hooks.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 
     #[test]
     fn npm_process_state_provider_reads_latest_snapshot_for_repeated_forks() {
@@ -656,5 +698,182 @@ mod tests {
         assert!(message.contains("install"));
         assert!(message.contains("timed out"));
         assert!(message.contains("direct child"));
+    }
+
+    #[test]
+    fn stable_builder_has_two_attempt_ceiling_before_execution() {
+        let mut marker = 0;
+        let mut result = Ok(false);
+        for attempt in 0..SharedServices::MAX_STABLE_BUILD_ATTEMPTS {
+            match stable_build_decision(attempt, false) {
+                Ok(false) => {}
+                Ok(true) => {
+                    marker += 1;
+                    result = Ok(true);
+                    break;
+                }
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+            if result.is_err() {
+                break;
+            }
+            if marker != 0 {
+                break;
+            }
+            if attempt + 1 == SharedServices::MAX_STABLE_BUILD_ATTEMPTS {
+                break;
+            }
+        }
+        assert!(result.is_err());
+        assert_eq!(marker, 0, "unstable candidates must not execute");
+    }
+
+    #[test]
+    fn stable_builder_retries_after_real_manifest_mutation() {
+        let _lock = STABILITY_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "libdeno-stable-builder-retry-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("deno.json");
+        let config_a = r##"{"imports":{"#probe":"./a.js"}}"##;
+        let config_b = r##"{"imports":{"#probe":"./b.js"}}"##;
+        assert_eq!(config_a.len(), config_b.len());
+        std::fs::write(dir.join("a.js"), "export const value = 'a';").unwrap();
+        std::fs::write(dir.join("b.js"), "export const value = 'b';").unwrap();
+        std::fs::write(&config, config_a).unwrap();
+
+        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mutations_for_hook = mutations.clone();
+        let config_for_hook = config.clone();
+        let config_b_for_hook = config_b.to_string();
+        set_stability_test_hook(move || {
+            if mutations_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                std::fs::write(&config_for_hook, &config_b_for_hook).unwrap();
+            }
+        });
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = tokio_runtime.block_on(SharedServices::new(dir.clone(), vec![dir.clone()]));
+        clear_stability_test_hook();
+
+        assert!(result.is_ok());
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stable_builder_retries_parse_probe_window_mutation() {
+        let _lock = crate::npm_cache::semantic_probe_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "libdeno-stable-builder-parse-probe-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("deno.json");
+        let config_a = r##"{"imports":{"#probe":"./a.js"}}"##;
+        let config_b = r##"{"imports":{"#probe":"./b.js"}}"##;
+        assert_eq!(config_a.len(), config_b.len());
+        std::fs::write(dir.join("a.js"), "export const value = 'a';").unwrap();
+        std::fs::write(dir.join("b.js"), "export const value = 'b';").unwrap();
+        std::fs::write(&config, config_a).unwrap();
+
+        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mutations_for_hook = mutations.clone();
+        let config_for_hook = config.clone();
+        let config_b_for_hook = config_b.to_string();
+        crate::npm_cache::set_semantic_probe_test_hook(move || {
+            if mutations_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                std::fs::write(&config_for_hook, &config_b_for_hook).unwrap();
+            }
+        });
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = tokio_runtime.block_on(SharedServices::new(dir.clone(), vec![dir.clone()]));
+        crate::npm_cache::clear_semantic_probe_test_hook();
+
+        assert!(result.is_ok());
+        assert_eq!(
+            mutations.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "the first failed manifest attempt must be retried"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stable_builder_exhaustion_returns_runtime_error_without_execution() {
+        let _lock = STABILITY_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "libdeno-stable-builder-exhausted-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("deno.json");
+        let config_a = r##"{"imports":{"#probe":"./a.js"}}"##;
+        let config_b = r##"{"imports":{"#probe":"./b.js"}}"##;
+        assert_eq!(config_a.len(), config_b.len());
+        std::fs::write(dir.join("a.js"), "export const value = 'a';").unwrap();
+        std::fs::write(dir.join("b.js"), "export const value = 'b';").unwrap();
+        std::fs::write(&config, config_a).unwrap();
+
+        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mutations_for_hook = mutations.clone();
+        let config_for_hook = config.clone();
+        let config_a_for_hook = config_a.to_string();
+        let config_b_for_hook = config_b.to_string();
+        set_stability_test_hook(move || {
+            let mutation = mutations_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = if mutation.is_multiple_of(2) {
+                &config_b_for_hook
+            } else {
+                &config_a_for_hook
+            };
+            std::fs::write(&config_for_hook, next).unwrap();
+        });
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = tokio_runtime.block_on(SharedServices::new(dir.clone(), vec![dir.clone()]));
+        clear_stability_test_hook();
+
+        let marker = std::sync::atomic::AtomicUsize::new(0);
+        if result.is_ok() {
+            marker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let error = match result {
+            Ok(_) => panic!("unstable resolver inputs unexpectedly built"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "resolver inputs changed during construction"
+        );
+        assert_eq!(
+            mutations.load(std::sync::atomic::Ordering::SeqCst),
+            SharedServices::MAX_STABLE_BUILD_ATTEMPTS
+        );
+        assert_eq!(marker.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

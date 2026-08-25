@@ -5,10 +5,33 @@
 
 #![cfg(windows)]
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::PathBuf;
 
 use libdeno::{run_in_subprocess_with_output, run_with_output, LibdenoOptions};
+
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
 
 #[test]
 fn capture_is_rejected_on_windows() {
@@ -35,8 +58,7 @@ fn subprocess_capture_returns_both_streams_and_exit_code_on_windows() {
     // cannot run this cfg-gated test locally.
     static HOST_EXE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _host_exe_lock = HOST_EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let previous_host_exe = std::env::var_os("LIBDENO_HOST_EXE");
-    std::env::set_var("LIBDENO_HOST_EXE", env!("CARGO_BIN_EXE_child_host"));
+    let _host_exe = EnvVarGuard::set("LIBDENO_HOST_EXE", env!("CARGO_BIN_EXE_child_host"));
 
     let dir: PathBuf = std::env::temp_dir().join(format!(
         "libdeno-capture-win-subprocess-{}",
@@ -58,10 +80,6 @@ fn subprocess_capture_returns_both_streams_and_exit_code_on_windows() {
         },
     );
 
-    match previous_host_exe {
-        Some(value) => std::env::set_var("LIBDENO_HOST_EXE", value),
-        None => std::env::remove_var("LIBDENO_HOST_EXE"),
-    }
     let _ = fs::remove_dir_all(&dir);
 
     let output = result.unwrap();

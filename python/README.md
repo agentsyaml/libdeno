@@ -1,7 +1,7 @@
 # libdeno Python API
 
 This is a private alpha Python binding for the Rust `libdeno` runtime. The
-Python distribution and core Rust crate are both versioned at `0.3.1`. The
+Python distribution and core Rust crate are both versioned at `0.3.2`. The
 contract is deliberately small, synchronous, and fail-closed:
 
 ```python

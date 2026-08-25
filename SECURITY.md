@@ -149,6 +149,11 @@ Output capture has its own boundary:
 - `run_in_subprocess_with_output` pipes and drains the direct child's stdout
   and stderr on every platform. Its cap bounds the retained parent buffers,
   not the child's CPU, memory, or descendants.
+- Execution-control supervisor capture is bounded separately because terminal
+  output is JSON-embedded in a 1 MiB frame: `None` retains at most 64 KiB per
+  requested stream, explicit values up to 96 KiB are honored, and larger
+  explicit values are rejected before spawning. This does not change the
+  legacy or in-process capture semantics above.
 
 Network and package-install guards are also finite but not isolation controls:
 

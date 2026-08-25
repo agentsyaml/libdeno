@@ -6,6 +6,7 @@ permission-hook APIs.
 
 import json
 import os
+import sys
 import threading
 import time
 import unittest
@@ -131,6 +132,46 @@ class ApiTests(unittest.TestCase):
         config.write_text(json.dumps({"imports": {"virtual": f"./{two.name}"}}), encoding="utf-8")
         self.assertEqual(runtime.run(second_entry, permissions=permission), 0)
 
+    def test_runtime_refresh_rebuilds_after_nested_package_config_changes(self):
+        self.write("package.json", '{"name":"refresh-project","private":true}')
+        self.write(
+            "node_modules/nested-pkg/package.json",
+            '{"name":"nested-pkg","version":"1.0.0","type":"module","main":"index.js"}',
+        )
+        self.write(
+            "node_modules/nested-pkg/index.js",
+            "import { marker } from 'nested-dep';\nexport { marker };",
+        )
+        self.write(
+            "node_modules/nested-pkg/node_modules/nested-dep/package.json",
+            '{"name":"nested-dep","version":"1.0.0","type":"module","main":"a.js"}',
+        )
+        self.write(
+            "node_modules/nested-pkg/node_modules/nested-dep/a.js",
+            "export const marker = 'a';",
+        )
+        self.write(
+            "node_modules/nested-pkg/node_modules/nested-dep/b.js",
+            "export const marker = 'b';",
+        )
+        entry = self.write(
+            "main.js",
+            "import { marker } from './node_modules/nested-pkg/index.js';"
+            "\nDeno.writeTextFileSync(new URL('./out.txt', import.meta.url), marker);",
+        )
+        output = self.root / "out.txt"
+        runtime = libdeno.Runtime(self.root)
+
+        self.assertEqual(runtime.run(entry, allow_all_permissions=True), 0)
+        self.assertEqual(output.read_text(encoding="utf-8"), "a")
+        self.write(
+            "node_modules/nested-pkg/node_modules/nested-dep/package.json",
+            '{"name":"nested-dep","version":"1.0.0","type":"module","main":"b.js"}',
+        )
+        self.assertIsNone(runtime.refresh())
+        self.assertEqual(runtime.run(entry, allow_all_permissions=True), 0)
+        self.assertEqual(output.read_text(encoding="utf-8"), "b")
+
     def test_deadline_and_javascript_errors_have_distinct_exceptions(self):
         loop = self.write("loop.js", "while (true) {}")
         for deadline in (-1.0, float("nan"), float("inf")):
@@ -162,6 +203,26 @@ class ApiTests(unittest.TestCase):
         )
         with self.assertRaises(libdeno.DenoRuntimeError):
             libdeno.run(permission_marker, allow_all_permissions=True)
+
+    def test_invalid_heap_size_numbers_raise_configuration_error(self):
+        entry = self.write("heap.js", "while (true) {}")
+        runtime = libdeno.Runtime(self.root)
+
+        for max_heap_bytes in (-1, sys.maxsize * 2 + 2):
+            with self.subTest(binding="run", max_heap_bytes=max_heap_bytes):
+                with self.assertRaises(libdeno.ConfigurationError):
+                    libdeno.run(
+                        entry,
+                        allow_all_permissions=True,
+                        max_heap_bytes=max_heap_bytes,
+                    )
+            with self.subTest(binding="Runtime.run", max_heap_bytes=max_heap_bytes):
+                with self.assertRaises(libdeno.ConfigurationError):
+                    runtime.run(
+                        entry,
+                        allow_all_permissions=True,
+                        max_heap_bytes=max_heap_bytes,
+                    )
 
     def test_pathlike_and_non_ascii_paths(self):
         directory = self.root / "非ASCII-目录"

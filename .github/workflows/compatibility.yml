@@ -13,7 +13,6 @@ on:
       - python/src/**
       - ".cargo/**"
       - ".github/workflows/**"
-      - rust-toolchain.toml
   workflow_dispatch:
   schedule:
     - cron: "30 3 * * 0"
@@ -50,6 +49,9 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets --locked
+
+      - name: Test execution-control feature
+        run: cargo test --all-targets --features execution-control,phase-diagnostics --locked
 
   msrv:
     name: MSRV check (1.95.0)
@@ -107,6 +109,12 @@ jobs:
       - name: Check (MSRV)
         # --all-targets covers the build script plus lib/bin/example/test/bench targets.
         run: cargo check --all-targets --locked
+
+      - name: Check docs.rs mode (MSRV)
+        run: DOCS_RS=1 cargo check --no-default-features --lib --locked
+
+      - name: Check execution-control feature (MSRV)
+        run: cargo check --all-targets --features execution-control,phase-diagnostics --locked
 
       - name: Check Python crate (MSRV)
         run: cargo check --manifest-path python/Cargo.toml --locked

@@ -1,5 +1,6 @@
 //! End-to-end smoke tests: run real JS through the embedded runtime.
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::PathBuf;
 
@@ -11,15 +12,67 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+fn restore_env(name: &str, previous: &Option<OsString>) {
+    match previous {
+        Some(value) => std::env::set_var(name, value),
+        None => std::env::remove_var(name),
+    }
+}
+
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+
+    fn remove(name: &'static str) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::remove_var(name);
+        Self { name, previous }
+    }
+
+    fn set_value(&self, value: impl AsRef<OsStr>) {
+        std::env::set_var(self.name, value);
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        restore_env(self.name, &self.previous);
+    }
+}
+
+struct HostExeGuard {
+    previous: Option<OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for HostExeGuard {
+    fn drop(&mut self) {
+        restore_env("LIBDENO_HOST_EXE", &self.previous);
+    }
+}
+
 /// Sets the process-global `LIBDENO_HOST_EXE` under a shared lock and returns
-/// the guard, held for the rest of the test. cargo runs tests on parallel
-/// threads in one process and `run_in_subprocess` reads the var at spawn time,
-/// so concurrent set_var calls would race (hook_host vs child_host).
-fn set_host_exe(exe: &str) -> std::sync::MutexGuard<'static, ()> {
+/// a guard held for the rest of the test. Cargo runs tests on parallel threads
+/// in one process and `run_in_subprocess` reads the var at spawn time, so
+/// concurrent set_var calls would race (hook_host vs child_host). The guard
+/// restores the prior value before releasing the lock.
+fn set_host_exe(exe: &str) -> HostExeGuard {
     static HOST_EXE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let guard = HOST_EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = std::env::var_os("LIBDENO_HOST_EXE");
     std::env::set_var("LIBDENO_HOST_EXE", exe);
-    guard
+    HostExeGuard {
+        previous,
+        _lock: guard,
+    }
 }
 
 #[test]
@@ -553,7 +606,6 @@ fn oversized_subprocess_request_fails_before_spawn() {
             .contains("child-mode request exceeds the 1048576-byte limit"),
         "unexpected oversized-request error: {error}"
     );
-    std::env::set_var("LIBDENO_HOST_EXE", env!("CARGO_BIN_EXE_child_host"));
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -764,7 +816,7 @@ fn permission_hook_decides_all_checks() {
     )
     .unwrap();
     let _host_exe = set_host_exe(env!("CARGO_BIN_EXE_hook_host"));
-    std::env::remove_var("LIBDENO_TEST_HOOK_DENY");
+    let hook_deny = EnvVarGuard::remove("LIBDENO_TEST_HOOK_DENY");
     let options = LibdenoOptions {
         permissions: vec![format!("--allow-read={}", dir.display())],
         ..Default::default()
@@ -772,10 +824,9 @@ fn permission_hook_decides_all_checks() {
     let code = libdeno::run_in_subprocess(&entry, &options).unwrap();
     assert_eq!(code, 0, "the allow-hook must override the restricted grant");
     // Deny-hook: the same read is refused, child exits 1.
-    std::env::set_var("LIBDENO_TEST_HOOK_DENY", "1");
+    hook_deny.set_value("1");
     let code = libdeno::run_in_subprocess(&entry, &options).unwrap();
     assert_eq!(code, 1, "the deny-hook must refuse the read");
-    std::env::remove_var("LIBDENO_TEST_HOOK_DENY");
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_file(&secret);
 }
@@ -974,7 +1025,7 @@ fn permission_hook_overrides_already_granted_reads() {
 
     // Allow-hook + allow-all (no flag grants): the read succeeds — the hook
     // is consulted even though allow-all alone would grant it.
-    std::env::remove_var("LIBDENO_TEST_HOOK_DENY");
+    let hook_deny = EnvVarGuard::remove("LIBDENO_TEST_HOOK_DENY");
     let options = LibdenoOptions {
         allow_all_permissions: true,
         ..Default::default()
@@ -984,14 +1035,13 @@ fn permission_hook_overrides_already_granted_reads() {
 
     // Deny-hook + a flag that grants the exact file: the hook overrides the
     // grant and the read must fail (child exits 1).
-    std::env::set_var("LIBDENO_TEST_HOOK_DENY", "1");
+    hook_deny.set_value("1");
     let options = LibdenoOptions {
         permissions: vec![format!("--allow-read={}", dir.display())],
         ..Default::default()
     };
     let code = libdeno::run_in_subprocess(&entry, &options).unwrap();
     assert_eq!(code, 1, "the deny-hook must override the granted read");
-    std::env::remove_var("LIBDENO_TEST_HOOK_DENY");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1083,7 +1133,7 @@ fn permission_broker_decides_all_checks_end_to_end() {
     };
 
     let _host_exe = set_host_exe(env!("CARGO_BIN_EXE_broker_host"));
-    std::env::set_var("LIBDENO_TEST_BROKER_PATH", &socket);
+    let _broker_path = EnvVarGuard::set("LIBDENO_TEST_BROKER_PATH", &socket);
     let options = LibdenoOptions {
         permissions: vec![format!("--allow-read={}", dir.display())],
         ..Default::default()
@@ -1097,7 +1147,6 @@ fn permission_broker_decides_all_checks_end_to_end() {
     let code = libdeno::run_in_subprocess(&entry, &options).unwrap();
     assert_eq!(code, 0, "the allow-mode broker must let the reads through");
 
-    std::env::remove_var("LIBDENO_TEST_BROKER_PATH");
     drop(server);
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_file(&outside);
@@ -1263,8 +1312,8 @@ fn subprocess_passes_environment_to_child() {
         "Deno.exit(Deno.env.get('LIBDENO_TEST_ENV_PASSTHROUGH') === 'passthrough-42' ? 0 : 9);",
     )
     .unwrap();
-    std::env::set_var("LIBDENO_TEST_ENV_PASSTHROUGH", "passthrough-42");
     let _host_exe = set_host_exe(env!("CARGO_BIN_EXE_child_host"));
+    let _passthrough = EnvVarGuard::set("LIBDENO_TEST_ENV_PASSTHROUGH", "passthrough-42");
     let code = libdeno::run_in_subprocess(
         &entry,
         &LibdenoOptions {
@@ -1273,7 +1322,6 @@ fn subprocess_passes_environment_to_child() {
         },
     )
     .unwrap();
-    std::env::remove_var("LIBDENO_TEST_ENV_PASSTHROUGH");
     assert_eq!(
         code, 0,
         "the child must see the parent's environment (exit 9 = not passed)"

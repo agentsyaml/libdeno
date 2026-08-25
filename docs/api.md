@@ -192,7 +192,8 @@ builds the permission-free half of that stack once and `run_with` /
   `run_with` recomputes a fingerprint and swaps the stack when it diverges.
   The npm part of the fingerprint includes the effective registry and the
   resolver-supported global npmrc (`$HOME/.npmrc`) by canonical path and
-  content. `deno_resolver` 0.88 does not honor `NPM_CONFIG_USERCONFIG`. Call
+  content. The fingerprint also tracks the resolved `JSR_URL`. `deno_resolver`
+  0.88 does not honor `NPM_CONFIG_USERCONFIG`. Call
   `runtime.refresh()` to force the next run to rebuild after changes below the
   discovered chain, such as nested `node_modules`; this is an explicit bounded
   invalidation, not a recursive watcher/hash.
@@ -362,8 +363,12 @@ Per-stream cap on captured output (stdout and stderr each get this budget).
 When a stream exceeds it, capture stops, the excess is dropped, and
 `RunOutput::capture_truncated` is set — a verbose or hostile script can no
 longer grow host memory without limit. `None` (default) captures without a
-bound. In-process capture remains process-global and exclusive; subprocess
-capture drains the child's pipes while retaining only the bounded prefix.
+bound for legacy/in-process capture. In-process capture remains process-global
+and exclusive; subprocess capture drains the child's pipes while retaining only
+the bounded prefix. The execution-control supervisor path is separately
+bounded: `None` means 64 KiB per stream, explicit values up to 96 KiB are
+honored, and larger explicit values are rejected before the child is spawned
+because terminal bytes are JSON-embedded in a 1 MiB frame.
 In-process fd capture is rejected on Windows; use
 `run_in_subprocess_with_output` there.
 
@@ -483,6 +488,10 @@ Windows included.
 - `max_capture_bytes` caps each stream: excess is drained and dropped (the
   reader keeps going so the child never blocks) and
   `RunOutput.capture_truncated` is set.
+- For the execution-control supervisor path, `None` defaults to 64 KiB per
+  stream and explicit values are limited to 96 KiB; larger values are rejected
+  before spawning. This supervisor-specific bound does not change legacy
+  subprocess capture semantics.
 - Every other option (permissions, features, `max_heap_bytes`,
   `execution_deadline`, `cwd`) behaves exactly as in `run_in_subprocess`.
 

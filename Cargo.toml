@@ -1,9 +1,10 @@
 [package]
 name = "libdeno"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
-# Matches the toolchain pinned by deno v2.9.5 (rust-toolchain.toml); the deno
-# stack publishes no rust-version, and the v8 crate requires edition 2024.
+# Workflow toolchain actions are authoritative for compatibility: stable CI
+# plus an explicit MSRV 1.95.0 check. No rust-toolchain.toml is checked in;
+# the deno stack publishes no rust-version, and the v8 crate requires edition 2024.
 rust-version = "1.95"
 description = "Embed the Deno runtime in Rust with direct npm: specifier support"
 license = "MIT"
@@ -13,6 +14,7 @@ repository = "https://github.com/agentsyaml/libdeno"
 keywords = ["deno", "runtime", "embed", "npm", "javascript"]
 categories = ["api-bindings", "development-tools"]
 authors = ["Zhenxing Sun <zhenxing.sun@irootech.com>"]
+exclude = ["项目完整缺陷与优化审计报告.md"]
 
 # Checked-in compatibility ledger for the upstream Deno snapshot. Cargo does
 # not expose the Deno CLI or bundled TypeScript compiler versions, so these
@@ -95,6 +97,10 @@ deno_core = { version = "0.410.0", features = ["v8", "reactor-tokio", "v8_use_cu
 
 [features]
 default = ["snapshot"]
+phase-diagnostics = []
+# Experimental request admission/lifecycle API.  It is deliberately opt-in
+# and does not alter the legacy execution entry points.
+execution-control = []
 # Compiles the V8 runtime snapshot (and residual lazy sources) in build.rs.
 # Disable only for documentation builds (see [package.metadata.docs.rs]);
 # without it the crate compiles with an empty snapshot and is not runnable.

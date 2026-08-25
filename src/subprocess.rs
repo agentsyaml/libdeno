@@ -5,10 +5,38 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+#[cfg(feature = "execution-control")]
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+#[cfg(feature = "execution-control")]
+use std::process::{Child, ExitStatus, Stdio};
+#[cfg(feature = "execution-control")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "execution-control")]
+use std::sync::{mpsc, Arc, Mutex};
+#[cfg(feature = "execution-control")]
+use std::time::{Duration, Instant};
+
 use crate::limits::LIBDENO_SPAWNED_IPC;
 use crate::run;
+use crate::timing::{ExecutionTiming, Phase};
 use crate::LibdenoError;
 use crate::LibdenoOptions;
+#[cfg(feature = "execution-control")]
+use crate::RunOutput;
+
+#[cfg(feature = "execution-control")]
+use crate::limits::CancellationContext;
+#[cfg(feature = "execution-control")]
+use crate::supervisor::{
+    decode_payload, encode_payload, read_frame, read_frame_after_first_byte,
+    read_frame_with_cancellation, write_frame, CancelReason, CleanupStrength, FrameDirection,
+    FrameKind, SupervisorCancellation, SupervisorChildSession, SupervisorFrame,
+    SupervisorFrameEvent, SupervisorParentSession, SupervisorRequest, SupervisorRunResult,
+    SupervisorTerminal, SupervisorToken, SUPERVISOR_CANCEL_GRACE,
+    SUPERVISOR_CAPTURE_BYTES_PER_STREAM, SUPERVISOR_CHILD_EXIT_GRACE, SUPERVISOR_CONNECT_TIMEOUT,
+    SUPERVISOR_ENDPOINT_ENV, SUPERVISOR_FRAME_TIMEOUT, SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM,
+    SUPERVISOR_MODE_ENV, SUPERVISOR_TOKEN_ENV,
+};
 
 /// The request writer is detached because a blocking `write_all` cannot be
 /// joined safely after the handshake deadline. Bound those retained threads
@@ -165,6 +193,24 @@ pub fn run_in_subprocess(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<i32, LibdenoError> {
+    run_in_subprocess_inner(entry.as_ref(), options, None, ExecutionTiming::disabled())
+}
+
+pub(crate) fn run_in_subprocess_with_executable_observed(
+    host_executable: &Path,
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+) -> Result<i32, LibdenoError> {
+    run_in_subprocess_inner(entry.as_ref(), options, Some(host_executable), timing)
+}
+
+fn run_in_subprocess_inner(
+    entry: &Path,
+    options: &LibdenoOptions,
+    explicit_host: Option<&Path>,
+    timing: ExecutionTiming,
+) -> Result<i32, LibdenoError> {
     // In-process runs never switch the process cwd (cwd is a resolution base
     // only), so the child's cwd can be pinned from a plain read with no
     // synchronization. The lock is NOT held across child.wait() — that would
@@ -172,16 +218,20 @@ pub fn run_in_subprocess(
     // first child would hold a process-global lock forever and block every
     // later run_in_subprocess or run() call in the same process.
     let (payload, mut child) = spawn_child_request(
-        entry.as_ref(),
+        entry,
         options,
+        explicit_host,
         std::process::Stdio::inherit(),
         std::process::Stdio::inherit(),
     )?;
-    write_child_request(&mut child, payload)?;
+    write_child_request(&mut child, payload, timing.clone())?;
     // The writer thread dropped the last handle to the child's stdin after the
     // payload write, so a script reading process.stdin sees EOF instead of
     // blocking forever on the still-open pipe.
-    let status = child.wait().map_err(LibdenoError::Io)?;
+    let status = {
+        let _reap = timing.span(Phase::CancelKillReap);
+        child.wait().map_err(LibdenoError::Io)?
+    };
     Ok(status.code().unwrap_or(1))
 }
 
@@ -195,6 +245,7 @@ pub fn run_in_subprocess(
 fn spawn_child_request(
     entry: &Path,
     options: &LibdenoOptions,
+    explicit_host: Option<&Path>,
     stdout: std::process::Stdio,
     stderr: std::process::Stdio,
 ) -> Result<(Vec<u8>, std::process::Child), LibdenoError> {
@@ -217,9 +268,12 @@ fn spawn_child_request(
     // Validate before resolving the executable or spawning a process: an
     // oversized request must have no child-side effects.
     validate_child_request_size(&payload)?;
-    let exe = std::env::var_os(LIBDENO_HOST_EXE)
-        .map(PathBuf::from)
-        .unwrap_or(std::env::current_exe()?);
+    let exe = match explicit_host {
+        Some(host_executable) => host_executable.to_path_buf(),
+        None => std::env::var_os(LIBDENO_HOST_EXE)
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_exe()?),
+    };
     let child = std::process::Command::new(exe)
         .env(LIBDENO_CHILD_MODE, "1")
         .env(LIBDENO_SPAWNED_IPC, "1")
@@ -251,6 +305,7 @@ fn spawn_child_request(
 fn write_child_request(
     child: &mut std::process::Child,
     payload: Vec<u8>,
+    timing: ExecutionTiming,
 ) -> Result<(), LibdenoError> {
     use std::io::Write;
     let (write_result, writer_done) = match child.stdin.take() {
@@ -261,6 +316,7 @@ fn write_child_request(
             let writer_budget = match reserve_handshake_writer() {
                 Ok(budget) => budget,
                 Err(error) => {
+                    let _cleanup = timing.span(Phase::CancelKillReap);
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(LibdenoError::Io(error));
@@ -319,6 +375,7 @@ fn write_child_request(
                  (request write failed: {e})"
             )),
             _ => {
+                let _cleanup = timing.span(Phase::CancelKillReap);
                 let _ = child.kill();
                 let _ = child.wait();
                 e
@@ -358,63 +415,93 @@ pub fn run_in_subprocess_with_output(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<crate::RunOutput, LibdenoError> {
-    let (payload, mut child) = spawn_child_request(
+    run_in_subprocess_with_output_inner(
         entry.as_ref(),
         options,
-        std::process::Stdio::piped(),
-        std::process::Stdio::piped(),
+        None,
+        true,
+        true,
+        ExecutionTiming::disabled(),
+    )
+}
+
+pub(crate) fn run_in_subprocess_with_selective_output_and_executable_observed(
+    host_executable: &Path,
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+    timing: ExecutionTiming,
+) -> Result<crate::RunOutput, LibdenoError> {
+    run_in_subprocess_with_output_inner(
+        entry.as_ref(),
+        options,
+        Some(host_executable),
+        options.capture_stdout,
+        options.capture_stderr,
+        timing,
+    )
+}
+
+fn run_in_subprocess_with_output_inner(
+    entry: &Path,
+    options: &LibdenoOptions,
+    explicit_host: Option<&Path>,
+    capture_stdout: bool,
+    capture_stderr: bool,
+    timing: ExecutionTiming,
+) -> Result<crate::RunOutput, LibdenoError> {
+    let (payload, mut child) = spawn_child_request(
+        entry,
+        options,
+        explicit_host,
+        if capture_stdout {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::inherit()
+        },
+        if capture_stderr {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::inherit()
+        },
     )?;
-    write_child_request(&mut child, payload)?;
+    write_child_request(&mut child, payload, timing.clone())?;
     // Drain both pipes concurrently with wait(): a child that fills a pipe
     // buffer blocks on write, so the parent must read while waiting or the
     // run deadlocks. Each stream keeps the first `max_capture_bytes` bytes
     // and keeps draining (dropping) the rest so the child never blocks; a
     // truncated stream sets the flag, mirroring in-process capture.
     let max = options.max_capture_bytes.unwrap_or(usize::MAX);
-    let stdout_handle = child
-        .stdout
-        .take()
-        .map(|pipe| std::thread::spawn(move || drain_pipe(pipe, max)));
-    let stderr_handle = child
-        .stderr
-        .take()
-        .map(|pipe| std::thread::spawn(move || drain_pipe(pipe, max)));
-    let status = child.wait().map_err(LibdenoError::Io)?;
-    let (stdout, stdout_truncated) = stdout_handle
-        .map(|h| {
-            h.join()
-                .map_err(|_| {
-                    LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-                        "subprocess stdout reader thread panicked"
-                    ))
-                })?
-                .map_err(LibdenoError::Io)
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let (stderr, stderr_truncated) = stderr_handle
-        .map(|h| {
-            h.join()
-                .map_err(|_| {
-                    LibdenoError::Runtime(deno_core::anyhow::anyhow!(
-                        "subprocess stderr reader thread panicked"
-                    ))
-                })?
-                .map_err(LibdenoError::Io)
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let output_readers =
+        match SubprocessOutputReaders::take(&mut child, capture_stdout, capture_stderr, max) {
+            Ok(readers) => readers,
+            Err(error) => {
+                let _cleanup = timing.span(Phase::CancelKillReap);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(LibdenoError::Io(error));
+            }
+        };
+    let _output_drain = (capture_stdout || capture_stderr).then(|| timing.span(Phase::OutputDrain));
+    let status = {
+        let _reap = timing.span(Phase::CancelKillReap);
+        child.wait().map_err(LibdenoError::Io)?
+    };
+    let capture = output_readers.collect();
+    if let Some(error) = capture.error {
+        return Err(LibdenoError::Io(error));
+    }
     Ok(crate::RunOutput {
         exit_code: status.code().unwrap_or(1),
-        stdout,
-        stderr,
-        capture_truncated: stdout_truncated || stderr_truncated,
+        stdout: capture.stdout,
+        stderr: capture.stderr,
+        capture_truncated: capture.truncated,
     })
 }
 
 /// Reads a child pipe to EOF, keeping the first `max` bytes; excess is
 /// drained and dropped (a truncated stream still unblocks the child). Read
 /// errors other than `Interrupted` are returned to the caller.
+#[cfg(test)]
 fn drain_pipe<R: std::io::Read>(
     mut pipe: R,
     max: usize,
@@ -582,19 +669,1839 @@ pub fn maybe_handle_child_mode() -> bool {
     }
 }
 
+#[cfg(feature = "execution-control")]
+const SUPERVISOR_REQUEST_ID: u64 = 1;
+
+#[cfg(feature = "execution-control")]
+fn supervisor_error(message: impl Into<String>) -> LibdenoError {
+    LibdenoError::Runtime(deno_core::anyhow::anyhow!(message.into()))
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_cancel_error(reason: CancelReason) -> LibdenoError {
+    match reason {
+        CancelReason::Deadline => {
+            LibdenoError::Timeout("supervisor execution deadline exceeded".to_string())
+        }
+        CancelReason::User | CancelReason::Shutdown => {
+            LibdenoError::Timeout("supervisor execution cancelled".to_string())
+        }
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_exit_code_for_status(exit_code: i32) -> i32 {
+    #[cfg(unix)]
+    {
+        exit_code.rem_euclid(256)
+    }
+    #[cfg(not(unix))]
+    {
+        exit_code
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_capture_limit(
+    capture_stdout: bool,
+    capture_stderr: bool,
+    max_capture_bytes: Option<usize>,
+) -> Result<Option<usize>, LibdenoError> {
+    if !capture_stdout && !capture_stderr {
+        return Ok(None);
+    }
+    let limit = max_capture_bytes.unwrap_or(SUPERVISOR_CAPTURE_BYTES_PER_STREAM);
+    if limit > SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM {
+        return Err(LibdenoError::Configuration(format!(
+            "supervisor capture limit {limit} exceeds the {}-byte per-stream maximum",
+            SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM
+        )));
+    }
+    Ok(Some(limit))
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_request(
+    entry: &Path,
+    options: &LibdenoOptions,
+    cwd: PathBuf,
+) -> Result<SupervisorRequest, LibdenoError> {
+    let max_capture_bytes = supervisor_capture_limit(
+        options.capture_stdout,
+        options.capture_stderr,
+        options.max_capture_bytes,
+    )?;
+    Ok(SupervisorRequest {
+        entry: entry.to_path_buf(),
+        cwd,
+        permissions: options.permissions.clone(),
+        allow_all_permissions: options.allow_all_permissions,
+        prompt: options.prompt,
+        args: options.args.clone(),
+        features: options.features.clone(),
+        max_heap_bytes: options.max_heap_bytes,
+        execution_deadline: options.execution_deadline,
+        capture_stdout: options.capture_stdout,
+        capture_stderr: options.capture_stderr,
+        max_capture_bytes,
+    })
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_host_executable(explicit: Option<&Path>) -> Result<PathBuf, LibdenoError> {
+    match explicit {
+        Some(path) => Ok(path.to_path_buf()),
+        None => std::env::var_os(LIBDENO_HOST_EXE)
+            .map(PathBuf::from)
+            .map(Ok)
+            .unwrap_or_else(|| std::env::current_exe().map_err(LibdenoError::Io)),
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn spawn_supervisor_child(
+    host_executable: &Path,
+    cwd: &Path,
+    endpoint: &str,
+    token: &SupervisorToken,
+    capture_stdout: bool,
+    capture_stderr: bool,
+) -> Result<Child, LibdenoError> {
+    std::process::Command::new(host_executable)
+        .env(SUPERVISOR_MODE_ENV, "1")
+        .env(SUPERVISOR_ENDPOINT_ENV, endpoint)
+        .env(SUPERVISOR_TOKEN_ENV, token.to_hex())
+        // Keep the existing Node IPC pairing exactly as the legacy child path
+        // does. Supervisor variables are removed by the child handler; this
+        // marker is intentionally left for deno_node/fork descendants.
+        .env(LIBDENO_SPAWNED_IPC, "1")
+        .current_dir(cwd)
+        .stdin(Stdio::inherit())
+        .stdout(if capture_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+        .stderr(if capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+        .spawn()
+        .map_err(LibdenoError::Io)
+}
+
+/// A child can inherit a captured pipe and keep it open after the direct child
+/// exits. Keep the collection wait bounded, and cap the number of detached
+/// readers/fds retained by those descendants just like in-process capture.
+const SUBPROCESS_OUTPUT_COLLECTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(500);
+const MAX_ACTIVE_SUBPROCESS_OUTPUT_READERS: usize = 64;
+static ACTIVE_SUBPROCESS_OUTPUT_READERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct SubprocessOutputReaderBudget;
+
+impl Drop for SubprocessOutputReaderBudget {
+    fn drop(&mut self) {
+        let previous =
+            ACTIVE_SUBPROCESS_OUTPUT_READERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(
+            previous > 0,
+            "subprocess output reader budget released without a reservation"
+        );
+    }
+}
+
+#[cfg(test)]
+fn active_subprocess_output_readers() -> usize {
+    ACTIVE_SUBPROCESS_OUTPUT_READERS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn reserve_subprocess_output_reader() -> Result<SubprocessOutputReaderBudget, std::io::Error> {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+
+    let mut active = ACTIVE_SUBPROCESS_OUTPUT_READERS.load(Acquire);
+    loop {
+        if active >= MAX_ACTIVE_SUBPROCESS_OUTPUT_READERS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "subprocess output reader/pipe resource budget exhausted: {} active, maximum {}",
+                    active, MAX_ACTIVE_SUBPROCESS_OUTPUT_READERS
+                ),
+            ));
+        }
+        match ACTIVE_SUBPROCESS_OUTPUT_READERS.compare_exchange_weak(
+            active,
+            active + 1,
+            AcqRel,
+            Acquire,
+        ) {
+            Ok(_) => return Ok(SubprocessOutputReaderBudget),
+            Err(next) => active = next,
+        }
+    }
+}
+
+enum SubprocessOutputReaderMessage {
+    Data(Vec<u8>),
+    Finished,
+    Failed(std::io::Error),
+}
+
+struct SubprocessOutputReader {
+    receiver: std::sync::mpsc::Receiver<SubprocessOutputReaderMessage>,
+    overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SubprocessOutputReader {
+    fn spawn<R: std::io::Read + Send + 'static>(mut pipe: R, max: usize) -> std::io::Result<Self> {
+        let reader_budget = reserve_subprocess_output_reader()?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let overflow_for_thread = overflow.clone();
+        let reader = std::thread::Builder::new()
+            .name("libdeno-subprocess-output-reader".to_string())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drain_pipe_to_channel(&mut pipe, max, &sender, &overflow_for_thread)
+                }));
+                match result {
+                    Ok(Ok(())) => {
+                        let _ = sender.send(SubprocessOutputReaderMessage::Finished);
+                    }
+                    Ok(Err(error)) => {
+                        let _ = sender.send(SubprocessOutputReaderMessage::Failed(error));
+                    }
+                    Err(_) => {
+                        let _ = sender.send(SubprocessOutputReaderMessage::Failed(
+                            std::io::Error::other("subprocess output reader panicked"),
+                        ));
+                    }
+                }
+                drop(reader_budget);
+            });
+        reader?;
+        // The reader owns its pipe and remains bounded by the collection
+        // timeout/resource budget; joining it after a descendant inherits the
+        // write end can block forever.
+        Ok(Self { receiver, overflow })
+    }
+}
+
+fn drain_pipe_to_channel(
+    pipe: &mut impl std::io::Read,
+    max: usize,
+    sender: &std::sync::mpsc::Sender<SubprocessOutputReaderMessage>,
+    overflow: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<()> {
+    let mut retained = 0usize;
+    let mut discarding = false;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = match pipe.read(&mut buf) {
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if n == 0 {
+            return Ok(());
+        }
+        if discarding {
+            continue;
+        }
+        let keep = max.saturating_sub(retained).min(n);
+        if keep > 0 {
+            if sender
+                .send(SubprocessOutputReaderMessage::Data(buf[..keep].to_vec()))
+                .is_err()
+            {
+                // The collector timed out and dropped its receiver. Stop
+                // reading so a completed reader releases its fd promptly.
+                return Ok(());
+            }
+            retained += keep;
+        }
+        if n > keep {
+            overflow.store(true, std::sync::atomic::Ordering::Relaxed);
+            discarding = true;
+        }
+    }
+}
+
+struct SubprocessOutputReaders {
+    stdout: Option<SubprocessOutputReader>,
+    stderr: Option<SubprocessOutputReader>,
+}
+
+struct SubprocessOutputCapture {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+    error: Option<std::io::Error>,
+}
+
+struct SubprocessOutputStream {
+    receiver: std::sync::mpsc::Receiver<SubprocessOutputReaderMessage>,
+    overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    name: &'static str,
+    output: Vec<u8>,
+    error: Option<std::io::Error>,
+    done: bool,
+}
+
+impl SubprocessOutputStream {
+    fn new(reader: SubprocessOutputReader, name: &'static str) -> Self {
+        Self {
+            receiver: reader.receiver,
+            overflow: reader.overflow,
+            name,
+            output: Vec::new(),
+            error: None,
+            done: false,
+        }
+    }
+
+    fn accept(&mut self, message: SubprocessOutputReaderMessage) {
+        match message {
+            SubprocessOutputReaderMessage::Data(block) => self.output.extend_from_slice(&block),
+            SubprocessOutputReaderMessage::Finished => self.done = true,
+            SubprocessOutputReaderMessage::Failed(error) => {
+                self.error = Some(std::io::Error::other(format!(
+                    "{} reader failed: {error}",
+                    self.name
+                )));
+                self.done = true;
+            }
+        }
+    }
+
+    fn disconnected(&mut self) {
+        self.error = Some(std::io::Error::other(format!(
+            "{} reader disconnected unexpectedly",
+            self.name
+        )));
+        self.done = true;
+    }
+
+    fn try_receive(&mut self) -> bool {
+        match self.receiver.try_recv() {
+            Ok(message) => {
+                self.accept(message);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.disconnected();
+                true
+            }
+        }
+    }
+
+    fn wait_receive(&mut self, timeout: std::time::Duration) -> bool {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(message) => {
+                self.accept(message);
+                true
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.disconnected();
+                true
+            }
+        }
+    }
+}
+
+impl SubprocessOutputReaders {
+    fn take(
+        child: &mut std::process::Child,
+        capture_stdout: bool,
+        capture_stderr: bool,
+        max: usize,
+    ) -> std::io::Result<Self> {
+        let stdout_pipe =
+            if capture_stdout {
+                Some(child.stdout.take().ok_or_else(|| {
+                    std::io::Error::other("subprocess stdout pipe was not created")
+                })?)
+            } else {
+                None
+            };
+        let stderr_pipe =
+            if capture_stderr {
+                Some(child.stderr.take().ok_or_else(|| {
+                    std::io::Error::other("subprocess stderr pipe was not created")
+                })?)
+            } else {
+                None
+            };
+        let stdout = stdout_pipe
+            .map(|pipe| SubprocessOutputReader::spawn(pipe, max))
+            .transpose()?;
+        let stderr = stderr_pipe
+            .map(|pipe| SubprocessOutputReader::spawn(pipe, max))
+            .transpose()?;
+        Ok(Self { stdout, stderr })
+    }
+
+    fn collect(self) -> SubprocessOutputCapture {
+        let deadline = std::time::Instant::now()
+            .checked_add(SUBPROCESS_OUTPUT_COLLECTION_TIMEOUT)
+            .unwrap_or_else(std::time::Instant::now);
+        let mut streams = [
+            self.stdout
+                .map(|reader| SubprocessOutputStream::new(reader, "subprocess stdout")),
+            self.stderr
+                .map(|reader| SubprocessOutputStream::new(reader, "subprocess stderr")),
+        ];
+        while deadline > std::time::Instant::now() {
+            let mut progress = false;
+            for stream in streams.iter_mut().flatten() {
+                if !stream.done {
+                    progress |= stream.try_receive();
+                }
+            }
+            if streams
+                .iter()
+                .all(|stream| stream.as_ref().is_none_or(|stream| stream.done))
+            {
+                break;
+            }
+            if !progress {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if let Some(stream) = streams.iter_mut().flatten().find(|stream| !stream.done) {
+                    let _ =
+                        stream.wait_receive(remaining.min(std::time::Duration::from_millis(10)));
+                }
+            }
+        }
+        let (stdout, stdout_truncated, stdout_error) = streams[0]
+            .take()
+            .map(|stream| {
+                (
+                    stream.output,
+                    stream.overflow.load(std::sync::atomic::Ordering::Relaxed),
+                    stream.error,
+                )
+            })
+            .unwrap_or_default();
+        let (stderr, stderr_truncated, stderr_error) = streams[1]
+            .take()
+            .map(|stream| {
+                (
+                    stream.output,
+                    stream.overflow.load(std::sync::atomic::Ordering::Relaxed),
+                    stream.error,
+                )
+            })
+            .unwrap_or_default();
+        let error = match (stdout_error, stderr_error) {
+            (Some(stdout), Some(stderr)) => {
+                Some(std::io::Error::other(format!("{stdout}; {stderr}")))
+            }
+            (Some(error), None) | (None, Some(error)) => Some(error),
+            (None, None) => None,
+        };
+        SubprocessOutputCapture {
+            stdout,
+            stderr,
+            truncated: stdout_truncated || stderr_truncated,
+            error,
+        }
+    }
+}
+
+#[cfg(feature = "execution-control")]
+struct SupervisorSessionOutcome {
+    terminal: SupervisorTerminal,
+    cancellation_before_terminal: Option<CancelReason>,
+    transport_status: crate::supervisor::SupervisorTransportStatus,
+}
+
+#[cfg(feature = "execution-control")]
+pub(crate) struct SupervisedSubprocessError {
+    pub(crate) error: LibdenoError,
+    pub(crate) cleanup_strength: Option<CleanupStrength>,
+    pub(crate) transport_status: Option<crate::supervisor::SupervisorTransportStatus>,
+}
+
+#[cfg(feature = "execution-control")]
+impl From<LibdenoError> for SupervisedSubprocessError {
+    fn from(error: LibdenoError) -> Self {
+        Self {
+            error,
+            cleanup_strength: None,
+            transport_status: None,
+        }
+    }
+}
+
+#[cfg(feature = "execution-control")]
+impl SupervisedSubprocessError {
+    fn with_metadata(
+        error: LibdenoError,
+        cleanup_strength: Option<CleanupStrength>,
+        transport_status: Option<crate::supervisor::SupervisorTransportStatus>,
+    ) -> Self {
+        Self {
+            error,
+            cleanup_strength,
+            transport_status,
+        }
+    }
+}
+
+#[cfg(feature = "execution-control")]
+struct SupervisorControlWorker {
+    stop: mpsc::Sender<()>,
+    terminal_seen: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+}
+
+#[cfg(feature = "execution-control")]
+impl SupervisorControlWorker {
+    fn spawn(
+        stream: &TcpStream,
+        state: Arc<Mutex<SupervisorParentSession>>,
+        cancellation: SupervisorCancellation,
+        deadline: Option<Instant>,
+    ) -> Result<Self, LibdenoError> {
+        let stream = stream.try_clone().map_err(LibdenoError::Io)?;
+        let (stop, stop_rx) = mpsc::channel();
+        let terminal_seen = Arc::new(AtomicBool::new(false));
+        let terminal_seen_for_thread = terminal_seen.clone();
+        let join = std::thread::Builder::new()
+            .name("libdeno-supervisor-control".to_string())
+            .spawn(move || {
+                supervisor_control_loop(
+                    stream,
+                    stop_rx,
+                    state,
+                    cancellation,
+                    deadline,
+                    terminal_seen_for_thread,
+                )
+            })
+            .map_err(LibdenoError::Io)?;
+        Ok(Self {
+            stop,
+            terminal_seen,
+            join: Some(join),
+        })
+    }
+
+    fn mark_terminal(&self) {
+        self.terminal_seen.store(true, Ordering::Release);
+    }
+
+    fn stop_and_join(self) -> std::io::Result<()> {
+        let _ = self.stop.send(());
+        self.join()
+    }
+
+    fn join(mut self) -> std::io::Result<()> {
+        match self
+            .join
+            .take()
+            .expect("supervisor worker join handle")
+            .join()
+        {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::other("supervisor control worker panicked")),
+        }
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_control_loop(
+    mut stream: TcpStream,
+    stop_rx: mpsc::Receiver<()>,
+    state: Arc<Mutex<SupervisorParentSession>>,
+    cancellation: SupervisorCancellation,
+    deadline: Option<Instant>,
+    terminal_seen: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    stream.set_write_timeout(Some(SUPERVISOR_FRAME_TIMEOUT))?;
+    loop {
+        if stop_rx.recv_timeout(Duration::from_millis(10)).is_ok() {
+            return Ok(());
+        }
+        if terminal_seen.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !cancellation.is_requested() {
+            if deadline.is_some_and(|at| at <= Instant::now()) {
+                cancellation.request(CancelReason::Deadline);
+            } else {
+                continue;
+            }
+        }
+
+        if terminal_seen.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let reason = cancellation.reason();
+        let should_send = state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .send_cancel(reason)?;
+        if should_send {
+            let payload = encode_payload(&reason)?;
+            let frame = SupervisorFrame::new(FrameKind::Cancel, SUPERVISOR_REQUEST_ID, payload)?;
+            if let Err(error) = write_frame(&mut stream, &frame) {
+                let _ = stream.shutdown(Shutdown::Both);
+                return Err(error);
+            }
+        }
+
+        let grace_deadline = supervisor_deadline_after(SUPERVISOR_CANCEL_GRACE);
+        loop {
+            let remaining = grace_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = stream.shutdown(Shutdown::Both);
+                return Ok(());
+            }
+            match stop_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if terminal_seen.load(Ordering::Acquire) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_deadline_after(duration: Duration) -> Instant {
+    Instant::now()
+        .checked_add(duration)
+        .unwrap_or_else(Instant::now)
+}
+
+#[cfg(feature = "execution-control")]
+fn effective_supervisor_deadline(
+    started: Instant,
+    parent_deadline: Option<Instant>,
+    execution_deadline: Option<Duration>,
+) -> Result<Option<Instant>, LibdenoError> {
+    let option_deadline = execution_deadline
+        .map(|duration| {
+            started.checked_add(duration).ok_or_else(|| {
+                LibdenoError::Configuration(
+                    "execution deadline is too large for the host clock".to_string(),
+                )
+            })
+        })
+        .transpose()?;
+    Ok(match (parent_deadline, option_deadline) {
+        (Some(parent), Some(option)) => Some(parent.min(option)),
+        (Some(parent), None) => Some(parent),
+        (None, Some(option)) => Some(option),
+        (None, None) => None,
+    })
+}
+
+#[cfg(feature = "execution-control")]
+fn phase_frame_deadline(effective_deadline: Option<Instant>) -> Instant {
+    let frame_deadline = supervisor_deadline_after(SUPERVISOR_FRAME_TIMEOUT);
+    effective_deadline.map_or(frame_deadline, |deadline| deadline.min(frame_deadline))
+}
+
+#[cfg(feature = "execution-control")]
+fn set_supervisor_write_timeout(
+    stream: &TcpStream,
+    effective_deadline: Option<Instant>,
+    cancellation: &SupervisorCancellation,
+) -> std::io::Result<()> {
+    let deadline = phase_frame_deadline(effective_deadline);
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        if effective_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            cancellation.request(CancelReason::Deadline);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "supervisor frame deadline exceeded",
+        ));
+    }
+    stream.set_write_timeout(Some(remaining))
+}
+
+#[cfg(feature = "execution-control")]
+fn read_supervisor_handshake_frame(
+    stream: &mut TcpStream,
+    effective_deadline: Option<Instant>,
+    cancellation: &SupervisorCancellation,
+) -> std::io::Result<SupervisorFrame> {
+    let result = read_frame_with_cancellation(
+        stream,
+        FrameDirection::ChildToParent,
+        Some(phase_frame_deadline(effective_deadline)),
+        Some(cancellation),
+    );
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+        && effective_deadline.is_some_and(|deadline| deadline <= Instant::now())
+        && cancellation.requested_reason().is_none()
+    {
+        cancellation.request(CancelReason::Deadline);
+    }
+    result
+}
+
+#[cfg(feature = "execution-control")]
+fn write_supervisor_frame(
+    stream: &mut TcpStream,
+    frame: &SupervisorFrame,
+    effective_deadline: Option<Instant>,
+    cancellation: &SupervisorCancellation,
+) -> std::io::Result<()> {
+    set_supervisor_write_timeout(stream, effective_deadline, cancellation)?;
+    let result = write_frame(stream, frame);
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+        && effective_deadline.is_some_and(|deadline| deadline <= Instant::now())
+        && cancellation.requested_reason().is_none()
+    {
+        cancellation.request(CancelReason::Deadline);
+    }
+    result
+}
+
+#[cfg(feature = "execution-control")]
+fn accept_supervisor_peer(
+    listener: &TcpListener,
+    effective_deadline: Option<Instant>,
+    cancellation: &SupervisorCancellation,
+) -> std::io::Result<TcpStream> {
+    listener.set_nonblocking(true)?;
+    let connect_deadline = supervisor_deadline_after(SUPERVISOR_CONNECT_TIMEOUT);
+    let deadline = effective_deadline.map_or(connect_deadline, |value| value.min(connect_deadline));
+    loop {
+        if let Some(reason) = cancellation.requested_reason() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("supervisor connection cancelled ({reason:?})"),
+            ));
+        }
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                if !peer.ip().is_loopback() {
+                    continue;
+                }
+                stream.set_nonblocking(false)?;
+                return Ok(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    if effective_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                        cancellation.request(CancelReason::Deadline);
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "supervisor connect deadline exceeded",
+                    ));
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn cancellation_reason_if_due(
+    cancellation: &SupervisorCancellation,
+    deadline: Option<Instant>,
+) -> Option<CancelReason> {
+    if let Some(reason) = cancellation.requested_reason() {
+        return Some(reason);
+    }
+    if deadline.is_some_and(|at| at <= Instant::now()) {
+        cancellation.request(CancelReason::Deadline);
+        return Some(CancelReason::Deadline);
+    }
+    None
+}
+
+#[cfg(feature = "execution-control")]
+fn send_supervisor_cancel(
+    stream: &mut TcpStream,
+    state: &Arc<Mutex<SupervisorParentSession>>,
+    reason: CancelReason,
+) -> std::io::Result<()> {
+    let should_send = state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .send_cancel(reason)?;
+    if should_send {
+        let payload = encode_payload(&reason)?;
+        let frame = SupervisorFrame::new(FrameKind::Cancel, SUPERVISOR_REQUEST_ID, payload)?;
+        stream.set_write_timeout(Some(Duration::from_millis(100)))?;
+        write_frame(stream, &frame)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "execution-control")]
+fn read_supervisor_terminal(
+    stream: &mut TcpStream,
+    state: &Arc<Mutex<SupervisorParentSession>>,
+    effective_deadline: Option<Instant>,
+    started_phase_deadline: Instant,
+    cancellation: &SupervisorCancellation,
+    read_cancellation: Option<&SupervisorCancellation>,
+    on_started: Option<&dyn Fn()>,
+) -> std::io::Result<SupervisorTerminal> {
+    let terminal = loop {
+        let (parent_state, started_received) = {
+            let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            (state.state(), state.started_received())
+        };
+        let waiting_started = parent_state
+            == crate::supervisor::SupervisorParentState::AwaitStarted
+            || (parent_state == crate::supervisor::SupervisorParentState::Cancelling
+                && !started_received);
+        let cancelled_before_start =
+            parent_state == crate::supervisor::SupervisorParentState::CancellingBeforeStart;
+        let (first_byte_deadline, assembly_deadline) = if waiting_started {
+            // STARTED is one phase: all bytes share the same absolute bound.
+            (Some(started_phase_deadline), Some(started_phase_deadline))
+        } else if cancelled_before_start {
+            let grace_deadline = supervisor_deadline_after(SUPERVISOR_CANCEL_GRACE);
+            let terminal_deadline =
+                effective_deadline.map_or(grace_deadline, |deadline| deadline.min(grace_deadline));
+            (Some(terminal_deadline), Some(terminal_deadline))
+        } else {
+            // After STARTED, the control worker owns execution cancellation;
+            // keep waiting for a cooperative TERMINAL during its grace. Once
+            // that byte arrives, read_frame_after_first_byte creates its own
+            // absolute SUPERVISOR_FRAME_TIMEOUT assembly bound.
+            (None, None)
+        };
+        let phase_deadline = if waiting_started || cancelled_before_start {
+            effective_deadline
+        } else {
+            None
+        };
+        let frame = read_frame_after_first_byte(
+            stream,
+            FrameDirection::ChildToParent,
+            first_byte_deadline,
+            assembly_deadline,
+            (!cancelled_before_start)
+                .then_some(read_cancellation)
+                .flatten(),
+        )
+        .inspect_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut
+                && phase_deadline.is_some_and(|deadline| deadline <= Instant::now())
+                && cancellation.requested_reason().is_none()
+            {
+                cancellation.request(CancelReason::Deadline);
+            }
+        })?;
+        let event = state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .receive_child_frame(&frame)?;
+        match event {
+            SupervisorFrameEvent::Terminal => {
+                break state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .terminal()
+                    .expect("terminal event must store a terminal")
+                    .clone();
+            }
+            SupervisorFrameEvent::Accepted => {}
+            SupervisorFrameEvent::Started => {
+                if let Some(on_started) = on_started {
+                    on_started();
+                }
+            }
+        }
+    };
+
+    // A child normally closes immediately after its one terminal frame. Give
+    // a peer a short bounded window to prove an identical duplicate is benign
+    // while still rejecting a conflicting duplicate.
+    let duplicate_deadline = supervisor_deadline_after(Duration::from_millis(100));
+    loop {
+        match read_frame(stream, FrameDirection::ChildToParent, duplicate_deadline) {
+            Ok(frame) => {
+                let event = state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .receive_child_frame(&frame)?;
+                if !matches!(event, SupervisorFrameEvent::Terminal) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "supervisor frame follows TERMINAL",
+                    ));
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(terminal)
+}
+
+#[cfg(feature = "execution-control")]
+fn drive_supervisor_session(
+    listener: TcpListener,
+    request_payload: Vec<u8>,
+    token: SupervisorToken,
+    cancellation: SupervisorCancellation,
+    deadline: Option<Instant>,
+    on_started: Option<&dyn Fn()>,
+) -> Result<SupervisorSessionOutcome, LibdenoError> {
+    let mut stream =
+        accept_supervisor_peer(&listener, deadline, &cancellation).map_err(LibdenoError::Io)?;
+    let state = Arc::new(Mutex::new(SupervisorParentSession::new(
+        SUPERVISOR_REQUEST_ID,
+    )));
+
+    let hello = read_supervisor_handshake_frame(&mut stream, deadline, &cancellation)
+        .map_err(LibdenoError::Io)?;
+    state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .accept_hello(&hello, &token)
+        .map_err(LibdenoError::Io)?;
+
+    let request = SupervisorFrame::new(FrameKind::Request, SUPERVISOR_REQUEST_ID, request_payload)
+        .map_err(LibdenoError::Io)?;
+    state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .send_request()
+        .map_err(LibdenoError::Io)?;
+    write_supervisor_frame(&mut stream, &request, deadline, &cancellation)
+        .map_err(LibdenoError::Io)?;
+
+    let accepted = read_supervisor_handshake_frame(&mut stream, deadline, &cancellation)
+        .map_err(LibdenoError::Io)?;
+    let accepted_event = state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .receive_child_frame(&accepted)
+        .map_err(LibdenoError::Io)?;
+    if accepted_event != SupervisorFrameEvent::Accepted {
+        return Err(supervisor_error("supervisor child did not accept REQUEST"));
+    }
+
+    let _ = cancellation_reason_if_due(&cancellation, deadline);
+    let start_authorized = state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .authorize_start(&cancellation)
+        .map_err(LibdenoError::Io)?;
+    // START authorization begins an independent supervisor phase. The
+    // execution deadline is owned by the control worker from this point on.
+    let started_phase_deadline = phase_frame_deadline(None);
+    let mut control_worker = None;
+    if start_authorized {
+        let start = SupervisorFrame::new(FrameKind::Start, SUPERVISOR_REQUEST_ID, Vec::new())
+            .map_err(LibdenoError::Io)?;
+        write_supervisor_frame(&mut stream, &start, deadline, &cancellation)
+            .map_err(LibdenoError::Io)?;
+        control_worker = Some(SupervisorControlWorker::spawn(
+            &stream,
+            state.clone(),
+            cancellation.clone(),
+            deadline,
+        )?);
+    } else {
+        let reason = cancellation.reason();
+        send_supervisor_cancel(&mut stream, &state, reason).map_err(LibdenoError::Io)?;
+    }
+
+    // After START authorization, the control worker owns cancellation and its
+    // fixed grace; the terminal reader must not turn that request into an
+    // immediate Interrupted result.
+    let terminal = read_supervisor_terminal(
+        &mut stream,
+        &state,
+        deadline,
+        started_phase_deadline,
+        &cancellation,
+        (!start_authorized).then_some(&cancellation),
+        on_started,
+    );
+    let cancellation_before_terminal = state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .cancellation_before_terminal();
+    let (terminal, transport_status) = match (terminal, control_worker) {
+        (Ok(terminal), Some(worker)) => {
+            // receive_child_frame has already linearized TERMINAL in the
+            // parent state. Publish that fact before stopping the worker: it
+            // suppresses a late CANCEL, while an already-sent CANCEL exits its
+            // grace wait as soon as this cooperative terminal arrives.
+            worker.mark_terminal();
+            let worker_result = worker.stop_and_join();
+            let status = if worker_result.is_ok() {
+                crate::supervisor::SupervisorTransportStatus::Clean
+            } else {
+                crate::supervisor::SupervisorTransportStatus::Failed
+            };
+            (terminal, status)
+        }
+        (Ok(terminal), None) => (
+            terminal,
+            crate::supervisor::SupervisorTransportStatus::Clean,
+        ),
+        (Err(error), Some(worker)) => {
+            if cancellation.is_requested() {
+                // Do not send the stop signal: the worker must finish its
+                // cancellation grace and close the peer itself.
+                let _ = worker.join();
+            } else {
+                let _ = worker.stop_and_join();
+            }
+            return Err(LibdenoError::Io(error));
+        }
+        (Err(error), None) => return Err(LibdenoError::Io(error)),
+    };
+    Ok(SupervisorSessionOutcome {
+        terminal,
+        cancellation_before_terminal,
+        transport_status,
+    })
+}
+
+#[cfg(feature = "execution-control")]
+struct SupervisorChildReap {
+    status: ExitStatus,
+    forced_kill: bool,
+}
+
+#[cfg(feature = "execution-control")]
+fn reap_supervisor_child(
+    child: &mut Child,
+    terminal_received: bool,
+) -> std::io::Result<SupervisorChildReap> {
+    if !terminal_received {
+        return kill_and_wait_supervisor_child(child).map(|status| SupervisorChildReap {
+            status,
+            forced_kill: true,
+        });
+    }
+    let deadline = supervisor_deadline_after(SUPERVISOR_CHILD_EXIT_GRACE);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(SupervisorChildReap {
+                    status,
+                    forced_kill: false,
+                });
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) => {
+                return kill_and_wait_supervisor_child(child).map(|status| SupervisorChildReap {
+                    status,
+                    forced_kill: true,
+                });
+            }
+            Err(error) => {
+                return match kill_and_wait_supervisor_child(child) {
+                    Ok(status) => Err(std::io::Error::other(format!(
+                        "supervisor child inspection failed: {error}; cleanup reaped exit status {status}"
+                    ))),
+                    Err(cleanup) => Err(std::io::Error::other(format!(
+                        "supervisor child inspection failed: {error}; cleanup failed: {cleanup}"
+                    ))),
+                };
+            }
+        }
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn kill_and_wait_supervisor_child(child: &mut Child) -> std::io::Result<ExitStatus> {
+    let kill_result = child.kill();
+    let wait_result = child.wait();
+    match (kill_result, wait_result) {
+        (Ok(()), Ok(status)) => Ok(status),
+        (Err(kill), Ok(status)) => Err(std::io::Error::other(format!(
+            "supervisor child kill failed after reaping exit status {status}: {kill}"
+        ))),
+        (Ok(()), Err(wait)) => Err(std::io::Error::other(format!(
+            "supervisor child was killed but wait failed: {wait}"
+        ))),
+        (Err(kill), Err(wait)) => Err(std::io::Error::other(format!(
+            "supervisor child kill failed: {kill}; wait failed: {wait}"
+        ))),
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn validate_supervisor_terminal(
+    terminal: &SupervisorTerminal,
+    request: &SupervisorRequest,
+) -> Result<(), LibdenoError> {
+    match terminal.outcome {
+        crate::supervisor::SupervisorOutcome::Completed if terminal.exit_code.is_none() => {
+            return Err(supervisor_error(
+                "completed supervisor TERMINAL has no exit code",
+            ));
+        }
+        crate::supervisor::SupervisorOutcome::Completed => {}
+        crate::supervisor::SupervisorOutcome::Failed
+        | crate::supervisor::SupervisorOutcome::Cancelled
+        | crate::supervisor::SupervisorOutcome::Deadline
+            if terminal.exit_code.is_some() =>
+        {
+            return Err(supervisor_error(
+                "non-completed supervisor TERMINAL has an exit code",
+            ));
+        }
+        _ => {}
+    }
+    if (!request.capture_stdout && !terminal.stdout.is_empty())
+        || (!request.capture_stderr && !terminal.stderr.is_empty())
+        || (!request.capture_stdout && !request.capture_stderr && terminal.truncated)
+    {
+        return Err(supervisor_error(
+            "supervisor TERMINAL contains unrequested output",
+        ));
+    }
+    if let Some(max) = supervisor_capture_limit(
+        request.capture_stdout,
+        request.capture_stderr,
+        request.max_capture_bytes,
+    )? {
+        if terminal.stdout.len() > max || terminal.stderr.len() > max {
+            return Err(supervisor_error(
+                "supervisor TERMINAL output exceeds its bound",
+            ));
+        }
+    }
+    if terminal.truncated && !request.capture_stdout && !request.capture_stderr {
+        return Err(supervisor_error(
+            "supervisor TERMINAL reports truncation without capture",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "execution-control")]
+#[cfg(test)]
+fn map_supervisor_terminal(
+    terminal: SupervisorTerminal,
+    status: ExitStatus,
+    request: &SupervisorRequest,
+    forced_kill: bool,
+) -> Result<RunOutput, LibdenoError> {
+    map_supervisor_terminal_with_cancellation(terminal, status, request, forced_kill, None)
+}
+
+#[cfg(feature = "execution-control")]
+fn validate_supervisor_terminal_status(
+    terminal: &SupervisorTerminal,
+    status: ExitStatus,
+    forced_kill: bool,
+) -> Result<(), LibdenoError> {
+    if forced_kill {
+        return Ok(());
+    }
+    let expected = match terminal.outcome {
+        crate::supervisor::SupervisorOutcome::Completed => {
+            supervisor_exit_code_for_status(terminal.exit_code.expect("validated terminal"))
+        }
+        crate::supervisor::SupervisorOutcome::Cancelled
+        | crate::supervisor::SupervisorOutcome::Deadline
+        | crate::supervisor::SupervisorOutcome::Failed => 1,
+    };
+    if status.code() != Some(expected) {
+        let outcome = match terminal.outcome {
+            crate::supervisor::SupervisorOutcome::Completed => "completed",
+            crate::supervisor::SupervisorOutcome::Cancelled => "cancelled",
+            crate::supervisor::SupervisorOutcome::Deadline => "deadline",
+            crate::supervisor::SupervisorOutcome::Failed => "failed",
+        };
+        return Err(supervisor_error(format!(
+            "{outcome} supervisor TERMINAL disagrees with direct-child exit status"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "execution-control")]
+fn map_supervisor_terminal_with_cancellation(
+    terminal: SupervisorTerminal,
+    status: ExitStatus,
+    request: &SupervisorRequest,
+    forced_kill: bool,
+    cancellation_before_terminal: Option<CancelReason>,
+) -> Result<RunOutput, LibdenoError> {
+    validate_supervisor_terminal(&terminal, request)?;
+    if let Some(reason) = cancellation_before_terminal {
+        // The parent state records only cancellations that won the state lock
+        // before TERMINAL. Keep validating the child payload, then reconcile
+        // to the first cancellation reason instead of returning Completed.
+        validate_supervisor_terminal_status(&terminal, status, forced_kill)?;
+        return Err(supervisor_cancel_error(reason));
+    }
+    match terminal.outcome {
+        crate::supervisor::SupervisorOutcome::Completed => {
+            let exit_code = terminal.exit_code.expect("validated completed terminal");
+            if !forced_kill && status.code() != Some(supervisor_exit_code_for_status(exit_code)) {
+                return Err(supervisor_error(
+                    "supervisor TERMINAL disagrees with direct-child exit status",
+                ));
+            }
+            Ok(RunOutput {
+                exit_code,
+                stdout: terminal.stdout,
+                stderr: terminal.stderr,
+                capture_truncated: terminal.truncated,
+            })
+        }
+        crate::supervisor::SupervisorOutcome::Cancelled => {
+            if !forced_kill && status.code() != Some(1) {
+                return Err(supervisor_error(
+                    "cancelled supervisor TERMINAL disagrees with direct-child exit status",
+                ));
+            }
+            Err(supervisor_cancel_error(CancelReason::User))
+        }
+        crate::supervisor::SupervisorOutcome::Deadline => {
+            if !forced_kill && status.code() != Some(1) {
+                return Err(supervisor_error(
+                    "deadline supervisor TERMINAL disagrees with direct-child exit status",
+                ));
+            }
+            Err(supervisor_cancel_error(CancelReason::Deadline))
+        }
+        crate::supervisor::SupervisorOutcome::Failed => {
+            if !forced_kill && status.code() != Some(1) {
+                return Err(supervisor_error(
+                    "failed supervisor TERMINAL disagrees with direct-child exit status",
+                ));
+            }
+            Err(supervisor_error("supervised child execution failed"))
+        }
+    }
+}
+
+/// Runs one opt-in supervisor-protocol child. This is hidden and feature
+/// gated until the executor lane owns backend selection; legacy subprocess
+/// helpers above remain on their original stdin-JSON protocol.
+#[cfg(feature = "execution-control")]
+#[doc(hidden)]
+pub fn run_in_supervised_subprocess(
+    entry: impl AsRef<Path>,
+    options: &LibdenoOptions,
+) -> Result<RunOutput, LibdenoError> {
+    let host = supervisor_host_executable(None)?;
+    let cancellation = CancellationContext::new();
+    run_supervised_subprocess_with_executable_observed(
+        &host,
+        entry.as_ref(),
+        options,
+        Some(cancellation),
+        CancelReason::User,
+        None,
+        ExecutionTiming::disabled(),
+    )
+    .map(|result| result.output)
+    .map_err(|error| error.error)
+}
+
+#[cfg(feature = "execution-control")]
+pub(crate) fn run_supervised_subprocess_with_executable_observed(
+    host_executable: &Path,
+    entry: &Path,
+    options: &LibdenoOptions,
+    cancellation: Option<CancellationContext>,
+    default_cancel_reason: CancelReason,
+    parent_deadline: Option<Instant>,
+    timing: ExecutionTiming,
+) -> Result<SupervisorRunResult, SupervisedSubprocessError> {
+    run_supervised_subprocess_with_executable_observed_and_started(
+        host_executable,
+        entry,
+        options,
+        cancellation,
+        default_cancel_reason,
+        parent_deadline,
+        timing,
+        None,
+    )
+}
+
+#[cfg(feature = "execution-control")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_supervised_subprocess_with_executable_observed_and_started(
+    host_executable: &Path,
+    entry: &Path,
+    options: &LibdenoOptions,
+    cancellation: Option<CancellationContext>,
+    default_cancel_reason: CancelReason,
+    parent_deadline: Option<Instant>,
+    _timing: ExecutionTiming,
+    on_started: Option<&dyn Fn()>,
+) -> Result<SupervisorRunResult, SupervisedSubprocessError> {
+    let started = Instant::now();
+    let cancellation = SupervisorCancellation::new(
+        cancellation.unwrap_or_else(CancellationContext::new),
+        default_cancel_reason,
+    );
+    let deadline =
+        effective_supervisor_deadline(started, parent_deadline, options.execution_deadline)
+            .map_err(SupervisedSubprocessError::from)?;
+    if let Some(reason) = cancellation.requested_reason() {
+        return Err(supervisor_cancel_error(reason).into());
+    }
+    if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+        cancellation.request(CancelReason::Deadline);
+        return Err(supervisor_cancel_error(cancellation.reason()).into());
+    }
+
+    let cwd = options
+        .cwd
+        .clone()
+        .unwrap_or(std::env::current_dir().map_err(LibdenoError::Io)?);
+    let request = supervisor_request(entry, options, cwd.clone())?;
+    let request_payload = encode_payload(&request).map_err(LibdenoError::Io)?;
+    let token = SupervisorToken::generate()
+        .map_err(|error| LibdenoError::Runtime(deno_core::anyhow::anyhow!(error)))?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(LibdenoError::Io)?;
+    let endpoint = listener.local_addr().map_err(LibdenoError::Io)?.to_string();
+    // In-process fd capture is unavailable on Windows because the runtime's
+    // stdout/stderr handles bypass CRT fd redirection. Capture the supervisor
+    // child's own pipes there instead; Unix keeps the existing terminal-frame
+    // capture path.
+    let parent_pipe_capture = cfg!(windows) && (request.capture_stdout || request.capture_stderr);
+    let mut child = spawn_supervisor_child(
+        host_executable,
+        &cwd,
+        &endpoint,
+        &token,
+        parent_pipe_capture && request.capture_stdout,
+        parent_pipe_capture && request.capture_stderr,
+    )?;
+    #[cfg(windows)]
+    let output_readers = if parent_pipe_capture {
+        let max = request
+            .max_capture_bytes
+            .unwrap_or(SUPERVISOR_CAPTURE_BYTES_PER_STREAM);
+        match SubprocessOutputReaders::take(
+            &mut child,
+            request.capture_stdout,
+            request.capture_stderr,
+            max,
+        ) {
+            Ok(readers) => Some(readers),
+            Err(error) => {
+                let _ = kill_and_wait_supervisor_child(&mut child);
+                return Err(SupervisedSubprocessError::with_metadata(
+                    LibdenoError::Io(error),
+                    Some(CleanupStrength::DirectChild),
+                    Some(crate::supervisor::SupervisorTransportStatus::Failed),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    let session = drive_supervisor_session(
+        listener,
+        request_payload,
+        token,
+        cancellation.clone(),
+        deadline,
+        on_started,
+    );
+    let terminal_received = session.is_ok();
+    let cleanup = reap_supervisor_child(&mut child, terminal_received);
+    #[cfg(windows)]
+    let output_capture = output_readers.map(SubprocessOutputReaders::collect);
+
+    let session = match session {
+        Ok(session) => session,
+        Err(error) => {
+            let error = if cancellation.is_requested() {
+                supervisor_cancel_error(cancellation.reason())
+            } else {
+                error
+            };
+            let error = match cleanup {
+                Ok(_) => error,
+                Err(cleanup) => supervisor_error(format!(
+                    "supervisor session failed: {error}; direct-child cleanup failed: {cleanup}"
+                )),
+            };
+            #[cfg(windows)]
+            let error = match output_capture
+                .as_ref()
+                .and_then(|capture| capture.error.as_ref())
+            {
+                Some(reader_error) => supervisor_error(format!(
+                    "{error}; supervisor output reader failed: {reader_error}"
+                )),
+                None => error,
+            };
+            return Err(SupervisedSubprocessError::with_metadata(
+                error,
+                Some(CleanupStrength::DirectChild),
+                Some(crate::supervisor::SupervisorTransportStatus::Failed),
+            ));
+        }
+    };
+    let reap = match cleanup {
+        Ok(reap) => reap,
+        Err(error) => {
+            #[cfg(windows)]
+            let error = match output_capture
+                .as_ref()
+                .and_then(|capture| capture.error.as_ref())
+            {
+                Some(reader_error) => supervisor_error(format!(
+                    "{error}; supervisor output reader failed: {reader_error}"
+                )),
+                None => LibdenoError::Io(error),
+            };
+            #[cfg(not(windows))]
+            let error = LibdenoError::Io(error);
+            return Err(SupervisedSubprocessError::with_metadata(
+                error,
+                Some(CleanupStrength::DirectChild),
+                Some(crate::supervisor::SupervisorTransportStatus::Failed),
+            ));
+        }
+    };
+    let status = reap.status;
+    #[cfg(windows)]
+    if let Some(reader_error) = output_capture
+        .as_ref()
+        .and_then(|capture| capture.error.as_ref())
+    {
+        return Err(SupervisedSubprocessError::with_metadata(
+            supervisor_error(format!("supervisor output reader failed: {reader_error}")),
+            Some(CleanupStrength::DirectChild),
+            Some(crate::supervisor::SupervisorTransportStatus::Failed),
+        ));
+    }
+    #[cfg(windows)]
+    let transport_status = session.transport_status;
+    #[cfg(not(windows))]
+    let transport_status = session.transport_status;
+    #[cfg(windows)]
+    let terminal = if let Some(capture) = output_capture {
+        SupervisorTerminal {
+            stdout: capture.stdout,
+            stderr: capture.stderr,
+            truncated: capture.truncated,
+            ..session.terminal
+        }
+    } else {
+        session.terminal
+    };
+    #[cfg(not(windows))]
+    let terminal = session.terminal;
+    let output = match map_supervisor_terminal_with_cancellation(
+        terminal,
+        status,
+        &request,
+        reap.forced_kill,
+        session.cancellation_before_terminal,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(SupervisedSubprocessError::with_metadata(
+                error,
+                Some(CleanupStrength::DirectChild),
+                Some(transport_status),
+            ));
+        }
+    };
+    Ok(SupervisorRunResult {
+        output,
+        cleanup_strength: CleanupStrength::DirectChild,
+        transport_status,
+    })
+}
+
+#[cfg(feature = "execution-control")]
+fn parse_supervisor_endpoint(value: &str) -> Result<SocketAddr, LibdenoError> {
+    let endpoint = value
+        .parse::<SocketAddr>()
+        .map_err(|_| supervisor_error("malformed supervisor endpoint"))?;
+    if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+        return Err(supervisor_error("supervisor endpoint is not loopback"));
+    }
+    Ok(endpoint)
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_child_exit(
+    stream: &mut TcpStream,
+    state: &mut SupervisorChildSession,
+    outcome: crate::supervisor::SupervisorOutcome,
+    exit_code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+) -> Result<i32, LibdenoError> {
+    let terminal = SupervisorTerminal {
+        outcome,
+        exit_code,
+        stdout,
+        stderr,
+        truncated,
+    };
+    state
+        .mark_terminal(terminal.clone())
+        .map_err(LibdenoError::Io)?;
+    let request_id = state
+        .request_id()
+        .ok_or_else(|| supervisor_error("supervisor child has no request ID"))?;
+    let payload = encode_payload(&terminal).map_err(LibdenoError::Io)?;
+    let frame =
+        SupervisorFrame::new(FrameKind::Terminal, request_id, payload).map_err(LibdenoError::Io)?;
+    write_frame(stream, &frame).map_err(LibdenoError::Io)?;
+    Ok(match outcome {
+        crate::supervisor::SupervisorOutcome::Completed => exit_code.unwrap_or(1),
+        crate::supervisor::SupervisorOutcome::Failed
+        | crate::supervisor::SupervisorOutcome::Cancelled
+        | crate::supervisor::SupervisorOutcome::Deadline => 1,
+    })
+}
+
+#[cfg(feature = "execution-control")]
+fn start_supervisor_child_control(
+    stream: &TcpStream,
+    request_id: u64,
+    cancellation: SupervisorCancellation,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<std::thread::JoinHandle<std::io::Result<()>>, LibdenoError> {
+    let mut stream = stream.try_clone().map_err(LibdenoError::Io)?;
+    std::thread::Builder::new()
+        .name("libdeno-supervisor-child-control".to_string())
+        .spawn(move || {
+            stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    return Ok(());
+                }
+                match read_frame(
+                    &mut stream,
+                    FrameDirection::ParentToChild,
+                    Instant::now() + Duration::from_millis(100),
+                ) {
+                    Ok(frame) => {
+                        if frame.kind != FrameKind::Cancel || frame.request_id != request_id {
+                            cancellation.request(CancelReason::User);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "invalid supervisor control frame after START",
+                            ));
+                        }
+                        let reason: CancelReason = match decode_payload(&frame.payload) {
+                            Ok(reason) => reason,
+                            Err(error) => {
+                                cancellation.request(CancelReason::User);
+                                return Err(error);
+                            }
+                        };
+                        let previous = cancellation.reason();
+                        if cancellation.is_requested() && previous != reason {
+                            cancellation.request(CancelReason::User);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "conflicting supervisor cancellation reason",
+                            ));
+                        }
+                        cancellation.request(reason);
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) => {}
+                    Err(error) => {
+                        cancellation.request(CancelReason::User);
+                        return Err(error);
+                    }
+                }
+            }
+        })
+        .map_err(LibdenoError::Io)
+}
+
+#[cfg(feature = "execution-control")]
+fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<i32, LibdenoError> {
+    let mut stream = TcpStream::connect_timeout(&endpoint, SUPERVISOR_CONNECT_TIMEOUT)
+        .map_err(LibdenoError::Io)?;
+    stream
+        .set_write_timeout(Some(SUPERVISOR_FRAME_TIMEOUT))
+        .map_err(LibdenoError::Io)?;
+    let mut state = SupervisorChildSession::new();
+
+    let hello = SupervisorFrame::new(FrameKind::Hello, 0, token.as_bytes().to_vec())
+        .map_err(LibdenoError::Io)?;
+    write_frame(&mut stream, &hello).map_err(LibdenoError::Io)?;
+    let request_frame = read_frame(
+        &mut stream,
+        FrameDirection::ParentToChild,
+        Instant::now() + SUPERVISOR_FRAME_TIMEOUT,
+    )
+    .map_err(LibdenoError::Io)?;
+    state
+        .receive_parent_frame(&request_frame)
+        .map_err(LibdenoError::Io)?;
+    let request: SupervisorRequest =
+        decode_payload(&request_frame.payload).map_err(LibdenoError::Io)?;
+    let request_id = state
+        .request_id()
+        .ok_or_else(|| supervisor_error("supervisor REQUEST did not establish an ID"))?;
+    let accepted = SupervisorFrame::new(FrameKind::Accepted, request_id, Vec::new())
+        .map_err(LibdenoError::Io)?;
+    write_frame(&mut stream, &accepted).map_err(LibdenoError::Io)?;
+
+    let next = read_frame(
+        &mut stream,
+        FrameDirection::ParentToChild,
+        Instant::now() + SUPERVISOR_FRAME_TIMEOUT,
+    )
+    .map_err(LibdenoError::Io)?;
+    let event = state
+        .receive_parent_frame(&next)
+        .map_err(LibdenoError::Io)?;
+    if next.kind == FrameKind::Cancel {
+        let reason = state.cancel_reason().unwrap_or(CancelReason::User);
+        return supervisor_child_exit(
+            &mut stream,
+            &mut state,
+            match reason {
+                CancelReason::Deadline => crate::supervisor::SupervisorOutcome::Deadline,
+                CancelReason::User | CancelReason::Shutdown => {
+                    crate::supervisor::SupervisorOutcome::Cancelled
+                }
+            },
+            None,
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+    }
+    if event != Some(SupervisorFrameEvent::Started) || next.kind != FrameKind::Start {
+        return Err(supervisor_error(
+            "supervisor START barrier was not satisfied",
+        ));
+    }
+
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let cancellation = SupervisorCancellation::new(CancellationContext::new(), CancelReason::User);
+    let control =
+        start_supervisor_child_control(&stream, request_id, cancellation.clone(), stop_rx)?;
+    // STARTED is sent only after the control reader exists. No runtime call is
+    // made before this frame is successfully written.
+    let started = SupervisorFrame::new(FrameKind::Started, request_id, Vec::new())
+        .map_err(LibdenoError::Io)?;
+    if let Err(error) = write_frame(&mut stream, &started) {
+        let _ = stop_tx.send(());
+        let _ = control.join();
+        return Err(LibdenoError::Io(error));
+    }
+
+    // The supervisor environment is deliberately stripped only after the
+    // authenticated control setup and before the first runtime entry. The
+    // legacy LIBDENO_SPAWNED_IPC marker is not touched.
+    let max_capture_bytes = supervisor_capture_limit(
+        request.capture_stdout,
+        request.capture_stderr,
+        request.max_capture_bytes,
+    )?;
+    let capture_in_child = !cfg!(windows) || (!request.capture_stdout && !request.capture_stderr);
+    let options = LibdenoOptions {
+        permissions: request.permissions,
+        allow_all_permissions: request.allow_all_permissions,
+        prompt: request.prompt,
+        args: request.args,
+        cwd: Some(request.cwd),
+        max_heap_bytes: request.max_heap_bytes,
+        execution_deadline: request.execution_deadline,
+        capture_stdout: request.capture_stdout && capture_in_child,
+        capture_stderr: request.capture_stderr && capture_in_child,
+        max_capture_bytes: if capture_in_child {
+            max_capture_bytes
+        } else {
+            None
+        },
+        features: request.features,
+    };
+    let runtime_result = {
+        let _user_execution = ExecutionTiming::disabled().span(Phase::UserExecution);
+        crate::run_with_output_observed_cancellable(
+            &request.entry,
+            &options,
+            ExecutionTiming::disabled(),
+            Some(cancellation.context()),
+        )
+    };
+    let _ = stop_tx.send(());
+    let control_result = control.join();
+
+    let reason = cancellation.reason();
+    let (outcome, output) = match (reason, runtime_result) {
+        (CancelReason::Deadline, _) => (crate::supervisor::SupervisorOutcome::Deadline, None),
+        (CancelReason::User | CancelReason::Shutdown, _) if cancellation.is_requested() => {
+            (crate::supervisor::SupervisorOutcome::Cancelled, None)
+        }
+        (_, Ok(output)) => (
+            crate::supervisor::SupervisorOutcome::Completed,
+            Some(output),
+        ),
+        (_, Err(LibdenoError::Timeout(_))) => {
+            (crate::supervisor::SupervisorOutcome::Deadline, None)
+        }
+        (_, Err(_)) => (crate::supervisor::SupervisorOutcome::Failed, None),
+    };
+    if control_result.is_err() && output.is_some() {
+        // A control EOF after user code completed is secondary to the runtime
+        // result; the parent records transport failure independently.
+    }
+    let (exit_code, stdout, stderr, truncated) = match output {
+        Some(output) => (
+            Some(output.exit_code),
+            output.stdout,
+            output.stderr,
+            output.capture_truncated,
+        ),
+        None => (None, Vec::new(), Vec::new(), false),
+    };
+    supervisor_child_exit(
+        &mut stream,
+        &mut state,
+        outcome,
+        exit_code,
+        stdout,
+        stderr,
+        truncated,
+    )
+}
+
+/// Services a child created by the distinct supervisor protocol. It is public
+/// only so a tiny host binary can call it before its normal argument handling.
+#[cfg(feature = "execution-control")]
+#[doc(hidden)]
+pub fn maybe_handle_supervisor_mode() -> bool {
+    let Some(marker) = std::env::var_os(SUPERVISOR_MODE_ENV) else {
+        return false;
+    };
+    if marker != "1" {
+        eprintln!("libdeno: {SUPERVISOR_MODE_ENV} is malformed; refusing supervisor mode");
+        std::env::remove_var(SUPERVISOR_MODE_ENV);
+        std::env::remove_var(SUPERVISOR_ENDPOINT_ENV);
+        std::env::remove_var(SUPERVISOR_TOKEN_ENV);
+        std::process::exit(1);
+    }
+
+    let endpoint_value = std::env::var(SUPERVISOR_ENDPOINT_ENV).ok();
+    let token_value = std::env::var(SUPERVISOR_TOKEN_ENV).ok();
+    std::env::remove_var(SUPERVISOR_MODE_ENV);
+    std::env::remove_var(SUPERVISOR_ENDPOINT_ENV);
+    std::env::remove_var(SUPERVISOR_TOKEN_ENV);
+
+    let endpoint = match endpoint_value {
+        Some(value) => match parse_supervisor_endpoint(&value) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                eprintln!("libdeno: supervisor endpoint rejected: {error}");
+                std::process::exit(1);
+            }
+        },
+        None => {
+            eprintln!("libdeno: supervisor endpoint is missing; refusing supervisor mode");
+            std::process::exit(1);
+        }
+    };
+    let token = match token_value {
+        Some(value) => match SupervisorToken::from_hex(&value) {
+            Ok(token) => token,
+            Err(_) => {
+                eprintln!("libdeno: supervisor token is malformed; refusing supervisor mode");
+                std::process::exit(1);
+            }
+        },
+        None => {
+            eprintln!("libdeno: supervisor token is missing; refusing supervisor mode");
+            std::process::exit(1);
+        }
+    };
+
+    match run_supervisor_child(endpoint, token) {
+        Ok(code) => std::process::exit(code),
+        Err(error) => {
+            eprintln!("libdeno supervisor child failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::active_handshake_writers;
+    use super::active_subprocess_output_readers;
     use super::drain_pipe;
     use super::reserve_handshake_writer;
+    use super::reserve_subprocess_output_reader;
     use super::token_matches;
     use super::validate_child_request_size;
     use super::write_child_request;
+    use super::ExecutionTiming;
     use super::LibdenoError;
+    use super::SubprocessOutputReader;
+    use super::SubprocessOutputReaderMessage;
+    use super::SubprocessOutputReaders;
     use super::MAX_ACTIVE_HANDSHAKE_WRITERS;
     use super::MAX_CHILD_REQUEST_BYTES;
+    #[cfg(feature = "execution-control")]
+    use super::{
+        drive_supervisor_session, effective_supervisor_deadline, encode_payload, supervisor_request,
+    };
+    #[cfg(feature = "execution-control")]
+    use super::{
+        map_supervisor_terminal, validate_supervisor_terminal, SupervisorRequest,
+        SupervisorTerminal,
+    };
+    #[cfg(feature = "execution-control")]
+    use super::{read_supervisor_terminal, SupervisorCancellation, SupervisorParentSession};
+    #[cfg(feature = "execution-control")]
+    use crate::supervisor::{
+        read_frame, write_frame, CancelReason, FrameDirection, FrameKind, SupervisorFrame,
+        SupervisorOutcome, SupervisorToken, SupervisorTransportStatus,
+        SUPERVISOR_CAPTURE_BYTES_PER_STREAM, SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM,
+    };
+    #[cfg(feature = "execution-control")]
+    use crate::LibdenoOptions;
+    #[cfg(feature = "execution-control")]
+    use std::time::{Duration, Instant};
 
     static HANDSHAKE_WRITER_BUDGET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SUBPROCESS_OUTPUT_READER_BUDGET_TEST_LOCK: std::sync::Mutex<()> =
+        std::sync::Mutex::new(());
 
     #[test]
     fn child_request_size_accepts_small_payload() {
@@ -636,6 +2543,83 @@ mod tests {
     }
 
     #[test]
+    fn subprocess_output_collection_preserves_partial_bytes_and_reader_errors() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(SubprocessOutputReaderMessage::Data(b"partial".to_vec()))
+            .unwrap();
+        sender
+            .send(SubprocessOutputReaderMessage::Failed(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "synthetic pipe failure",
+            )))
+            .unwrap();
+        drop(sender);
+        let reader = SubprocessOutputReader {
+            receiver,
+            overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let capture = SubprocessOutputReaders {
+            stdout: Some(reader),
+            stderr: None,
+        }
+        .collect();
+        assert_eq!(capture.stdout, b"partial");
+        assert!(!capture.truncated);
+        let error = capture.error.unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("synthetic pipe failure"));
+    }
+
+    #[test]
+    fn subprocess_output_reader_panics_are_reported() {
+        let _lock = SUBPROCESS_OUTPUT_READER_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        struct PanicReader;
+
+        impl std::io::Read for PanicReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                panic!("synthetic reader panic");
+            }
+        }
+
+        let reader = SubprocessOutputReader::spawn(PanicReader, usize::MAX).unwrap();
+        let capture = SubprocessOutputReaders {
+            stdout: Some(reader),
+            stderr: None,
+        }
+        .collect();
+        let error = capture.error.unwrap();
+        assert!(error.to_string().contains("reader panicked"));
+    }
+
+    #[test]
+    fn subprocess_output_reader_budget_is_finite_and_releases_exactly() {
+        let _lock = SUBPROCESS_OUTPUT_READER_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let baseline = active_subprocess_output_readers();
+        let available = super::MAX_ACTIVE_SUBPROCESS_OUTPUT_READERS - baseline;
+        let mut reservations = Vec::with_capacity(available);
+        for _ in 0..available {
+            reservations.push(reserve_subprocess_output_reader().unwrap());
+        }
+        assert_eq!(
+            active_subprocess_output_readers(),
+            super::MAX_ACTIVE_SUBPROCESS_OUTPUT_READERS
+        );
+        let error = match reserve_subprocess_output_reader() {
+            Ok(_) => panic!("subprocess output reader budget must reject a new reservation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("reader/pipe resource budget"));
+        drop(reservations);
+        assert_eq!(active_subprocess_output_readers(), baseline);
+    }
+
+    #[test]
     fn token_matches_compares_tokens() {
         let token = "0123456789abcdef0123456789abcdef";
         assert!(token_matches(token, token));
@@ -647,6 +2631,402 @@ mod tests {
         // Empty tokens fail closed: a legitimate token is never empty.
         assert!(!token_matches("", ""));
         assert!(!token_matches(token, ""));
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn supervisor_deadline_uses_the_earlier_absolute_bound() {
+        let started = std::time::Instant::now();
+        let parent = started + std::time::Duration::from_secs(2);
+        let execution = std::time::Duration::from_millis(20);
+        let effective = effective_supervisor_deadline(started, Some(parent), Some(execution))
+            .unwrap()
+            .expect("one deadline must remain");
+        assert_eq!(effective, started + execution);
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn overflowing_supervisor_deadline_is_rejected() {
+        assert!(effective_supervisor_deadline(Instant::now(), None, Some(Duration::MAX)).is_err());
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn supervisor_capture_boundaries_are_exact_and_bounded() {
+        let mut options = LibdenoOptions {
+            capture_stdout: true,
+            ..Default::default()
+        };
+        let request = supervisor_request(
+            std::path::Path::new("entry.js"),
+            &options,
+            std::path::PathBuf::from("."),
+        )
+        .unwrap();
+        assert_eq!(
+            request.max_capture_bytes,
+            Some(SUPERVISOR_CAPTURE_BYTES_PER_STREAM)
+        );
+
+        for value in [0, 17, SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM] {
+            options.max_capture_bytes = Some(value);
+            let request = supervisor_request(
+                std::path::Path::new("entry.js"),
+                &options,
+                std::path::PathBuf::from("."),
+            )
+            .unwrap();
+            assert_eq!(request.max_capture_bytes, Some(value));
+        }
+
+        options.max_capture_bytes = Some(SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM + 1);
+        let error = supervisor_request(
+            std::path::Path::new("entry.js"),
+            &options,
+            std::path::PathBuf::from("."),
+        )
+        .unwrap_err();
+        assert!(matches!(error, LibdenoError::Configuration(_)));
+
+        options.capture_stdout = false;
+        options.max_capture_bytes = Some(usize::MAX);
+        assert_eq!(
+            supervisor_request(
+                std::path::Path::new("entry.js"),
+                &options,
+                std::path::PathBuf::from("."),
+            )
+            .unwrap()
+            .max_capture_bytes,
+            None
+        );
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn supervisor_terminal_validation_rejects_incoherent_result_and_capture() {
+        let request = SupervisorRequest {
+            entry: "entry.js".into(),
+            cwd: ".".into(),
+            permissions: Vec::new(),
+            allow_all_permissions: true,
+            prompt: false,
+            args: Vec::new(),
+            features: None,
+            max_heap_bytes: None,
+            execution_deadline: None,
+            capture_stdout: true,
+            capture_stderr: false,
+            max_capture_bytes: Some(4),
+        };
+        assert!(validate_supervisor_terminal(
+            &SupervisorTerminal {
+                outcome: SupervisorOutcome::Completed,
+                exit_code: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                truncated: false,
+            },
+            &request,
+        )
+        .is_err());
+        assert!(validate_supervisor_terminal(
+            &SupervisorTerminal {
+                outcome: SupervisorOutcome::Cancelled,
+                exit_code: Some(1),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                truncated: false,
+            },
+            &request,
+        )
+        .is_err());
+        assert!(validate_supervisor_terminal(
+            &SupervisorTerminal {
+                outcome: SupervisorOutcome::Completed,
+                exit_code: Some(0),
+                stdout: vec![0; 5],
+                stderr: Vec::new(),
+                truncated: false,
+            },
+            &request,
+        )
+        .is_err());
+        let error = validate_supervisor_terminal(
+            &SupervisorTerminal {
+                outcome: SupervisorOutcome::Completed,
+                exit_code: Some(0),
+                stdout: Vec::new(),
+                stderr: vec![1],
+                truncated: false,
+            },
+            &request,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unrequested output"));
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn forced_child_cleanup_accepts_valid_terminal_but_natural_mismatch_fails() {
+        let request = SupervisorRequest {
+            entry: "entry.js".into(),
+            cwd: ".".into(),
+            permissions: Vec::new(),
+            allow_all_permissions: true,
+            prompt: false,
+            args: Vec::new(),
+            features: None,
+            max_heap_bytes: None,
+            execution_deadline: None,
+            capture_stdout: false,
+            capture_stderr: false,
+            max_capture_bytes: None,
+        };
+        let status = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit", "0"])
+                .status()
+                .unwrap()
+        } else {
+            std::process::Command::new("sh")
+                .args(["-c", "exit 0"])
+                .status()
+                .unwrap()
+        };
+        let completed = SupervisorTerminal {
+            outcome: SupervisorOutcome::Completed,
+            exit_code: Some(3),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            truncated: false,
+        };
+        assert!(map_supervisor_terminal(completed.clone(), status, &request, false).is_err());
+        let output = map_supervisor_terminal(completed, status, &request, true).unwrap();
+        assert_eq!(output.exit_code, 3);
+
+        for outcome in [
+            SupervisorOutcome::Cancelled,
+            SupervisorOutcome::Deadline,
+            SupervisorOutcome::Failed,
+        ] {
+            let terminal = SupervisorTerminal {
+                outcome,
+                exit_code: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                truncated: false,
+            };
+            assert!(
+                map_supervisor_terminal(terminal.clone(), status, &request, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("disagrees")
+            );
+            assert!(!map_supervisor_terminal(terminal, status, &request, true)
+                .unwrap_err()
+                .to_string()
+                .contains("disagrees"));
+        }
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn cancellation_before_terminal_is_reconciled_before_completed_mapping() {
+        let request = SupervisorRequest {
+            entry: "entry.js".into(),
+            cwd: ".".into(),
+            permissions: Vec::new(),
+            allow_all_permissions: true,
+            prompt: false,
+            args: Vec::new(),
+            features: None,
+            max_heap_bytes: None,
+            execution_deadline: None,
+            capture_stdout: false,
+            capture_stderr: false,
+            max_capture_bytes: None,
+        };
+        let status = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit", "0"])
+                .status()
+                .unwrap()
+        } else {
+            std::process::Command::new("sh")
+                .args(["-c", "exit 0"])
+                .status()
+                .unwrap()
+        };
+        let terminal = SupervisorTerminal {
+            outcome: SupervisorOutcome::Completed,
+            exit_code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            truncated: false,
+        };
+        for reason in [
+            CancelReason::Deadline,
+            CancelReason::User,
+            CancelReason::Shutdown,
+        ] {
+            let error = super::map_supervisor_terminal_with_cancellation(
+                terminal.clone(),
+                status,
+                &request,
+                false,
+                Some(reason),
+            )
+            .unwrap_err();
+            assert!(matches!(error, LibdenoError::Timeout(_)));
+        }
+        let output = super::map_supervisor_terminal_with_cancellation(
+            terminal, status, &request, false, None,
+        )
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn post_start_reader_does_not_turn_cancellation_into_interrupted() {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let token =
+            crate::supervisor::SupervisorToken::from_hex("00112233445566778899aabbccddeeff")
+                .unwrap();
+        let mut parent = SupervisorParentSession::new(1);
+        parent
+            .accept_hello(
+                &SupervisorFrame::new(FrameKind::Hello, 0, token.as_bytes().to_vec()).unwrap(),
+                &token,
+            )
+            .unwrap();
+        parent.send_request().unwrap();
+        parent
+            .receive_child_frame(&SupervisorFrame::new(FrameKind::Accepted, 1, Vec::new()).unwrap())
+            .unwrap();
+        parent.send_start().unwrap();
+        let state = Arc::new(Mutex::new(parent));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut frame = Vec::new();
+            frame.extend_from_slice(b"LDSV");
+            frame.push(1);
+            frame.push(6);
+            frame.extend_from_slice(&1u64.to_be_bytes());
+            frame.extend_from_slice(&0u32.to_be_bytes());
+            stream.write_all(&frame[..1]).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = stream.write_all(&frame[1..]);
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        let cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::User,
+        );
+        cancellation.request(CancelReason::User);
+        let phase_deadline = Instant::now() + Duration::from_millis(25);
+        let started = Instant::now();
+        let error = read_supervisor_terminal(
+            &mut stream,
+            &state,
+            None,
+            phase_deadline,
+            &cancellation,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        peer.join().unwrap();
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn deadline_cancel_accepts_terminal_after_delayed_started() {
+        use std::net::{TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        let token = SupervisorToken::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let token_bytes = token.as_bytes().to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            let hello = SupervisorFrame::new(FrameKind::Hello, 0, token_bytes).unwrap();
+            write_frame(&mut stream, &hello).unwrap();
+            let request = read_frame(
+                &mut stream,
+                FrameDirection::ParentToChild,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(request.kind, FrameKind::Request);
+            let accepted =
+                SupervisorFrame::new(FrameKind::Accepted, request.request_id, Vec::new()).unwrap();
+            write_frame(&mut stream, &accepted).unwrap();
+            let start = read_frame(
+                &mut stream,
+                FrameDirection::ParentToChild,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(start.kind, FrameKind::Start);
+            std::thread::sleep(Duration::from_millis(800));
+            let started =
+                SupervisorFrame::new(FrameKind::Started, request.request_id, Vec::new()).unwrap();
+            write_frame(&mut stream, &started).unwrap();
+            let cancel = read_frame(
+                &mut stream,
+                FrameDirection::ParentToChild,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(cancel.kind, FrameKind::Cancel);
+            let terminal = SupervisorTerminal {
+                outcome: SupervisorOutcome::Deadline,
+                exit_code: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                truncated: false,
+            };
+            let terminal = SupervisorFrame::new(
+                FrameKind::Terminal,
+                request.request_id,
+                encode_payload(&terminal).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut stream, &terminal).unwrap();
+        });
+
+        let result = drive_supervisor_session(
+            listener,
+            Vec::new(),
+            token,
+            SupervisorCancellation::new(
+                crate::limits::CancellationContext::new(),
+                CancelReason::Deadline,
+            ),
+            Some(Instant::now() + Duration::from_millis(500)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            result.transport_status,
+            SupervisorTransportStatus::Clean,
+            "cooperative TERMINAL must finish the worker cleanly"
+        );
+        assert_eq!(result.terminal.outcome, SupervisorOutcome::Deadline);
+        peer.join().unwrap();
     }
 
     #[test]
@@ -688,7 +3068,12 @@ mod tests {
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        write_child_request(&mut child, b"normal completion".to_vec()).unwrap();
+        write_child_request(
+            &mut child,
+            b"normal completion".to_vec(),
+            ExecutionTiming::disabled(),
+        )
+        .unwrap();
         assert!(child.wait().unwrap().success());
         for _ in 0..100 {
             if active_handshake_writers() == baseline {
@@ -712,7 +3097,7 @@ mod tests {
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
-        let _ = write_child_request(&mut child, vec![b'x'; 4096]);
+        let _ = write_child_request(&mut child, vec![b'x'; 4096], ExecutionTiming::disabled());
         let _ = child.wait();
         for _ in 0..100 {
             if active_handshake_writers() == baseline {

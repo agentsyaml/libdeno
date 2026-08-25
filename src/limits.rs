@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use deno_core::v8;
 use deno_core::v8::IsolateHandle;
@@ -17,6 +17,170 @@ use deno_runtime::code_cache::CodeCache;
 use deno_runtime::code_cache::CodeCacheType;
 use deno_runtime::deno_node::ops::ipc::ChildIpcSerialization;
 use deno_runtime::worker::MainWorker;
+
+use crate::timing::{ExecutionTiming, Phase};
+
+#[cfg(feature = "execution-control")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancellationReason {
+    User,
+    Deadline,
+    Shutdown,
+}
+
+/// Crate-private best-effort cancellation bridge for experimental executor
+/// submissions. A request can arrive before the isolate exists, so the hook
+/// stores the flag and registers the isolate handle once bootstrap reaches the
+/// execution boundary.
+#[derive(Clone)]
+pub(crate) struct CancellationContext {
+    requested: Arc<AtomicBool>,
+    isolate: Arc<Mutex<Option<IsolateHandle>>>,
+    notify: Arc<tokio::sync::Notify>,
+    #[cfg(feature = "execution-control")]
+    reason: Arc<Mutex<Option<CancellationReason>>>,
+}
+
+impl CancellationContext {
+    #[cfg(feature = "execution-control")]
+    pub(crate) fn new() -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+            isolate: Arc::new(Mutex::new(None)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            reason: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(feature = "execution-control")]
+    pub(crate) fn request_with_reason(&self, reason: CancellationReason) {
+        self.reason
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_or_insert(reason);
+        self.requested.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+        let isolate = self
+            .isolate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(isolate) = isolate {
+            isolate.terminate_execution();
+        }
+    }
+
+    #[cfg(feature = "execution-control")]
+    pub(crate) fn reason(&self) -> Option<CancellationReason> {
+        *self
+            .reason
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    async fn wait_requested(&self) {
+        loop {
+            if self.is_requested() {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.is_requested() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn register(&self, isolate: IsolateHandle) {
+        let should_terminate = self.is_requested();
+        self.isolate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(isolate.clone());
+        if should_terminate {
+            isolate.terminate_execution();
+        }
+    }
+
+    fn clear(&self) {
+        self.isolate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+}
+
+#[cfg(feature = "execution-control")]
+/// Requests deadline cancellation at one absolute instant while in-process
+/// executor bootstrap is still running. The worker-side deadline timer starts
+/// later, at the V8 boundary; this guard closes that gap without changing the
+/// legacy duration-based entry points.
+pub(crate) struct AbsoluteDeadlineGuard {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "execution-control")]
+impl AbsoluteDeadlineGuard {
+    pub(crate) fn new(
+        deadline: Option<Instant>,
+        cancellation: Option<CancellationContext>,
+    ) -> Self {
+        let Some(deadline) = deadline else {
+            return Self {
+                stop: None,
+                join: None,
+            };
+        };
+        let Some(cancellation) = cancellation else {
+            return Self {
+                stop: None,
+                join: None,
+            };
+        };
+        if deadline <= Instant::now() {
+            cancellation.request_with_reason(CancellationReason::Deadline);
+            return Self {
+                stop: None,
+                join: None,
+            };
+        }
+        let (stop, receiver) = std::sync::mpsc::channel();
+        let cancellation_for_thread = cancellation.clone();
+        let join = std::thread::Builder::new()
+            .name("libdeno-submission-deadline".to_string())
+            .spawn(move || {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if receiver.recv_timeout(remaining).is_err() {
+                    cancellation_for_thread.request_with_reason(CancellationReason::Deadline);
+                }
+            })
+            .ok();
+        if join.is_none() {
+            cancellation.request_with_reason(CancellationReason::Deadline);
+        }
+        Self {
+            stop: Some(stop),
+            join,
+        }
+    }
+}
+
+#[cfg(feature = "execution-control")]
+impl Drop for AbsoluteDeadlineGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
 
 /// V8's own resource-constraint tests use an 8 MiB old generation as the
 /// smallest deliberately constrained isolate. Rejecting smaller values keeps
@@ -318,44 +482,143 @@ pub(crate) fn in_process_code_cache() -> Arc<dyn CodeCache> {
 /// only when the syscall itself returns — the run may exceed the deadline by
 /// the syscall's duration. This is a V8/runtime boundary, not fixable in the
 /// embedder.
-pub(crate) async fn run_with_deadline<F, T, E>(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionTermination {
+    Deadline(Duration),
+    Cancelled,
+}
+
+/// Rejects a finite deadline that cannot be represented by the host clock.
+/// Treating the same value as "no deadline" on one backend and "immediate
+/// timeout" on another is worse than rejecting the invalid configuration.
+pub(crate) fn validate_execution_deadline(
+    deadline: Option<Duration>,
+) -> Result<(), crate::LibdenoError> {
+    if deadline.is_some_and(|duration| Instant::now().checked_add(duration).is_none()) {
+        return Err(crate::LibdenoError::Configuration(
+            "execution deadline is too large for the host clock".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_with_deadline_cancellable<F, T, E>(
     fut: F,
     deadline: Option<Duration>,
     isolate_handle: IsolateHandle,
-) -> Result<Result<T, E>, Duration>
+    cancellation: Option<CancellationContext>,
+) -> Result<Result<T, E>, ExecutionTermination>
 where
     F: Future<Output = Result<T, E>>,
 {
     const GRACE: Duration = Duration::from_secs(2);
 
-    let Some(deadline) = deadline else {
+    if deadline.is_none() && cancellation.is_none() {
         return Ok(fut.await);
-    };
+    }
+
+    if let Some(cancellation) = &cancellation {
+        cancellation.register(isolate_handle.clone());
+    }
 
     // Signal channel: if the run finishes first we send on it so the waiter
     // exits without terminating (harmless either way — terminate_execution
     // returns false on a dropped isolate — but this frees the thread at once
     // instead of leaving it asleep for the rest of the deadline).
-    let fired = Arc::new(AtomicBool::new(false));
+    let deadline_fired = Arc::new(AtomicBool::new(false));
+    let cancellation_fired = Arc::new(AtomicBool::new(false));
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let terminator = {
-        let fired = fired.clone();
-        std::thread::spawn(move || match done_rx.recv_timeout(deadline) {
-            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                fired.store(true, Ordering::SeqCst);
+        let deadline_fired = deadline_fired.clone();
+        let cancellation_fired = cancellation_fired.clone();
+        let cancellation = cancellation.clone();
+        let deadline_at = deadline.and_then(|duration| Instant::now().checked_add(duration));
+        std::thread::spawn(move || loop {
+            if cancellation
+                .as_ref()
+                .is_some_and(CancellationContext::is_requested)
+            {
+                cancellation_fired.store(true, Ordering::SeqCst);
                 isolate_handle.terminate_execution();
+                break;
+            }
+            let wait = deadline_at
+                .map(|deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10))
+                })
+                .unwrap_or_else(|| Duration::from_millis(10));
+            match done_rx.recv_timeout(wait) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if deadline_at.is_some_and(|deadline| deadline <= Instant::now()) {
+                        deadline_fired.store(true, Ordering::SeqCst);
+                        isolate_handle.terminate_execution();
+                        break;
+                    }
+                }
             }
         })
     };
 
-    let result = match tokio::time::timeout(deadline.saturating_add(GRACE), fut).await {
-        Ok(result) => result,
-        Err(_) => return Err(deadline),
-    };
+    tokio::pin!(fut);
+    let mut result = None;
+    let mut termination = None;
+    match (deadline, cancellation.as_ref()) {
+        (Some(deadline), Some(cancellation)) => {
+            tokio::select! {
+                completed = tokio::time::timeout(deadline.saturating_add(GRACE), &mut fut) => {
+                    match completed {
+                        Ok(completed) => result = Some(completed),
+                        Err(_) => termination = Some(ExecutionTermination::Deadline(deadline)),
+                    }
+                }
+                _ = cancellation.wait_requested() => {
+                    // Cancellation-only idle work gets a bounded best-effort
+                    // grace after the request, not from submission start.
+                    match tokio::time::timeout(GRACE, &mut fut).await {
+                        Ok(completed) => result = Some(completed),
+                        Err(_) => termination = Some(ExecutionTermination::Cancelled),
+                    }
+                }
+            }
+        }
+        (Some(deadline), None) => {
+            match tokio::time::timeout(deadline.saturating_add(GRACE), &mut fut).await {
+                Ok(completed) => result = Some(completed),
+                Err(_) => termination = Some(ExecutionTermination::Deadline(deadline)),
+            }
+        }
+        (None, Some(cancellation)) => {
+            tokio::select! {
+                completed = &mut fut => result = Some(completed),
+                _ = cancellation.wait_requested() => {
+                    // Cancellation-only must also be able to leave an idle
+                    // event loop parked on a far-future timer. This is a
+                    // bounded best-effort grace, not a claim that blocking
+                    // native/syscall/broker work is interruptible.
+                    match tokio::time::timeout(GRACE, &mut fut).await {
+                        Ok(completed) => result = Some(completed),
+                        Err(_) => termination = Some(ExecutionTermination::Cancelled),
+                    }
+                }
+            }
+        }
+        (None, None) => unreachable!("unbounded execution returned before fast path"),
+    }
 
     let _ = done_tx.send(());
     let _ = terminator.join();
+
+    if let Some(cancellation) = &cancellation {
+        cancellation.clear();
+    }
+
+    if let Some(termination) = termination {
+        return Err(termination);
+    }
+    let result = result.expect("execution must either complete or terminate");
 
     // `result` alone cannot tell whether the future unwound because the script
     // finished or because the deadline interrupted it; the flag set by the
@@ -366,8 +629,12 @@ where
     // instant before the completed result was observed. Safety-biased (a false
     // timeout is observable by the caller; a missed deadline is not) and
     // accepted.
-    if fired.load(Ordering::SeqCst) {
-        Err(deadline)
+    if cancellation_fired.load(Ordering::SeqCst) {
+        Err(ExecutionTermination::Cancelled)
+    } else if deadline_fired.load(Ordering::SeqCst) {
+        Err(ExecutionTermination::Deadline(
+            deadline.unwrap_or(Duration::ZERO),
+        ))
     } else {
         Ok(result)
     }
@@ -375,12 +642,15 @@ where
 
 /// Runs the standard worker lifecycle (main module, event loop, load/unload/
 /// exit events) under an optional execution deadline.
-pub(crate) async fn run_worker(
+pub(crate) async fn run_worker_cancellable(
     worker: &mut MainWorker,
     main_module: &ModuleSpecifier,
     execution_deadline: Option<Duration>,
     isolate_handle: IsolateHandle,
-) -> Result<Result<(), crate::LibdenoError>, Duration> {
+    timing: ExecutionTiming,
+    cancellation: Option<CancellationContext>,
+) -> Result<Result<(), crate::LibdenoError>, ExecutionTermination> {
+    let _user_execution = timing.span(Phase::UserExecution);
     let run = async {
         worker.execute_main_module(main_module).await?;
         worker.run_event_loop(false).await?;
@@ -392,7 +662,7 @@ pub(crate) async fn run_worker(
         worker.dispatch_process_exit_event()?;
         Ok::<(), crate::LibdenoError>(())
     };
-    run_with_deadline(run, execution_deadline, isolate_handle).await
+    run_with_deadline_cancellable(run, execution_deadline, isolate_handle, cancellation).await
 }
 
 /// Environment marker pairing an IPC child with its spawner: set on the
@@ -499,6 +769,25 @@ mod tests {
         assert!(validate_max_heap_bytes(Some(usize::MAX)).is_err());
         assert!(validate_max_heap_bytes(Some(MIN_V8_OLD_GENERATION_BYTES)).is_ok());
         assert!(validate_max_heap_bytes(None).is_ok());
+    }
+
+    #[test]
+    fn overflowing_execution_deadline_is_rejected() {
+        assert!(validate_execution_deadline(Some(Duration::MAX)).is_err());
+        assert!(validate_execution_deadline(Some(Duration::from_secs(1))).is_ok());
+        assert!(validate_execution_deadline(None).is_ok());
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn absolute_deadline_guard_requests_an_expired_deadline() {
+        let cancellation = CancellationContext::new();
+        let _guard = AbsoluteDeadlineGuard::new(
+            Some(Instant::now() - Duration::from_millis(1)),
+            Some(cancellation.clone()),
+        );
+        assert!(cancellation.is_requested());
+        assert_eq!(cancellation.reason(), Some(CancellationReason::Deadline));
     }
 
     #[test]

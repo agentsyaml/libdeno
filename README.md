@@ -46,7 +46,7 @@ let exit_code = run("app.js", &options).unwrap();
 
 ### Reuse the resolver stack: `LibdenoRuntime` + `run_with`
 
-`run()` rebuilds the resolver stack (workspace / resolver / npm-installer factories, graph resolver) on every call. For long-lived hosts running many scripts in the same project, build the stack once and reuse it — it is rebuilt automatically when the config chain changes. The fingerprint includes the project config chain, `deno.lock`, root `node_modules`, the effective registry, and the resolver-supported global npmrc (`$HOME/.npmrc`) by canonical path and content. `deno_resolver` 0.88 does not honor `NPM_CONFIG_USERCONFIG`. Call `runtime.refresh()` after changes below that chain, such as nested `node_modules`; refresh is an explicit bounded invalidation, not a recursive watcher:
+`run()` rebuilds the resolver stack (workspace / resolver / npm-installer factories, graph resolver) on every call. For long-lived hosts running many scripts in the same project, build the stack once and reuse it — it is rebuilt automatically when the config chain changes. The fingerprint includes the project config chain, `deno.lock`, root `node_modules`, the effective npm registry, `JSR_URL`, and the resolver-supported global npmrc (`$HOME/.npmrc`) by canonical path and content. `deno_resolver` 0.88 does not honor `NPM_CONFIG_USERCONFIG`. Call `runtime.refresh()` after changes below that chain, such as nested `node_modules`; refresh is an explicit bounded invalidation, not a recursive watcher:
 
 ```rust
 use libdeno::{LibdenoRuntime, LibdenoOptions, run_with};
@@ -88,7 +88,7 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `run(entry, &options) -> Result<i32, LibdenoError>` | Runs the entry to completion and returns the exit code the script requested. Each call builds its own current-thread runtime and worker; ordinary runs execute fully in parallel — own thread, isolate, and graph, sharing nothing mutable (the process-global analysis / npm-snapshot / on-disk caches are safe shared state; the process cwd is never switched). Safe to call from inside a tokio runtime — the run executes on a fresh thread there (see below). |
 | `run_with_output(entry, &options) -> Result<RunOutput, LibdenoError>` | Like `run`, but also captures the script's stdout/stderr into `RunOutput` when `capture_stdout` / `capture_stderr` are set. |
 | `run_async(entry, &options) -> Result<i32, LibdenoError>` | Async entry point: runs the script on the **caller's** tokio runtime — no spawned thread. Must be awaited inside a tokio context; the future is not `Send` and a second `run_async` on one thread is rejected with `LibdenoError::Configuration` (interleaved runs would abort the process). Await one at a time — use `run` for parallel runs. |
-| `LibdenoRuntime::new(cwd)` | Builds the resolver stack for a project directory once (async). Reused by `run_with`; rebuilt automatically when the config chain (deno.json / deno.jsonc / import_map.json / package.json / `.npmrc` / `deno.lock` / `node_modules`) or effective npm registry / `$HOME/.npmrc` changes. |
+| `LibdenoRuntime::new(cwd)` | Builds the resolver stack for a project directory once (async). Reused by `run_with`; rebuilt automatically when the config chain (deno.json / deno.jsonc / import_map.json / package.json / `.npmrc` / `deno.lock` / `node_modules`) or effective npm registry / `JSR_URL` / `$HOME/.npmrc` changes. |
 | `LibdenoRuntime::refresh()` | Forces the next reusable run to rebuild its resolver stack, for example after a nested `node_modules` change not visible in the discovered fingerprint. |
 | `run_with(&runtime, entry, &options) -> Result<i32, LibdenoError>` | Like `run`, but reuses `runtime`'s resolver stack. Semantics identical to `run` (parallel ordinary runs, tokio re-entry handling, exit codes, deadlines); relative paths resolve against the runtime's cwd and permission-bound components are rebuilt per call. Capture flags and a mismatched `options.cwd` are rejected with `LibdenoError::Configuration`. |
 | `libdeno::runtime::run_with_output(&runtime, entry, &options) -> Result<RunOutput, LibdenoError>` | Like `run_with`, but also captures the script's stdout/stderr into `RunOutput` when `capture_stdout` / `capture_stderr` are set — the long-lived-host equivalent of `run_with_output` (which rebuilds the resolver stack every call). Same semantics as `run_with` otherwise. |
@@ -98,7 +98,7 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `LibdenoOptions.permissions: Vec<String>` | `--allow-*` capability strings. An empty list is a construction error (`LibdenoError::Configuration`) — since v0.2.0 it grants nothing; pass capability flags, set `allow_all_permissions`, or set `prompt: true`. |
 | `LibdenoOptions.allow_all_permissions: bool` | Grants every capability (`-A` equivalent). Required to run scripts with an empty `permissions` list. Use only for code you trust (see SECURITY.md). |
 | `LibdenoOptions.capture_stdout` / `capture_stderr: bool` | Redirect the script's stdout/stderr (fd 1/2) into `RunOutput` instead of the host's terminal. While active the redirection is process-global: other host threads printing during the run are captured too, and the run is **exclusive** — any concurrent run (captured or not) is rejected with `LibdenoError::Configuration` (use `run_in_subprocess_with_output` for capture alongside parallel runs). |
-| `LibdenoOptions.max_capture_bytes: Option<usize>` | Cap on captured output per stream (stdout and stderr each get this budget); when a stream exceeds it, capture stops, the excess is dropped, and `RunOutput.capture_truncated` is set. `None` (default) captures without a bound. |
+| `LibdenoOptions.max_capture_bytes: Option<usize>` | Cap on captured output per stream (stdout and stderr each get this budget); when a stream exceeds it, capture stops, the excess is dropped, and `RunOutput.capture_truncated` is set. `None` (default) captures without a bound for legacy/in-process capture. Execution-control supervisor capture instead defaults to 64 KiB per stream, accepts explicit values through 96 KiB, and rejects larger explicit values before spawning. |
 | `LibdenoOptions.features: Option<Vec<String>>` | Overrides the default unstable feature set (`kv`, `cron`, `ffi`, `webgpu`, `worker-options`). Feature names must be valid deno unstable-feature names; `None` (default) enables the default set. An embedder running untrusted plugins can shrink the surface; the ops themselves stay permission-gated regardless. |
 | `LibdenoOptions.args: Vec<String>` | Arguments exposed to the script via `process.argv` (after argv[0]). |
 | `LibdenoOptions.cwd: Option<PathBuf>` | Resolution base that relative paths (entry, permissions, `node_modules` discovery) resolve against. Defaults to the process current directory. The process cwd is never switched — scripts observe the host's cwd (`Deno.cwd()`), so use `run_in_subprocess` for a per-run working directory. |
@@ -155,7 +155,10 @@ while calling into `libdeno`.
 each get the budget): when a stream exceeds it, capture stops and
 `RunOutput.capture_truncated` is set, so a verbose or hostile script can no
 longer grow host memory without limit. `None` (default) captures without a
-bound.
+bound for legacy/in-process capture. The execution-control supervisor path
+uses a 64 KiB per-stream default and a 96 KiB explicit maximum because its
+terminal output is JSON-embedded inside a 1 MiB protocol frame; larger explicit
+values are rejected with `LibdenoError::Configuration`.
 
 Output capture is unix-only: on Windows Rust std's stdout/stderr bypass the
 redirected CRT fd, so `capture_stdout`/`capture_stderr` fail with a

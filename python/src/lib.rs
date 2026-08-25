@@ -37,7 +37,7 @@ fn run(
     allow_all_permissions: bool,
     args: Py<PyAny>,
     cwd: Option<Bound<'_, PyAny>>,
-    max_heap_bytes: Option<usize>,
+    max_heap_bytes: Option<Bound<'_, PyAny>>,
     execution_deadline: Option<f64>,
     features: Option<Py<PyAny>>,
 ) -> PyResult<i32> {
@@ -50,7 +50,7 @@ fn run(
         allow_all_permissions,
         args,
         cwd.as_ref(),
-        max_heap_bytes,
+        max_heap_bytes.as_ref(),
         execution_deadline,
         features,
     )?;
@@ -86,6 +86,10 @@ impl Runtime {
             .map_err(DenoRuntimeError::new_err)
     }
 
+    fn refresh(&self) {
+        self.inner.refresh();
+    }
+
     #[pyo3(
         signature = (entry, *, permissions=empty_tuple(), allow_all_permissions=false, args=empty_tuple(), max_heap_bytes=None, execution_deadline=None, features=None),
         text_signature = "($self, entry, *, permissions=(), allow_all_permissions=False, args=(), max_heap_bytes=None, execution_deadline=None, features=None)"
@@ -97,7 +101,7 @@ impl Runtime {
         permissions: Py<PyAny>,
         allow_all_permissions: bool,
         args: Py<PyAny>,
-        max_heap_bytes: Option<usize>,
+        max_heap_bytes: Option<Bound<'_, PyAny>>,
         execution_deadline: Option<f64>,
         features: Option<Py<PyAny>>,
     ) -> PyResult<i32> {
@@ -110,7 +114,7 @@ impl Runtime {
             allow_all_permissions,
             args,
             None,
-            max_heap_bytes,
+            max_heap_bytes.as_ref(),
             execution_deadline,
             features,
         )?;
@@ -155,9 +159,7 @@ fn path_from_python(value: &Bound<'_, PyAny>, name: &str) -> PyResult<PathBuf> {
         let utf16 = decoded
             .call_method1("encode", ("utf-16-le", "surrogatepass"))
             .map_err(|error| {
-                ConfigurationError::new_err(format!(
-                    "{name} must be str or os.PathLike: {error}"
-                ))
+                ConfigurationError::new_err(format!("{name} must be str or os.PathLike: {error}"))
             })?;
         let bytes = utf16.extract::<Vec<u8>>().map_err(|error| {
             ConfigurationError::new_err(format!("{name} must be str or os.PathLike: {error}"))
@@ -186,10 +188,19 @@ fn options_from_python(
     allow_all_permissions: bool,
     args: &Bound<'_, PyAny>,
     cwd: Option<&Bound<'_, PyAny>>,
-    max_heap_bytes: Option<usize>,
+    max_heap_bytes: Option<&Bound<'_, PyAny>>,
     execution_deadline: Option<f64>,
     features: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<libdeno::LibdenoOptions> {
+    let max_heap_bytes = max_heap_bytes
+        .map(|value| {
+            value.extract::<usize>().map_err(|error| {
+                ConfigurationError::new_err(format!(
+                    "max_heap_bytes must be a non-negative integer within the platform usize range: {error}"
+                ))
+            })
+        })
+        .transpose()?;
     let execution_deadline = execution_deadline
         .map(|seconds| {
             if seconds.is_finite() && seconds >= 0.0 {

@@ -28,15 +28,11 @@ use crate::LibdenoError;
 const MAX_RESPONSE_BODY_BYTES: usize = 256 << 20;
 /// Cap for explicit npm `.tgz` downloads: some legal packages exceed 256MiB.
 /// Still bounded, so a broken/oversized response fails fast instead of OOMing
-/// the host.
-///
-/// This cap counts only the downloaded (compressed) bytes; the decompressed
-/// allocation is NOT size-checked. Upstream tarball_extract reserves space
-/// from the gzip stream's ISIZE header, which is written by the publisher —
-/// a malicious registry can serve a small tarball (under this cap) whose
-/// ISIZE claims ~4GiB, triggering a try_reserve of that size and OOM risk.
-/// The registry must therefore be trusted; a hardened build would need to
-/// pre-validate ISIZE against a post-decompression budget.
+/// the host. This is a response-body cap after any HTTP Content-Encoding
+/// decoding by reqwest, not wire-byte accounting; an npm `.tgz` response
+/// remains compressed tarball data here. The ISIZE guard below is a coarse
+/// publisher-controlled pre-check; neither boundary accounts for allocations
+/// inside upstream extraction.
 const MAX_TARBALL_BODY_BYTES: usize = 1 << 30;
 
 /// Total wall-clock budget for one HTTP operation, including retries,
@@ -57,9 +53,8 @@ impl ReqwestHttpClient {
     ///
     /// reqwest 0.12 has no client-level response body limit (`response_body_limit`
     /// does not exist here), so the caps are enforced per read in
-    /// [`read_body_limited`]. Because gzip/brotli auto-decompression runs at the
-    /// transport layer, the bytes that helper sees are already decompressed and
-    /// the cap doubles as a decompression-bomb guard.
+    /// [`read_body_limited`]. HTTP Content-Encoding is decoded before that
+    /// helper, but an npm `.tgz` response body remains compressed tarball data.
     pub fn new() -> Result<Self, LibdenoError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -72,12 +67,13 @@ impl ReqwestHttpClient {
     }
 }
 
-/// Reads the full (already auto-decompressed) response body into a Vec,
-/// failing once the accumulated size exceeds the caller-supplied `limit`
-/// instead of buffering an unbounded response. The caller picks the bound:
-/// module fetches pin the module cap, while npm registry downloads use the
-/// explicit tarball-path check in [`npm_body_limit`]. Over-limit is an error,
-/// never a retry.
+/// Reads the full response body as delivered by reqwest into a Vec, failing
+/// once the accumulated size exceeds the caller-supplied `limit` instead of
+/// buffering an unbounded response. HTTP Content-Encoding has already been
+/// decoded, while an npm `.tgz` response body remains compressed tarball data.
+/// The caller picks the bound: module fetches pin the module cap, while npm
+/// registry downloads use the explicit tarball-path check in [`npm_body_limit`].
+/// Over-limit is an error, never a retry.
 async fn read_body_limited(
     response: &mut reqwest::Response,
     limit: usize,
@@ -122,11 +118,8 @@ fn remaining_http_budget(deadline: Instant) -> Result<Duration, String> {
 }
 
 /// Default post-decompression budget for npm tarballs, and the env override
-/// (`LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`). Downstream extraction reserves
-/// from the gzip ISIZE header, which the publisher writes — a malicious
-/// registry could serve a small tarball whose ISIZE claims ~4 GiB and make
-/// the extractor try_reserve that much. This pre-check rejects such tarballs
-/// at download time; the budget is deliberately configurable so hosts with
+/// (`LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`). The budget is used for the
+/// publisher-controlled ISIZE guard; it is deliberately configurable so hosts with
 /// unusual packages can raise it.
 fn tarball_decompress_budget() -> usize {
     const DEFAULT: usize = 1 << 30;
