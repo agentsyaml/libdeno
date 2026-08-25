@@ -358,7 +358,7 @@ impl SupervisorToken {
             return Err(invalid_data("invalid supervisor token"));
         }
         let mut bytes = [0u8; SUPERVISOR_TOKEN_LEN];
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             bytes[index] = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
         }
         Ok(Self(bytes))
