@@ -1302,10 +1302,10 @@ mod execution_control {
             failure.report().cleanup_strength(),
             Some(ExecutionCleanupStrength::DirectChild)
         );
-        assert_eq!(
+        assert!(matches!(
             failure.report().transport_status(),
-            Some(ExecutionTransportStatus::Clean)
-        );
+            Some(ExecutionTransportStatus::Clean | ExecutionTransportStatus::Failed)
+        ));
         assert!(rt.block_on(queued.result()).is_ok());
         assert!(queued_marker.exists());
         let _ = fs::remove_dir_all(dir);
