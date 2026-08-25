@@ -677,6 +677,7 @@ fn reusable_runtime_rebuilds_for_home_npmrc_change_with_independent_userconfig()
         "NPM_CONFIG_USERCONFIG",
         "DENO_DIR",
         "HOME",
+        "USERPROFILE",
     ]);
     let dir = temp_dir("runtime-registry-change");
     let deno_dir = temp_dir("runtime-registry-change-deno");
@@ -709,10 +710,12 @@ fn reusable_runtime_rebuilds_for_home_npmrc_change_with_independent_userconfig()
     std::fs::write(&userconfig_a, userconfig_content_a).unwrap();
     std::fs::write(&userconfig_b, userconfig_content_b).unwrap();
     assert_eq!(userconfig_content_a.len(), userconfig_content_b.len());
-    // deno_resolver 0.88 reads `$HOME/.npmrc`; keep NPM_CONFIG_USERCONFIG on
-    // a separate, unrelated file and change it independently below.
+    // deno_resolver 0.88 reads `$HOME/.npmrc` (or `%USERPROFILE%\.npmrc` on
+    // Windows); keep NPM_CONFIG_USERCONFIG on a separate, unrelated file and
+    // change it independently below.
     std::env::remove_var("NPM_CONFIG_REGISTRY");
     std::env::set_var("HOME", &home);
+    std::env::set_var("USERPROFILE", &home);
     std::env::set_var("NPM_CONFIG_USERCONFIG", &userconfig_a);
     std::env::set_var("DENO_DIR", &deno_dir);
     write_project_with_expected(&dir, "from-registry-a");
