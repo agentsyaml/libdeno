@@ -1762,6 +1762,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _env = TestEnvGuard::new(&[
             "HOME",
+            "USERPROFILE",
             "NPM_CONFIG_REGISTRY",
             "NPM_CONFIG_REPLACE_REGISTRY_HOST",
         ]);
@@ -1789,6 +1790,7 @@ mod tests {
         std::env::remove_var("NPM_CONFIG_REGISTRY");
         std::env::remove_var("NPM_CONFIG_REPLACE_REGISTRY_HOST");
         std::env::set_var("HOME", &home_a);
+        std::env::set_var("USERPROFILE", &home_a);
 
         let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]);
         factory.workspace_directory().unwrap();
@@ -1803,6 +1805,7 @@ mod tests {
         assert!(old_manifest.is_reusable().unwrap());
 
         std::env::set_var("HOME", &home_b);
+        std::env::set_var("USERPROFILE", &home_b);
         assert!(!old_manifest.is_current().unwrap());
         assert!(!old_manifest.is_reusable().unwrap());
 
