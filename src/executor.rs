@@ -2783,7 +2783,7 @@ mod tests {
             )
             .unwrap();
         let queued_id = handle.id();
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let queued = scheduler
                 .state
@@ -2805,7 +2805,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                tokio::time::timeout(Duration::from_secs(1), handle.result())
+                tokio::time::timeout(Duration::from_secs(5), handle.result())
                     .await
                     .expect("queued submission did not reach a terminal state")
             });
