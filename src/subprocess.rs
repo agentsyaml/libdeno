@@ -2576,15 +2576,26 @@ mod tests {
         let _lock = SUBPROCESS_OUTPUT_READER_BUDGET_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        struct PanicReader;
+        let (read_started_sender, read_started_receiver) = std::sync::mpsc::channel();
+        struct PanicReader {
+            read_started_sender: std::sync::mpsc::Sender<()>,
+        }
 
         impl std::io::Read for PanicReader {
             fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.read_started_sender.send(()).unwrap();
                 panic!("synthetic reader panic");
             }
         }
 
-        let reader = SubprocessOutputReader::spawn(PanicReader, usize::MAX).unwrap();
+        let reader = SubprocessOutputReader::spawn(
+            PanicReader {
+                read_started_sender,
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        read_started_receiver.recv().unwrap();
         let capture = SubprocessOutputReaders {
             stdout: Some(reader),
             stderr: None,
