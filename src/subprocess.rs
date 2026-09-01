@@ -2037,7 +2037,7 @@ pub fn run_in_supervised_subprocess(
 ) -> Result<RunOutput, LibdenoError> {
     let host = supervisor_host_executable(None)?;
     let cancellation = CancellationContext::new();
-    let result = run_supervised_subprocess_with_executable_observed(
+    let result = match run_supervised_subprocess_with_executable_observed(
         &host,
         entry.as_ref(),
         options,
@@ -2045,8 +2045,29 @@ pub fn run_in_supervised_subprocess(
         CancelReason::User,
         None,
         ExecutionTiming::disabled(),
-    )
-    .map_err(|error| error.error)?;
+    ) {
+        Ok(result) => result,
+        Err(error)
+            if error.category.is_none()
+                && error.cleanup_strength == Some(CleanupStrength::DirectChild)
+                && error.transport_status
+                    == Some(crate::supervisor::SupervisorTransportStatus::Failed)
+                && error
+                    .partial_output
+                    .as_ref()
+                    .is_some_and(|partial| partial.incomplete || partial.reader_error) =>
+        {
+            // A legacy helper has no caller-owned cancellation state. If the
+            // direct child was reaped but parent-owned capture was incomplete,
+            // transport failure outranks the cancellation-shaped teardown
+            // error. The executor keeps the inner error and partial output so
+            // its cancellation/timeout precedence remains unchanged.
+            return Err(supervisor_category_error(
+                SupervisorFailureCategory::Infrastructure,
+            ));
+        }
+        Err(error) => return Err(error.error),
+    };
     if result.transport_status != crate::supervisor::SupervisorTransportStatus::Clean
         || result
             .partial_output
