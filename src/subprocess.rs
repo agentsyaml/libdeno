@@ -29,10 +29,10 @@ use crate::limits::CancellationContext;
 #[cfg(feature = "execution-control")]
 use crate::supervisor::{
     decode_payload, encode_payload, read_frame, read_frame_after_first_byte,
-    read_frame_with_cancellation, write_frame, CancelReason, CleanupStrength, FrameDirection,
-    FrameKind, SupervisorCancellation, SupervisorChildSession, SupervisorFrame,
-    SupervisorFrameEvent, SupervisorParentSession, SupervisorRequest, SupervisorRunResult,
-    SupervisorTerminal, SupervisorToken, SUPERVISOR_CANCEL_GRACE,
+    read_frame_with_cancellation, validate_supervisor_terminal_shape, write_frame, CancelReason,
+    CleanupStrength, FrameDirection, FrameKind, SupervisorCancellation, SupervisorChildSession,
+    SupervisorFailureCategory, SupervisorFrame, SupervisorFrameEvent, SupervisorParentSession,
+    SupervisorRequest, SupervisorTerminal, SupervisorToken, SUPERVISOR_CANCEL_GRACE,
     SUPERVISOR_CAPTURE_BYTES_PER_STREAM, SUPERVISOR_CHILD_EXIT_GRACE, SUPERVISOR_CONNECT_TIMEOUT,
     SUPERVISOR_ENDPOINT_ENV, SUPERVISOR_FRAME_TIMEOUT, SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM,
     SUPERVISOR_MODE_ENV, SUPERVISOR_TOKEN_ENV,
@@ -486,7 +486,7 @@ fn run_in_subprocess_with_output_inner(
         let _reap = timing.span(Phase::CancelKillReap);
         child.wait().map_err(LibdenoError::Io)?
     };
-    let capture = output_readers.collect();
+    let capture = output_readers.collect(None);
     if let Some(error) = capture.error {
         return Err(LibdenoError::Io(error));
     }
@@ -678,13 +678,55 @@ fn supervisor_error(message: impl Into<String>) -> LibdenoError {
 }
 
 #[cfg(feature = "execution-control")]
+fn supervisor_category_error(category: SupervisorFailureCategory) -> LibdenoError {
+    LibdenoError::Runtime(deno_core::anyhow::anyhow!(category.summary()))
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_child_failure_category(error: &LibdenoError) -> SupervisorFailureCategory {
+    if matches!(error, LibdenoError::Permission(_)) || error.is_permission_error() {
+        SupervisorFailureCategory::Permission
+    } else if matches!(error, LibdenoError::Configuration(_) | LibdenoError::Io(_)) {
+        SupervisorFailureCategory::Infrastructure
+    } else {
+        SupervisorFailureCategory::Runtime
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_session_error_is_timeout(error: &LibdenoError) -> bool {
+    matches!(error, LibdenoError::Timeout(_))
+        || matches!(error, LibdenoError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut)
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_session_error_is_natural_exit(error: &LibdenoError) -> bool {
+    matches!(
+        error,
+        LibdenoError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            )
+    )
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_session_error_is_protocol(error: &LibdenoError) -> bool {
+    matches!(error, LibdenoError::Runtime(_))
+        || matches!(error, LibdenoError::Io(error) if error.kind() == std::io::ErrorKind::InvalidData)
+}
+
+#[cfg(feature = "execution-control")]
 fn supervisor_cancel_error(reason: CancelReason) -> LibdenoError {
     match reason {
         CancelReason::Deadline => {
             LibdenoError::Timeout("supervisor execution deadline exceeded".to_string())
         }
         CancelReason::User | CancelReason::Shutdown => {
-            LibdenoError::Timeout("supervisor execution cancelled".to_string())
+            LibdenoError::Runtime(deno_core::anyhow::anyhow!("supervisor execution cancelled"))
         }
     }
 }
@@ -867,6 +909,8 @@ impl SubprocessOutputReader {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     drain_pipe_to_channel(&mut pipe, max, &sender, &overflow_for_thread)
                 }));
+                drop(pipe);
+                drop(reader_budget);
                 match result {
                     Ok(Ok(())) => {
                         let _ = sender.send(SubprocessOutputReaderMessage::Finished);
@@ -880,7 +924,6 @@ impl SubprocessOutputReader {
                         ));
                     }
                 }
-                drop(reader_budget);
             });
         reader?;
         // The reader owns its pipe and remains bounded by the collection
@@ -939,7 +982,66 @@ struct SubprocessOutputCapture {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     truncated: bool,
+    #[cfg_attr(not(feature = "execution-control"), allow(dead_code))]
+    incomplete: bool,
+    #[cfg_attr(not(feature = "execution-control"), allow(dead_code))]
+    reader_error: bool,
+    #[cfg_attr(not(feature = "execution-control"), allow(dead_code))]
+    deadline_won: bool,
     error: Option<std::io::Error>,
+}
+
+#[cfg(feature = "execution-control")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SupervisorPartialOutput {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) truncated: bool,
+    pub(crate) incomplete: bool,
+    pub(crate) reader_error: bool,
+}
+
+#[cfg(feature = "execution-control")]
+impl SupervisorPartialOutput {
+    fn empty() -> Self {
+        Self {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            truncated: false,
+            incomplete: false,
+            reader_error: false,
+        }
+    }
+
+    fn reader_error() -> Self {
+        Self {
+            incomplete: true,
+            reader_error: true,
+            ..Self::empty()
+        }
+    }
+}
+
+#[cfg(feature = "execution-control")]
+#[derive(Debug)]
+pub(crate) struct SupervisorRunResult {
+    pub(crate) exit_code: i32,
+    pub(crate) partial_output: Option<SupervisorPartialOutput>,
+    pub(crate) cleanup_strength: CleanupStrength,
+    pub(crate) transport_status: crate::supervisor::SupervisorTransportStatus,
+}
+
+#[cfg(feature = "execution-control")]
+impl SubprocessOutputCapture {
+    fn into_supervisor_partial(self) -> SupervisorPartialOutput {
+        SupervisorPartialOutput {
+            stdout: self.stdout,
+            stderr: self.stderr,
+            truncated: self.truncated,
+            incomplete: self.incomplete,
+            reader_error: self.reader_error,
+        }
+    }
 }
 
 struct SubprocessOutputStream {
@@ -1046,17 +1148,19 @@ impl SubprocessOutputReaders {
         Ok(Self { stdout, stderr })
     }
 
-    fn collect(self) -> SubprocessOutputCapture {
-        let deadline = std::time::Instant::now()
+    fn collect(self, effective_deadline: Option<std::time::Instant>) -> SubprocessOutputCapture {
+        let fixed_deadline = std::time::Instant::now()
             .checked_add(SUBPROCESS_OUTPUT_COLLECTION_TIMEOUT)
             .unwrap_or_else(std::time::Instant::now);
+        let deadline =
+            effective_deadline.map_or(fixed_deadline, |deadline| fixed_deadline.min(deadline));
         let mut streams = [
             self.stdout
                 .map(|reader| SubprocessOutputStream::new(reader, "subprocess stdout")),
             self.stderr
                 .map(|reader| SubprocessOutputStream::new(reader, "subprocess stderr")),
         ];
-        while deadline > std::time::Instant::now() {
+        loop {
             let mut progress = false;
             for stream in streams.iter_mut().flatten() {
                 if !stream.done {
@@ -1069,6 +1173,9 @@ impl SubprocessOutputReaders {
             {
                 break;
             }
+            if deadline <= std::time::Instant::now() {
+                break;
+            }
             if !progress {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if let Some(stream) = streams.iter_mut().flatten().find(|stream| !stream.done) {
@@ -1077,6 +1184,14 @@ impl SubprocessOutputReaders {
                 }
             }
         }
+        let incomplete = streams.iter().flatten().any(|stream| !stream.done);
+        let reader_error = streams
+            .iter()
+            .flatten()
+            .any(|stream| stream.error.is_some());
+        let deadline_won = incomplete
+            && !reader_error
+            && effective_deadline.is_some_and(|deadline| deadline <= fixed_deadline);
         let (stdout, stdout_truncated, stdout_error) = streams[0]
             .take()
             .map(|stream| {
@@ -1108,6 +1223,9 @@ impl SubprocessOutputReaders {
             stdout,
             stderr,
             truncated: stdout_truncated || stderr_truncated,
+            incomplete: incomplete || reader_error,
+            reader_error,
+            deadline_won,
             error,
         }
     }
@@ -1123,6 +1241,8 @@ struct SupervisorSessionOutcome {
 #[cfg(feature = "execution-control")]
 pub(crate) struct SupervisedSubprocessError {
     pub(crate) error: LibdenoError,
+    pub(crate) category: Option<SupervisorFailureCategory>,
+    pub(crate) partial_output: Option<SupervisorPartialOutput>,
     pub(crate) cleanup_strength: Option<CleanupStrength>,
     pub(crate) transport_status: Option<crate::supervisor::SupervisorTransportStatus>,
 }
@@ -1132,6 +1252,8 @@ impl From<LibdenoError> for SupervisedSubprocessError {
     fn from(error: LibdenoError) -> Self {
         Self {
             error,
+            category: None,
+            partial_output: None,
             cleanup_strength: None,
             transport_status: None,
         }
@@ -1140,13 +1262,35 @@ impl From<LibdenoError> for SupervisedSubprocessError {
 
 #[cfg(feature = "execution-control")]
 impl SupervisedSubprocessError {
-    fn with_metadata(
+    fn with_metadata_and_partial(
         error: LibdenoError,
+        partial_output: Option<SupervisorPartialOutput>,
         cleanup_strength: Option<CleanupStrength>,
         transport_status: Option<crate::supervisor::SupervisorTransportStatus>,
     ) -> Self {
         Self {
             error,
+            category: None,
+            partial_output,
+            cleanup_strength,
+            transport_status,
+        }
+    }
+
+    fn with_category_and_partial(
+        category: SupervisorFailureCategory,
+        partial_output: Option<SupervisorPartialOutput>,
+        cleanup_strength: Option<CleanupStrength>,
+        transport_status: Option<crate::supervisor::SupervisorTransportStatus>,
+    ) -> Self {
+        Self {
+            error: if category == SupervisorFailureCategory::Timeout {
+                LibdenoError::Timeout(category.summary().to_string())
+            } else {
+                supervisor_category_error(category)
+            },
+            category: Some(category),
+            partial_output,
             cleanup_strength,
             transport_status,
         }
@@ -1692,16 +1836,10 @@ struct SupervisorChildReap {
 }
 
 #[cfg(feature = "execution-control")]
-fn reap_supervisor_child(
-    child: &mut Child,
-    terminal_received: bool,
-) -> std::io::Result<SupervisorChildReap> {
-    if !terminal_received {
-        return kill_and_wait_supervisor_child(child).map(|status| SupervisorChildReap {
-            status,
-            forced_kill: true,
-        });
-    }
+fn reap_supervisor_child(child: &mut Child) -> std::io::Result<SupervisorChildReap> {
+    // Give a child that has not produced a TERMINAL the same short chance to
+    // exit naturally as a child that has produced one. This closes the EOF /
+    // try_wait race without allowing a stuck child to avoid parent cleanup.
     let deadline = supervisor_deadline_after(SUPERVISOR_CHILD_EXIT_GRACE);
     loop {
         match child.try_wait() {
@@ -1735,6 +1873,33 @@ fn reap_supervisor_child(
 }
 
 #[cfg(feature = "execution-control")]
+fn supervisor_session_failure_category(
+    error: &LibdenoError,
+    cleanup: &Result<SupervisorChildReap, std::io::Error>,
+    cancellation: &SupervisorCancellation,
+) -> Option<SupervisorFailureCategory> {
+    if cleanup.is_err() {
+        Some(SupervisorFailureCategory::Infrastructure)
+    } else if cancellation.is_requested() {
+        match cancellation.reason() {
+            CancelReason::Deadline => Some(SupervisorFailureCategory::Timeout),
+            CancelReason::User | CancelReason::Shutdown => None,
+        }
+    } else if cleanup.as_ref().is_ok_and(|reap| {
+        !reap.forced_kill
+            && (supervisor_session_error_is_natural_exit(error)
+                || (supervisor_session_error_is_timeout(error)
+                    && !supervisor_session_error_is_protocol(error)))
+    }) {
+        Some(SupervisorFailureCategory::ChildCrash)
+    } else if supervisor_session_error_is_timeout(error) {
+        Some(SupervisorFailureCategory::Timeout)
+    } else {
+        Some(SupervisorFailureCategory::Infrastructure)
+    }
+}
+
+#[cfg(feature = "execution-control")]
 fn kill_and_wait_supervisor_child(child: &mut Child) -> std::io::Result<ExitStatus> {
     let kill_result = child.kill();
     let wait_result = child.wait();
@@ -1755,50 +1920,9 @@ fn kill_and_wait_supervisor_child(child: &mut Child) -> std::io::Result<ExitStat
 #[cfg(feature = "execution-control")]
 fn validate_supervisor_terminal(
     terminal: &SupervisorTerminal,
-    request: &SupervisorRequest,
+    _request: &SupervisorRequest,
 ) -> Result<(), LibdenoError> {
-    match terminal.outcome {
-        crate::supervisor::SupervisorOutcome::Completed if terminal.exit_code.is_none() => {
-            return Err(supervisor_error(
-                "completed supervisor TERMINAL has no exit code",
-            ));
-        }
-        crate::supervisor::SupervisorOutcome::Completed => {}
-        crate::supervisor::SupervisorOutcome::Failed
-        | crate::supervisor::SupervisorOutcome::Cancelled
-        | crate::supervisor::SupervisorOutcome::Deadline
-            if terminal.exit_code.is_some() =>
-        {
-            return Err(supervisor_error(
-                "non-completed supervisor TERMINAL has an exit code",
-            ));
-        }
-        _ => {}
-    }
-    if (!request.capture_stdout && !terminal.stdout.is_empty())
-        || (!request.capture_stderr && !terminal.stderr.is_empty())
-        || (!request.capture_stdout && !request.capture_stderr && terminal.truncated)
-    {
-        return Err(supervisor_error(
-            "supervisor TERMINAL contains unrequested output",
-        ));
-    }
-    if let Some(max) = supervisor_capture_limit(
-        request.capture_stdout,
-        request.capture_stderr,
-        request.max_capture_bytes,
-    )? {
-        if terminal.stdout.len() > max || terminal.stderr.len() > max {
-            return Err(supervisor_error(
-                "supervisor TERMINAL output exceeds its bound",
-            ));
-        }
-    }
-    if terminal.truncated && !request.capture_stdout && !request.capture_stderr {
-        return Err(supervisor_error(
-            "supervisor TERMINAL reports truncation without capture",
-        ));
-    }
+    validate_supervisor_terminal_shape(terminal).map_err(LibdenoError::Io)?;
     Ok(())
 }
 
@@ -1913,7 +2037,7 @@ pub fn run_in_supervised_subprocess(
 ) -> Result<RunOutput, LibdenoError> {
     let host = supervisor_host_executable(None)?;
     let cancellation = CancellationContext::new();
-    run_supervised_subprocess_with_executable_observed(
+    let result = run_supervised_subprocess_with_executable_observed(
         &host,
         entry.as_ref(),
         options,
@@ -1922,8 +2046,26 @@ pub fn run_in_supervised_subprocess(
         None,
         ExecutionTiming::disabled(),
     )
-    .map(|result| result.output)
-    .map_err(|error| error.error)
+    .map_err(|error| error.error)?;
+    if result.transport_status != crate::supervisor::SupervisorTransportStatus::Clean
+        || result
+            .partial_output
+            .as_ref()
+            .is_some_and(|partial| partial.incomplete || partial.reader_error)
+    {
+        return Err(supervisor_category_error(
+            SupervisorFailureCategory::Infrastructure,
+        ));
+    }
+    let partial = result
+        .partial_output
+        .unwrap_or_else(SupervisorPartialOutput::empty);
+    Ok(crate::RunOutput {
+        exit_code: result.exit_code,
+        stdout: partial.stdout,
+        stderr: partial.stderr,
+        capture_truncated: partial.truncated,
+    })
 }
 
 #[cfg(feature = "execution-control")]
@@ -1961,36 +2103,108 @@ pub(crate) fn run_supervised_subprocess_with_executable_observed_and_started(
     on_started: Option<&dyn Fn()>,
 ) -> Result<SupervisorRunResult, SupervisedSubprocessError> {
     let started = Instant::now();
+    let capture_requested = options.capture_stdout || options.capture_stderr;
     let cancellation = SupervisorCancellation::new(
         cancellation.unwrap_or_else(CancellationContext::new),
         default_cancel_reason,
     );
     let deadline =
         effective_supervisor_deadline(started, parent_deadline, options.execution_deadline)
-            .map_err(SupervisedSubprocessError::from)?;
+            .map_err(|error| {
+                SupervisedSubprocessError::with_metadata_and_partial(
+                    error,
+                    capture_requested.then(SupervisorPartialOutput::empty),
+                    None,
+                    None,
+                )
+            })?;
     if let Some(reason) = cancellation.requested_reason() {
-        return Err(supervisor_cancel_error(reason).into());
+        return Err(SupervisedSubprocessError::with_metadata_and_partial(
+            supervisor_cancel_error(reason),
+            capture_requested.then(SupervisorPartialOutput::empty),
+            None,
+            None,
+        ));
     }
     if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
         cancellation.request(CancelReason::Deadline);
-        return Err(supervisor_cancel_error(cancellation.reason()).into());
+        return Err(SupervisedSubprocessError::with_metadata_and_partial(
+            supervisor_cancel_error(cancellation.reason()),
+            capture_requested.then(SupervisorPartialOutput::empty),
+            None,
+            None,
+        ));
     }
 
-    let cwd = options
-        .cwd
-        .clone()
-        .unwrap_or(std::env::current_dir().map_err(LibdenoError::Io)?);
-    let request = supervisor_request(entry, options, cwd.clone())?;
-    let request_payload = encode_payload(&request).map_err(LibdenoError::Io)?;
+    let cwd =
+        options
+            .cwd
+            .clone()
+            .unwrap_or(
+                std::env::current_dir()
+                    .map_err(LibdenoError::Io)
+                    .map_err(|error| {
+                        SupervisedSubprocessError::with_metadata_and_partial(
+                            error,
+                            capture_requested.then(SupervisorPartialOutput::empty),
+                            None,
+                            None,
+                        )
+                    })?,
+            );
+    let request = supervisor_request(entry, options, cwd.clone()).map_err(|error| {
+        SupervisedSubprocessError::with_metadata_and_partial(
+            error,
+            capture_requested.then(SupervisorPartialOutput::empty),
+            None,
+            None,
+        )
+    })?;
+    let request_payload = encode_payload(&request)
+        .map_err(LibdenoError::Io)
+        .map_err(|_| {
+            SupervisedSubprocessError::with_category_and_partial(
+                SupervisorFailureCategory::Infrastructure,
+                capture_requested.then(SupervisorPartialOutput::empty),
+                None,
+                None,
+            )
+        })?;
     let token = SupervisorToken::generate()
-        .map_err(|error| LibdenoError::Runtime(deno_core::anyhow::anyhow!(error)))?;
-    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(LibdenoError::Io)?;
-    let endpoint = listener.local_addr().map_err(LibdenoError::Io)?.to_string();
-    // In-process fd capture is unavailable on Windows because the runtime's
-    // stdout/stderr handles bypass CRT fd redirection. Capture the supervisor
-    // child's own pipes there instead; Unix keeps the existing terminal-frame
-    // capture path.
-    let parent_pipe_capture = cfg!(windows) && (request.capture_stdout || request.capture_stderr);
+        .map_err(|error| LibdenoError::Runtime(deno_core::anyhow::anyhow!(error)))
+        .map_err(|_| {
+            SupervisedSubprocessError::with_category_and_partial(
+                SupervisorFailureCategory::Infrastructure,
+                capture_requested.then(SupervisorPartialOutput::empty),
+                None,
+                None,
+            )
+        })?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(LibdenoError::Io)
+        .map_err(|_| {
+            SupervisedSubprocessError::with_category_and_partial(
+                SupervisorFailureCategory::Infrastructure,
+                capture_requested.then(SupervisorPartialOutput::empty),
+                None,
+                None,
+            )
+        })?;
+    let endpoint = listener
+        .local_addr()
+        .map_err(LibdenoError::Io)
+        .map_err(|_| {
+            SupervisedSubprocessError::with_category_and_partial(
+                SupervisorFailureCategory::Infrastructure,
+                capture_requested.then(SupervisorPartialOutput::empty),
+                None,
+                None,
+            )
+        })?
+        .to_string();
+    // Supervisor capture is parent-owned on every platform. The child never
+    // puts output in TERMINAL; one bounded pair of pipes is authoritative.
+    let parent_pipe_capture = capture_requested;
     let mut child = spawn_supervisor_child(
         host_executable,
         &cwd,
@@ -1998,8 +2212,15 @@ pub(crate) fn run_supervised_subprocess_with_executable_observed_and_started(
         &token,
         parent_pipe_capture && request.capture_stdout,
         parent_pipe_capture && request.capture_stderr,
-    )?;
-    #[cfg(windows)]
+    )
+    .map_err(|_| {
+        SupervisedSubprocessError::with_category_and_partial(
+            SupervisorFailureCategory::Infrastructure,
+            parent_pipe_capture.then(SupervisorPartialOutput::empty),
+            None,
+            None,
+        )
+    })?;
     let output_readers = if parent_pipe_capture {
         let max = request
             .max_capture_bytes
@@ -2011,10 +2232,11 @@ pub(crate) fn run_supervised_subprocess_with_executable_observed_and_started(
             max,
         ) {
             Ok(readers) => Some(readers),
-            Err(error) => {
+            Err(_error) => {
                 let _ = kill_and_wait_supervisor_child(&mut child);
-                return Err(SupervisedSubprocessError::with_metadata(
-                    LibdenoError::Io(error),
+                return Err(SupervisedSubprocessError::with_category_and_partial(
+                    SupervisorFailureCategory::Infrastructure,
+                    Some(SupervisorPartialOutput::reader_error()),
                     Some(CleanupStrength::DirectChild),
                     Some(crate::supervisor::SupervisorTransportStatus::Failed),
                 ));
@@ -2032,111 +2254,135 @@ pub(crate) fn run_supervised_subprocess_with_executable_observed_and_started(
         deadline,
         on_started,
     );
-    let terminal_received = session.is_ok();
-    let cleanup = reap_supervisor_child(&mut child, terminal_received);
-    #[cfg(windows)]
-    let output_capture = output_readers.map(SubprocessOutputReaders::collect);
+    let cleanup = reap_supervisor_child(&mut child);
+    let (partial_output, collection_deadline_won) = match output_readers {
+        Some(readers) => {
+            let capture = readers.collect(deadline);
+            let deadline_won = capture.deadline_won;
+            (Some(capture.into_supervisor_partial()), deadline_won)
+        }
+        None => (None, false),
+    };
 
     let session = match session {
         Ok(session) => session,
         Err(error) => {
-            let error = if cancellation.is_requested() {
-                supervisor_cancel_error(cancellation.reason())
-            } else {
-                error
-            };
-            let error = match cleanup {
-                Ok(_) => error,
-                Err(cleanup) => supervisor_error(format!(
-                    "supervisor session failed: {error}; direct-child cleanup failed: {cleanup}"
-                )),
-            };
-            #[cfg(windows)]
-            let error = match output_capture
-                .as_ref()
-                .and_then(|capture| capture.error.as_ref())
-            {
-                Some(reader_error) => supervisor_error(format!(
-                    "{error}; supervisor output reader failed: {reader_error}"
-                )),
-                None => error,
-            };
-            return Err(SupervisedSubprocessError::with_metadata(
-                error,
-                Some(CleanupStrength::DirectChild),
-                Some(crate::supervisor::SupervisorTransportStatus::Failed),
-            ));
+            let category = supervisor_session_failure_category(&error, &cleanup, &cancellation);
+            return Err(match category {
+                Some(category) => SupervisedSubprocessError::with_category_and_partial(
+                    category,
+                    partial_output.clone(),
+                    Some(CleanupStrength::DirectChild),
+                    Some(crate::supervisor::SupervisorTransportStatus::Failed),
+                ),
+                None => SupervisedSubprocessError::with_metadata_and_partial(
+                    supervisor_cancel_error(cancellation.reason()),
+                    partial_output.clone(),
+                    Some(CleanupStrength::DirectChild),
+                    Some(crate::supervisor::SupervisorTransportStatus::Failed),
+                ),
+            });
         }
     };
     let reap = match cleanup {
         Ok(reap) => reap,
-        Err(error) => {
-            #[cfg(windows)]
-            let error = match output_capture
-                .as_ref()
-                .and_then(|capture| capture.error.as_ref())
-            {
-                Some(reader_error) => supervisor_error(format!(
-                    "{error}; supervisor output reader failed: {reader_error}"
-                )),
-                None => LibdenoError::Io(error),
-            };
-            #[cfg(not(windows))]
-            let error = LibdenoError::Io(error);
-            return Err(SupervisedSubprocessError::with_metadata(
-                error,
+        Err(_error) => {
+            return Err(SupervisedSubprocessError::with_category_and_partial(
+                SupervisorFailureCategory::Infrastructure,
+                partial_output.clone(),
                 Some(CleanupStrength::DirectChild),
                 Some(crate::supervisor::SupervisorTransportStatus::Failed),
-            ));
+            ))
         }
     };
     let status = reap.status;
-    #[cfg(windows)]
-    if let Some(reader_error) = output_capture
+    let capture_transport_failed = partial_output
         .as_ref()
-        .and_then(|capture| capture.error.as_ref())
-    {
-        return Err(SupervisedSubprocessError::with_metadata(
-            supervisor_error(format!("supervisor output reader failed: {reader_error}")),
-            Some(CleanupStrength::DirectChild),
-            Some(crate::supervisor::SupervisorTransportStatus::Failed),
-        ));
-    }
-    #[cfg(windows)]
-    let transport_status = session.transport_status;
-    #[cfg(not(windows))]
-    let transport_status = session.transport_status;
-    #[cfg(windows)]
-    let terminal = if let Some(capture) = output_capture {
-        SupervisorTerminal {
-            stdout: capture.stdout,
-            stderr: capture.stderr,
-            truncated: capture.truncated,
-            ..session.terminal
-        }
+        .is_some_and(|output| output.incomplete || output.reader_error);
+    let transport_status = if capture_transport_failed {
+        crate::supervisor::SupervisorTransportStatus::Failed
     } else {
-        session.terminal
+        session.transport_status
     };
-    #[cfg(not(windows))]
     let terminal = session.terminal;
+    let cancellation_before_terminal = session.cancellation_before_terminal;
+    let terminal_for_category = terminal.clone();
     let output = match map_supervisor_terminal_with_cancellation(
         terminal,
         status,
         &request,
         reap.forced_kill,
-        session.cancellation_before_terminal,
+        cancellation_before_terminal,
     ) {
+        Ok(_output) if collection_deadline_won => {
+            return Err(match cancellation.requested_reason() {
+                Some(reason @ (CancelReason::User | CancelReason::Shutdown)) => {
+                    SupervisedSubprocessError::with_metadata_and_partial(
+                        supervisor_cancel_error(reason),
+                        partial_output.clone(),
+                        Some(CleanupStrength::DirectChild),
+                        Some(transport_status),
+                    )
+                }
+                Some(CancelReason::Deadline) | None => {
+                    SupervisedSubprocessError::with_category_and_partial(
+                        SupervisorFailureCategory::Timeout,
+                        partial_output.clone(),
+                        Some(CleanupStrength::DirectChild),
+                        Some(transport_status),
+                    )
+                }
+            });
+        }
         Ok(output) => output,
         Err(error) => {
-            return Err(SupervisedSubprocessError::with_metadata(
-                error,
-                Some(CleanupStrength::DirectChild),
-                Some(transport_status),
-            ));
+            let category = if matches!(error, LibdenoError::Timeout(_))
+                && terminal_for_category.outcome == crate::supervisor::SupervisorOutcome::Deadline
+                && !matches!(
+                    cancellation_before_terminal,
+                    Some(CancelReason::User | CancelReason::Shutdown)
+                ) {
+                Some(SupervisorFailureCategory::Timeout)
+            } else if matches!(
+                cancellation_before_terminal,
+                Some(CancelReason::User | CancelReason::Shutdown)
+            ) || terminal_for_category.outcome
+                == crate::supervisor::SupervisorOutcome::Cancelled
+                || matches!(error, LibdenoError::Timeout(_))
+            {
+                None
+            } else if terminal_for_category.outcome == crate::supervisor::SupervisorOutcome::Failed
+                && validate_supervisor_terminal(&terminal_for_category, &request).is_ok()
+                && validate_supervisor_terminal_status(
+                    &terminal_for_category,
+                    status,
+                    reap.forced_kill,
+                )
+                .is_ok()
+            {
+                terminal_for_category.category
+            } else {
+                Some(SupervisorFailureCategory::Infrastructure)
+            };
+            return Err(match category {
+                Some(category) => SupervisedSubprocessError::with_category_and_partial(
+                    category,
+                    partial_output.clone(),
+                    Some(CleanupStrength::DirectChild),
+                    Some(transport_status),
+                ),
+                None => SupervisedSubprocessError::with_metadata_and_partial(
+                    error,
+                    partial_output.clone(),
+                    Some(CleanupStrength::DirectChild),
+                    Some(transport_status),
+                ),
+            });
         }
     };
     Ok(SupervisorRunResult {
-        output,
+        exit_code: output.exit_code,
+        partial_output,
         cleanup_strength: CleanupStrength::DirectChild,
         transport_status,
     })
@@ -2154,11 +2400,13 @@ fn parse_supervisor_endpoint(value: &str) -> Result<SocketAddr, LibdenoError> {
 }
 
 #[cfg(feature = "execution-control")]
+#[allow(clippy::too_many_arguments)]
 fn supervisor_child_exit(
     stream: &mut TcpStream,
     state: &mut SupervisorChildSession,
     outcome: crate::supervisor::SupervisorOutcome,
     exit_code: Option<i32>,
+    category: Option<SupervisorFailureCategory>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     truncated: bool,
@@ -2166,6 +2414,7 @@ fn supervisor_child_exit(
     let terminal = SupervisorTerminal {
         outcome,
         exit_code,
+        category,
         stdout,
         stderr,
         truncated,
@@ -2300,6 +2549,7 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
                 }
             },
             None,
+            None,
             Vec::new(),
             Vec::new(),
             false,
@@ -2327,13 +2577,9 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
 
     // The supervisor environment is deliberately stripped only after the
     // authenticated control setup and before the first runtime entry. The
-    // legacy LIBDENO_SPAWNED_IPC marker is not touched.
-    let max_capture_bytes = supervisor_capture_limit(
-        request.capture_stdout,
-        request.capture_stderr,
-        request.max_capture_bytes,
-    )?;
-    let capture_in_child = !cfg!(windows) || (!request.capture_stdout && !request.capture_stderr);
+    // legacy LIBDENO_SPAWNED_IPC marker is not touched. Capture stays in the
+    // parent on every platform, so the terminal cannot become a second output
+    // channel and the child keeps no capture budget.
     let options = LibdenoOptions {
         permissions: request.permissions,
         allow_all_permissions: request.allow_all_permissions,
@@ -2342,13 +2588,9 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
         cwd: Some(request.cwd),
         max_heap_bytes: request.max_heap_bytes,
         execution_deadline: request.execution_deadline,
-        capture_stdout: request.capture_stdout && capture_in_child,
-        capture_stderr: request.capture_stderr && capture_in_child,
-        max_capture_bytes: if capture_in_child {
-            max_capture_bytes
-        } else {
-            None
-        },
+        capture_stdout: false,
+        capture_stderr: false,
+        max_capture_bytes: None,
         features: request.features,
     };
     let runtime_result = {
@@ -2364,31 +2606,31 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
     let control_result = control.join();
 
     let reason = cancellation.reason();
-    let (outcome, output) = match (reason, runtime_result) {
-        (CancelReason::Deadline, _) => (crate::supervisor::SupervisorOutcome::Deadline, None),
+    let (outcome, category, output) = match (reason, runtime_result) {
+        (CancelReason::Deadline, _) => (crate::supervisor::SupervisorOutcome::Deadline, None, None),
         (CancelReason::User | CancelReason::Shutdown, _) if cancellation.is_requested() => {
-            (crate::supervisor::SupervisorOutcome::Cancelled, None)
+            (crate::supervisor::SupervisorOutcome::Cancelled, None, None)
         }
         (_, Ok(output)) => (
             crate::supervisor::SupervisorOutcome::Completed,
+            None,
             Some(output),
         ),
         (_, Err(LibdenoError::Timeout(_))) => {
-            (crate::supervisor::SupervisorOutcome::Deadline, None)
+            (crate::supervisor::SupervisorOutcome::Deadline, None, None)
         }
-        (_, Err(_)) => (crate::supervisor::SupervisorOutcome::Failed, None),
+        (_, Err(error)) => (
+            crate::supervisor::SupervisorOutcome::Failed,
+            Some(supervisor_child_failure_category(&error)),
+            None,
+        ),
     };
     if control_result.is_err() && output.is_some() {
         // A control EOF after user code completed is secondary to the runtime
         // result; the parent records transport failure independently.
     }
     let (exit_code, stdout, stderr, truncated) = match output {
-        Some(output) => (
-            Some(output.exit_code),
-            output.stdout,
-            output.stderr,
-            output.capture_truncated,
-        ),
+        Some(output) => (Some(output.exit_code), Vec::new(), Vec::new(), false),
         None => (None, Vec::new(), Vec::new(), false),
     };
     supervisor_child_exit(
@@ -2396,6 +2638,7 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
         &mut state,
         outcome,
         exit_code,
+        category,
         stdout,
         stderr,
         truncated,
@@ -2453,8 +2696,11 @@ pub fn maybe_handle_supervisor_mode() -> bool {
 
     match run_supervisor_child(endpoint, token) {
         Ok(code) => std::process::exit(code),
-        Err(error) => {
-            eprintln!("libdeno supervisor child failed: {error}");
+        Err(_) => {
+            eprintln!(
+                "libdeno supervisor child failed: {}",
+                SupervisorFailureCategory::Infrastructure.summary()
+            );
             std::process::exit(1);
         }
     }
@@ -2490,9 +2736,10 @@ mod tests {
     use super::{read_supervisor_terminal, SupervisorCancellation, SupervisorParentSession};
     #[cfg(feature = "execution-control")]
     use crate::supervisor::{
-        read_frame, write_frame, CancelReason, FrameDirection, FrameKind, SupervisorFrame,
-        SupervisorOutcome, SupervisorToken, SupervisorTransportStatus,
-        SUPERVISOR_CAPTURE_BYTES_PER_STREAM, SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM,
+        read_frame, write_frame, CancelReason, FrameDirection, FrameKind,
+        SupervisorFailureCategory, SupervisorFrame, SupervisorOutcome, SupervisorToken,
+        SupervisorTransportStatus, SUPERVISOR_CAPTURE_BYTES_PER_STREAM,
+        SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM, SUPERVISOR_VERSION,
     };
     #[cfg(feature = "execution-control")]
     use crate::LibdenoOptions;
@@ -2544,6 +2791,9 @@ mod tests {
 
     #[test]
     fn subprocess_output_collection_preserves_partial_bytes_and_reader_errors() {
+        let _lock = SUBPROCESS_OUTPUT_READER_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let (sender, receiver) = std::sync::mpsc::channel();
         sender
             .send(SubprocessOutputReaderMessage::Data(b"partial".to_vec()))
@@ -2563,9 +2813,11 @@ mod tests {
             stdout: Some(reader),
             stderr: None,
         }
-        .collect();
+        .collect(None);
         assert_eq!(capture.stdout, b"partial");
         assert!(!capture.truncated);
+        assert!(capture.incomplete);
+        assert!(capture.reader_error);
         let error = capture.error.unwrap();
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert!(error.to_string().contains("synthetic pipe failure"));
@@ -2605,9 +2857,137 @@ mod tests {
             stdout: Some(reader),
             stderr: None,
         }
-        .collect();
+        .collect(None);
+        assert!(capture.incomplete);
+        assert!(capture.reader_error);
         let error = capture.error.unwrap();
         assert!(error.to_string().contains("reader panicked"));
+    }
+
+    #[test]
+    fn subprocess_output_capture_keeps_truncation_independent_from_completion() {
+        let _lock = SUBPROCESS_OUTPUT_READER_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let reader =
+            SubprocessOutputReader::spawn(std::io::Cursor::new(b"output".to_vec()), 0).unwrap();
+        let capture = SubprocessOutputReaders {
+            stdout: Some(reader),
+            stderr: None,
+        }
+        .collect(None);
+        assert!(capture.truncated);
+        assert!(!capture.incomplete);
+        assert!(!capture.reader_error);
+        assert!(capture.error.is_none());
+        assert!(capture.stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_output_capture_marks_descendant_held_pipe_incomplete() {
+        let _lock = SUBPROCESS_OUTPUT_READER_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "printf prefix; (sleep 1) & exit 0"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let readers = SubprocessOutputReaders::take(&mut child, true, false, 64).unwrap();
+        assert!(child.wait().unwrap().success());
+        let capture = readers.collect(None);
+        assert_eq!(capture.stdout, b"prefix");
+        assert!(!capture.truncated);
+        assert!(capture.incomplete);
+        assert!(!capture.reader_error);
+        assert!(capture.error.is_none());
+    }
+
+    #[test]
+    fn subprocess_output_collection_honors_absolute_deadline_and_keeps_prefix() {
+        let _lock = SUBPROCESS_OUTPUT_READER_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        struct BlockingReader {
+            ready: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            sent: bool,
+        }
+
+        impl std::io::Read for BlockingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if !self.sent {
+                    let prefix = b"prefix";
+                    buffer[..prefix.len()].copy_from_slice(prefix);
+                    self.sent = true;
+                    self.ready.send(()).unwrap();
+                    return Ok(prefix.len());
+                }
+                let _ = self.release.recv();
+                Ok(0)
+            }
+        }
+
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let baseline = active_subprocess_output_readers();
+        let reader = SubprocessOutputReader::spawn(
+            BlockingReader {
+                ready: ready_sender,
+                release: release_receiver,
+                sent: false,
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        ready_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let capture = SubprocessOutputReaders {
+            stdout: Some(reader),
+            stderr: None,
+        }
+        .collect(Some(started + std::time::Duration::from_millis(75)));
+        assert_eq!(capture.stdout, b"prefix");
+        assert!(!capture.truncated);
+        assert!(capture.incomplete);
+        assert!(!capture.reader_error);
+        assert!(capture.deadline_won);
+        assert!(started.elapsed() < super::SUBPROCESS_OUTPUT_COLLECTION_TIMEOUT);
+
+        release_sender.send(()).unwrap();
+        for _ in 0..100 {
+            if active_subprocess_output_readers() == baseline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(active_subprocess_output_readers(), baseline);
+    }
+
+    #[test]
+    fn subprocess_output_reader_budget_is_released_before_collection_returns() {
+        let _lock = SUBPROCESS_OUTPUT_READER_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let before = active_subprocess_output_readers();
+        let reader =
+            SubprocessOutputReader::spawn(std::io::Cursor::new(b"output".to_vec()), usize::MAX)
+                .unwrap();
+        let capture = SubprocessOutputReaders {
+            stdout: Some(reader),
+            stderr: None,
+        }
+        .collect(None);
+        assert_eq!(active_subprocess_output_readers(), before);
+        assert_eq!(capture.stdout, b"output");
+        assert!(!capture.incomplete);
+        assert!(!capture.reader_error);
     }
 
     #[test]
@@ -2740,6 +3120,7 @@ mod tests {
             &SupervisorTerminal {
                 outcome: SupervisorOutcome::Completed,
                 exit_code: None,
+                category: None,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 truncated: false,
@@ -2751,6 +3132,7 @@ mod tests {
             &SupervisorTerminal {
                 outcome: SupervisorOutcome::Cancelled,
                 exit_code: Some(1),
+                category: None,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 truncated: false,
@@ -2762,6 +3144,7 @@ mod tests {
             &SupervisorTerminal {
                 outcome: SupervisorOutcome::Completed,
                 exit_code: Some(0),
+                category: None,
                 stdout: vec![0; 5],
                 stderr: Vec::new(),
                 truncated: false,
@@ -2773,6 +3156,7 @@ mod tests {
             &SupervisorTerminal {
                 outcome: SupervisorOutcome::Completed,
                 exit_code: Some(0),
+                category: None,
                 stdout: Vec::new(),
                 stderr: vec![1],
                 truncated: false,
@@ -2780,7 +3164,132 @@ mod tests {
             &request,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("unrequested output"));
+        assert!(error.to_string().contains("must not carry output"));
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn child_failure_categories_keep_host_failures_infrastructure() {
+        assert_eq!(
+            super::supervisor_child_failure_category(&LibdenoError::Permission(
+                "permission details".to_string()
+            )),
+            SupervisorFailureCategory::Permission
+        );
+        assert_eq!(
+            super::supervisor_child_failure_category(&LibdenoError::Runtime(
+                deno_core::anyhow::anyhow!("runtime details")
+            )),
+            SupervisorFailureCategory::Runtime
+        );
+        assert_eq!(
+            super::supervisor_child_failure_category(&LibdenoError::Configuration(
+                "configuration details".to_string()
+            )),
+            SupervisorFailureCategory::Infrastructure
+        );
+        assert_eq!(
+            super::supervisor_child_failure_category(&LibdenoError::Io(std::io::Error::other(
+                "io details",
+            ))),
+            SupervisorFailureCategory::Infrastructure
+        );
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn cleanup_failure_overrides_supervisor_cancellation() {
+        let cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::User,
+        );
+        cancellation.request(CancelReason::User);
+        let cleanup = Err(std::io::Error::other("synthetic reap failure"));
+        assert_eq!(
+            super::supervisor_session_failure_category(
+                &LibdenoError::Io(std::io::Error::other("session failure")),
+                &cleanup,
+                &cancellation,
+            ),
+            Some(SupervisorFailureCategory::Infrastructure)
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn no_terminal_reap_grace_distinguishes_natural_and_forced_exit() {
+        let cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::User,
+        );
+        let session_error = LibdenoError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "synthetic session EOF",
+        ));
+
+        let mut natural = std::process::Command::new("sh")
+            .args(["-c", "sleep 0.02"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let natural_reap = super::reap_supervisor_child(&mut natural).unwrap();
+        assert!(!natural_reap.forced_kill);
+        let natural_category = super::supervisor_session_failure_category(
+            &session_error,
+            &Ok(natural_reap),
+            &cancellation,
+        );
+        assert_eq!(
+            natural_category,
+            Some(SupervisorFailureCategory::ChildCrash)
+        );
+
+        let mut forced = std::process::Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let forced_reap = super::reap_supervisor_child(&mut forced).unwrap();
+        assert!(forced_reap.forced_kill);
+        let forced_cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::Deadline,
+        );
+        forced_cancellation.request(CancelReason::Deadline);
+        assert_eq!(
+            super::supervisor_session_failure_category(
+                &session_error,
+                &Ok(forced_reap),
+                &forced_cancellation,
+            ),
+            Some(SupervisorFailureCategory::Timeout)
+        );
+
+        let mut forced_user = std::process::Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let forced_user_reap = super::reap_supervisor_child(&mut forced_user).unwrap();
+        assert!(forced_user_reap.forced_kill);
+        let forced_user_cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::User,
+        );
+        forced_user_cancellation.request(CancelReason::User);
+        assert_eq!(
+            super::supervisor_session_failure_category(
+                &session_error,
+                &Ok(forced_user_reap),
+                &forced_user_cancellation,
+            ),
+            None,
+            "a successful forced user cancellation is mapped to Cancelled by the executor"
+        );
     }
 
     #[cfg(feature = "execution-control")]
@@ -2814,6 +3323,7 @@ mod tests {
         let completed = SupervisorTerminal {
             outcome: SupervisorOutcome::Completed,
             exit_code: Some(3),
+            category: None,
             stdout: Vec::new(),
             stderr: Vec::new(),
             truncated: false,
@@ -2830,6 +3340,8 @@ mod tests {
             let terminal = SupervisorTerminal {
                 outcome,
                 exit_code: None,
+                category: (outcome == SupervisorOutcome::Failed)
+                    .then_some(SupervisorFailureCategory::Runtime),
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 truncated: false,
@@ -2878,15 +3390,22 @@ mod tests {
         let terminal = SupervisorTerminal {
             outcome: SupervisorOutcome::Completed,
             exit_code: Some(0),
+            category: None,
             stdout: Vec::new(),
             stderr: Vec::new(),
             truncated: false,
         };
-        for reason in [
-            CancelReason::Deadline,
-            CancelReason::User,
-            CancelReason::Shutdown,
-        ] {
+        let deadline_error = super::map_supervisor_terminal_with_cancellation(
+            terminal.clone(),
+            status,
+            &request,
+            false,
+            Some(CancelReason::Deadline),
+        )
+        .unwrap_err();
+        assert!(matches!(deadline_error, LibdenoError::Timeout(_)));
+
+        for reason in [CancelReason::User, CancelReason::Shutdown] {
             let error = super::map_supervisor_terminal_with_cancellation(
                 terminal.clone(),
                 status,
@@ -2895,7 +3414,7 @@ mod tests {
                 Some(reason),
             )
             .unwrap_err();
-            assert!(matches!(error, LibdenoError::Timeout(_)));
+            assert!(!matches!(error, LibdenoError::Timeout(_)));
         }
         let output = super::map_supervisor_terminal_with_cancellation(
             terminal, status, &request, false, None,
@@ -2935,7 +3454,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut frame = Vec::new();
             frame.extend_from_slice(b"LDSV");
-            frame.push(1);
+            frame.push(SUPERVISOR_VERSION);
             frame.push(6);
             frame.extend_from_slice(&1u64.to_be_bytes());
             frame.extend_from_slice(&0u32.to_be_bytes());
@@ -3011,6 +3530,7 @@ mod tests {
             let terminal = SupervisorTerminal {
                 outcome: SupervisorOutcome::Deadline,
                 exit_code: None,
+                category: None,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 truncated: false,

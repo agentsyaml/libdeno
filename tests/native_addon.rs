@@ -27,7 +27,10 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-use libdeno::{run, LibdenoOptions};
+use libdeno::{run, run_with_output, LibdenoOptions};
+
+static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const FINALIZER_MARKER_ENV: &str = "LIBDENO_NATIVE_ADDON_FINALIZER_MARKER";
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("libdeno-addon-{}-{}", std::process::id(), name));
@@ -95,8 +98,16 @@ fn target_triple() -> String {
     .to_string()
 }
 
+fn assert_one_finalizer_marker(path: &Path) {
+    assert_eq!(
+        fs::read_to_string(path).unwrap(),
+        "native addon finalizer\n"
+    );
+}
+
 #[test]
 fn node_addon_requires_and_loads() {
+    let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Canonicalize the dir: permission checks use canonical paths (read via
     // the require loader, ffi via op_napi_open), so grant the canonical form
     // to avoid macOS /var -> /private/var mismatches.
@@ -108,6 +119,8 @@ fn node_addon_requires_and_loads() {
         "const m = require('./addon.node');\n\
          if (typeof m.add !== 'function') throw new Error('add not exported');\n\
          if (m.add(2, 3) !== 5) throw new Error('add(2, 3) !== 5');\n\
+         globalThis.addEventListener('unload', () => console.error('native unload'));\n\
+         process.on('exit', () => console.error('native process exit'));\n\
          console.log('addon works');",
     )
     .unwrap();
@@ -117,16 +130,43 @@ fn node_addon_requires_and_loads() {
             // op_napi_open checks the ffi permission on the addon path.
             format!("--allow-ffi={}", dir.display()),
         ],
+        capture_stderr: true,
         ..Default::default()
     };
-    let code = run(&entry, &options).unwrap();
-    assert_eq!(code, 0);
+    let output = run_with_output(&entry, &options).unwrap();
+    assert_eq!(output.exit_code, 0);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for marker in [
+        "native unload\n",
+        "native process exit\n",
+        "native addon finalizer\n",
+    ] {
+        assert_eq!(
+            stderr.matches(marker).count(),
+            1,
+            "expected exactly one {marker:?}: {stderr:?}"
+        );
+    }
+    let unload = stderr
+        .find("native unload\n")
+        .expect("unload listener did not run");
+    let process_exit = stderr
+        .find("native process exit\n")
+        .expect("process exit listener did not run");
+    let finalizer = stderr
+        .find("native addon finalizer\n")
+        .expect("native addon finalizer did not run");
+    assert!(
+        unload < process_exit && process_exit < finalizer,
+        "shutdown ordering must be unload -> process exit -> finalizer: {stderr:?}"
+    );
     let _ = addon;
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn node_addon_without_ffi_permission_is_rejected() {
+    let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Fail-closed: with read but no ffi grant, loading the addon must error.
     let dir = fs::canonicalize(temp_dir("noperm")).unwrap();
     build_addon(&dir);
@@ -141,5 +181,62 @@ fn node_addon_without_ffi_permission_is_rejected() {
         err.to_string().contains("ffi access"),
         "unexpected error: {err}"
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn node_addon_finalizer_runs_after_runtime_error() {
+    let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = fs::canonicalize(temp_dir("runtime-error")).unwrap();
+    build_addon(&dir);
+    let marker = dir.join("finalizer.marker");
+    std::env::set_var(FINALIZER_MARKER_ENV, &marker);
+    let entry = dir.join("main.cjs");
+    fs::write(
+        &entry,
+        "require('./addon.node'); throw new Error('native addon runtime failure');",
+    )
+    .unwrap();
+    let options = LibdenoOptions {
+        permissions: vec![
+            format!("--allow-read={}", dir.display()),
+            format!("--allow-ffi={}", dir.display()),
+        ],
+        ..Default::default()
+    };
+    let error = run(&entry, &options).unwrap_err();
+    std::env::remove_var(FINALIZER_MARKER_ENV);
+    assert!(
+        error.to_string().contains("native addon runtime failure"),
+        "expected original runtime error, got: {error}"
+    );
+    assert_one_finalizer_marker(&marker);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn node_addon_finalizer_runs_after_execution_deadline() {
+    let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = fs::canonicalize(temp_dir("deadline")).unwrap();
+    build_addon(&dir);
+    let marker = dir.join("finalizer.marker");
+    std::env::set_var(FINALIZER_MARKER_ENV, &marker);
+    let entry = dir.join("main.cjs");
+    fs::write(&entry, "require('./addon.node'); while (true) {}\n").unwrap();
+    let options = LibdenoOptions {
+        permissions: vec![
+            format!("--allow-read={}", dir.display()),
+            format!("--allow-ffi={}", dir.display()),
+        ],
+        execution_deadline: Some(std::time::Duration::from_millis(200)),
+        ..Default::default()
+    };
+    let error = run(&entry, &options).unwrap_err();
+    std::env::remove_var(FINALIZER_MARKER_ENV);
+    assert!(
+        matches!(error, libdeno::LibdenoError::Timeout(_)),
+        "expected Timeout, got: {error}"
+    );
+    assert_one_finalizer_marker(&marker);
     let _ = fs::remove_dir_all(&dir);
 }

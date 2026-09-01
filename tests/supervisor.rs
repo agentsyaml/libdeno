@@ -149,6 +149,33 @@ fn supervisor_capture_default_is_bounded_and_selective() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn supervised_helper_rejects_incomplete_parent_capture() {
+    let dir = temp_dir("helper-descendant-pipe");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "console.log('descendant-prefix');\n\
+         new Deno.Command('/bin/sh', { args: ['-c', 'sleep 1 &'], stdout: 'inherit', stderr: 'null' }).outputSync();\n\
+         Deno.exit(0);",
+    )
+    .unwrap();
+    let error = with_child_host(|| {
+        run_in_supervised_subprocess(
+            &entry,
+            &LibdenoOptions {
+                capture_stdout: true,
+                ..allow_all()
+            },
+        )
+    })
+    .unwrap_err();
+    assert!(matches!(error, LibdenoError::Runtime(_)));
+    assert_eq!(error.to_string(), "supervisor infrastructure failure");
+    let _ = fs::remove_dir_all(dir);
+}
+
 #[test]
 fn cancellation_before_start_does_not_run_user_code() {
     let dir = temp_dir("cancel-before-start");

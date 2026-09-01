@@ -24,6 +24,9 @@ use std::sync::{Condvar, Mutex, Weak};
 use crate::timing::{ExecutionTiming, Phase, PhaseTiming};
 use crate::{LibdenoError, LibdenoOptions, LibdenoRuntime, RunOutput};
 
+#[cfg(feature = "execution-control")]
+#[doc(hidden)]
+pub use crate::supervisor::SupervisorFailureCategory;
 #[cfg(feature = "phase-diagnostics")]
 #[doc(hidden)]
 pub use crate::timing::PhaseDiagnostics;
@@ -338,6 +341,8 @@ pub struct ExecutionOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     truncated: bool,
+    incomplete: bool,
+    reader_error: bool,
 }
 
 impl ExecutionOutput {
@@ -354,6 +359,21 @@ impl ExecutionOutput {
     /// Returns whether captured output exceeded its configured budget.
     pub fn capture_truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// Returns whether bounded parent capture ended before observing EOF.
+    #[cfg(feature = "execution-control")]
+    #[doc(hidden)]
+    pub fn capture_incomplete(&self) -> bool {
+        self.incomplete
+    }
+
+    /// Returns whether a parent capture reader failed, disconnected, or
+    /// panicked.
+    #[cfg(feature = "execution-control")]
+    #[doc(hidden)]
+    pub fn capture_reader_error(&self) -> bool {
+        self.reader_error
     }
 }
 
@@ -509,6 +529,24 @@ pub enum ExecutionError {
     #[cfg(feature = "execution-control")]
     #[error("execution cancelled")]
     Cancelled,
+    /// A supervised subprocess failed with a bounded, fixed category.
+    #[cfg(feature = "execution-control")]
+    #[doc(hidden)]
+    #[error("{0}")]
+    Supervisor(SupervisorFailureCategory),
+}
+
+impl ExecutionError {
+    /// Returns the fixed supervisor category, when this is a supervised
+    /// subprocess failure.
+    #[cfg(feature = "execution-control")]
+    #[doc(hidden)]
+    pub fn supervisor_category(&self) -> Option<SupervisorFailureCategory> {
+        match self {
+            Self::Supervisor(category) => Some(*category),
+            _ => None,
+        }
+    }
 }
 
 /// Details for a failed execution.
@@ -549,14 +587,21 @@ impl ExecutionFailure {
         self.error.as_ref()
     }
 
+    /// Returns the fixed supervisor category, when this is a supervised
+    /// subprocess failure.
+    #[cfg(feature = "execution-control")]
+    #[doc(hidden)]
+    pub fn supervisor_category(&self) -> Option<SupervisorFailureCategory> {
+        self.error.supervisor_category()
+    }
+
     /// Returns the failure report.
     pub fn report(&self) -> &ExecutionReport {
         self.report.as_ref()
     }
 
-    /// Returns partial output when a backend can provide it. Phase 2B's
-    /// existing capture paths do not expose error-time partial output, so this
-    /// is always `None` for current backends.
+    /// Returns partial output when a backend can provide it. Legacy and
+    /// in-process backends do not expose error-time partial output.
     pub fn partial_output(&self) -> Option<&ExecutionOutput> {
         self.partial_output.as_deref()
     }
@@ -695,6 +740,8 @@ fn clone_execution_error(error: &Arc<ExecutionError>) -> ExecutionError {
         ExecutionError::Internal(message) => ExecutionError::Internal(message.clone()),
         #[cfg(feature = "execution-control")]
         ExecutionError::Cancelled => ExecutionError::Cancelled,
+        #[cfg(feature = "execution-control")]
+        ExecutionError::Supervisor(category) => ExecutionError::Supervisor(*category),
     }
 }
 
@@ -983,39 +1030,75 @@ impl TaskControl {
                 failure.report.transport_status,
             ),
         };
-        let (lifecycle, result) = match state.cancel_reason {
-            Some(CancelReason::Deadline) => (
-                ExecutionState::Terminated,
-                Err(self.deadline_failure_with_metadata(
-                    Some(dispatched),
-                    cleanup_strength,
-                    transport_status,
-                )),
-            ),
-            Some(CancelReason::User | CancelReason::Shutdown) => (
-                ExecutionState::Terminated,
-                Err(self.cancelled_failure_with_metadata(
-                    Some(dispatched),
-                    cleanup_strength,
-                    transport_status,
-                )),
-            ),
-            None => match backend_result {
-                Ok(result) => (ExecutionState::Completed, Ok(result)),
-                Err(failure) => {
-                    let timed_out = matches!(
-                        failure.error(),
-                        ExecutionError::Libdeno(LibdenoError::Timeout(_))
-                    );
-                    (
-                        if timed_out {
-                            ExecutionState::Terminated
-                        } else {
-                            ExecutionState::Failed
-                        },
-                        Err(failure),
-                    )
-                }
+        let partial_output = match &backend_result {
+            // A supervisor can report a valid terminal result while its
+            // parent-owned capture is still bounded. If cancellation wins
+            // before publication, retain that captured output as partial.
+            Ok(result) if dispatched == ExecutionBackend::Subprocess => Some(result.output.clone()),
+            Ok(_) => None,
+            Err(failure) => failure.partial_output.as_deref().cloned(),
+        };
+        let supervisor_failure = match &backend_result {
+            Err(failure) => match failure.error() {
+                ExecutionError::Supervisor(
+                    category @ (SupervisorFailureCategory::Timeout
+                    | SupervisorFailureCategory::Infrastructure),
+                ) => Some(*category),
+                _ => None,
+            },
+            Ok(_) => None,
+        };
+        let (lifecycle, result) = match supervisor_failure {
+            Some(category) => {
+                let Err(failure) = backend_result else {
+                    unreachable!("supervisor category requires a failed backend result")
+                };
+                (
+                    if category == SupervisorFailureCategory::Timeout {
+                        ExecutionState::Terminated
+                    } else {
+                        ExecutionState::Failed
+                    },
+                    Err(failure),
+                )
+            }
+            None => match state.cancel_reason {
+                Some(CancelReason::Deadline) => (
+                    ExecutionState::Terminated,
+                    Err(self.deadline_failure_with_partial_and_metadata(
+                        Some(dispatched),
+                        cleanup_strength,
+                        transport_status,
+                        partial_output,
+                    )),
+                ),
+                Some(CancelReason::User | CancelReason::Shutdown) => (
+                    ExecutionState::Terminated,
+                    Err(self.cancelled_failure_with_partial_and_metadata(
+                        Some(dispatched),
+                        cleanup_strength,
+                        transport_status,
+                        partial_output,
+                    )),
+                ),
+                None => match backend_result {
+                    Ok(result) => (ExecutionState::Completed, Ok(result)),
+                    Err(failure) => {
+                        let timed_out = matches!(
+                            failure.error(),
+                            ExecutionError::Libdeno(LibdenoError::Timeout(_))
+                                | ExecutionError::Supervisor(SupervisorFailureCategory::Timeout)
+                        );
+                        (
+                            if timed_out {
+                                ExecutionState::Terminated
+                            } else {
+                                ExecutionState::Failed
+                            },
+                            Err(failure),
+                        )
+                    }
+                },
             },
         };
         state.lifecycle = lifecycle;
@@ -1070,6 +1153,21 @@ impl TaskControl {
         cleanup_strength: Option<ExecutionCleanupStrength>,
         transport_status: Option<ExecutionTransportStatus>,
     ) -> ExecutionFailure {
+        self.cancelled_failure_with_partial_and_metadata(
+            dispatched,
+            cleanup_strength,
+            transport_status,
+            None,
+        )
+    }
+
+    fn cancelled_failure_with_partial_and_metadata(
+        &self,
+        dispatched: Option<ExecutionBackend>,
+        cleanup_strength: Option<ExecutionCleanupStrength>,
+        transport_status: Option<ExecutionTransportStatus>,
+        partial_output: Option<ExecutionOutput>,
+    ) -> ExecutionFailure {
         ExecutionFailure::new(
             ExecutionError::Cancelled,
             self.report_with_metadata(
@@ -1078,7 +1176,7 @@ impl TaskControl {
                 cleanup_strength,
                 transport_status,
             ),
-            None,
+            partial_output,
         )
     }
 
@@ -1092,6 +1190,21 @@ impl TaskControl {
         cleanup_strength: Option<ExecutionCleanupStrength>,
         transport_status: Option<ExecutionTransportStatus>,
     ) -> ExecutionFailure {
+        self.deadline_failure_with_partial_and_metadata(
+            dispatched,
+            cleanup_strength,
+            transport_status,
+            None,
+        )
+    }
+
+    fn deadline_failure_with_partial_and_metadata(
+        &self,
+        dispatched: Option<ExecutionBackend>,
+        cleanup_strength: Option<ExecutionCleanupStrength>,
+        transport_status: Option<ExecutionTransportStatus>,
+        partial_output: Option<ExecutionOutput>,
+    ) -> ExecutionFailure {
         ExecutionFailure::new(
             ExecutionError::Libdeno(LibdenoError::Timeout(
                 "execution request deadline exceeded".to_string(),
@@ -1102,7 +1215,7 @@ impl TaskControl {
                 cleanup_strength,
                 transport_status,
             ),
-            None,
+            partial_output,
         )
     }
 }
@@ -1808,7 +1921,7 @@ impl ExecutorDispatch {
         &self,
         started: Instant,
         result: Result<
-            crate::supervisor::SupervisorRunResult,
+            crate::subprocess::SupervisorRunResult,
             crate::subprocess::SupervisedSubprocessError,
         >,
         options: &LibdenoOptions,
@@ -1818,25 +1931,29 @@ impl ExecutorDispatch {
             Ok(supervised) => {
                 let cleanup_strength = supervisor_cleanup_strength(supervised.cleanup_strength);
                 let transport_status = supervisor_transport_status(supervised.transport_status);
-                Ok(self.result_with_metadata(
-                    started,
-                    Some(ExecutionBackend::Subprocess),
-                    CapabilityOutcome::Used,
-                    supervised.output,
-                    options,
-                    timing,
-                    Some(cleanup_strength),
-                    Some(transport_status),
-                ))
+                Ok(ExecutionResult {
+                    exit_code: supervised.exit_code,
+                    output: supervisor_execution_output(supervised.partial_output, options),
+                    report: self.report_with_metadata(
+                        started,
+                        Some(ExecutionBackend::Subprocess),
+                        CapabilityOutcome::Used,
+                        timing,
+                        Some(cleanup_strength),
+                        Some(transport_status),
+                    ),
+                })
             }
             Err(error) => {
                 let crate::subprocess::SupervisedSubprocessError {
                     error,
+                    category,
+                    partial_output,
                     cleanup_strength,
                     transport_status,
                 } = error;
                 Err(ExecutionFailure::new(
-                    ExecutionError::Libdeno(error),
+                    category.map_or(ExecutionError::Libdeno(error), ExecutionError::Supervisor),
                     self.report_with_metadata(
                         started,
                         Some(ExecutionBackend::Subprocess),
@@ -1845,7 +1962,8 @@ impl ExecutorDispatch {
                         cleanup_strength.map(supervisor_cleanup_strength),
                         transport_status.map(supervisor_transport_status),
                     ),
-                    None,
+                    partial_output
+                        .map(|partial| supervisor_execution_output(Some(partial), options)),
                 ))
             }
         }
@@ -1919,6 +2037,8 @@ impl ExecutorDispatch {
                     Vec::new()
                 },
                 truncated: output.capture_truncated,
+                incomplete: false,
+                reader_error: false,
             },
             report: self.report_with_metadata(
                 started,
@@ -1973,6 +2093,31 @@ impl ExecutorDispatch {
             self.report(started, dispatched, CapabilityOutcome::Failed, timing),
             None,
         )
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_execution_output(
+    partial: Option<crate::subprocess::SupervisorPartialOutput>,
+    options: &LibdenoOptions,
+) -> ExecutionOutput {
+    let Some(partial) = partial else {
+        return ExecutionOutput::default();
+    };
+    ExecutionOutput {
+        stdout: if options.capture_stdout {
+            partial.stdout
+        } else {
+            Vec::new()
+        },
+        stderr: if options.capture_stderr {
+            partial.stderr
+        } else {
+            Vec::new()
+        },
+        truncated: partial.truncated,
+        incomplete: partial.incomplete,
+        reader_error: partial.reader_error,
     }
 }
 
@@ -2326,6 +2471,8 @@ impl Executor {
                     Vec::new()
                 },
                 truncated: output.capture_truncated,
+                incomplete: false,
+                reader_error: false,
             },
             report: self.report(started, dispatched, outcome, timing),
         }
@@ -2514,13 +2661,16 @@ mod tests {
             ))
         }
 
-        fn result() -> ExecutionResult {
+        fn result(backend: ExecutionBackend) -> ExecutionResult {
             ExecutionResult {
                 exit_code: 0,
-                output: ExecutionOutput::default(),
+                output: ExecutionOutput {
+                    stdout: b"captured-output".to_vec(),
+                    ..ExecutionOutput::default()
+                },
                 report: ExecutionReport {
-                    requested_backend: ExecutionBackend::InProcess,
-                    dispatched_backend: Some(ExecutionBackend::InProcess),
+                    requested_backend: backend,
+                    dispatched_backend: Some(backend),
                     elapsed: Duration::ZERO,
                     backend_outcome: CapabilityOutcome::Used,
                     timing: Box::new(PhaseTiming::default()),
@@ -2537,7 +2687,10 @@ mod tests {
         backend_first.mark_accepted();
         assert!(backend_first.begin_start());
         let resolved = backend_first
-            .resolve_backend_result(Ok(result()), ExecutionBackend::InProcess)
+            .resolve_backend_result(
+                Ok(result(ExecutionBackend::InProcess)),
+                ExecutionBackend::InProcess,
+            )
             .expect("backend must publish the first terminal result");
         assert_eq!(resolved.0, ExecutionState::Completed);
         assert_eq!(backend_first.state(), ExecutionState::Completed);
@@ -2563,14 +2716,39 @@ mod tests {
         );
         assert!(!cancellation_first.mark_started());
         let resolved = cancellation_first
-            .resolve_backend_result(Ok(result()), ExecutionBackend::InProcess)
+            .resolve_backend_result(
+                Ok(result(ExecutionBackend::InProcess)),
+                ExecutionBackend::InProcess,
+            )
             .expect("cancellation must publish the first terminal result");
         assert_eq!(resolved.0, ExecutionState::Terminated);
+        let failure = resolved.1.unwrap_err();
         assert!(matches!(
-            resolved.1.unwrap_err().error(),
+            failure.error(),
             ExecutionError::Libdeno(LibdenoError::Timeout(_))
         ));
+        assert!(failure.partial_output().is_none());
         assert_eq!(cancellation_first.state(), ExecutionState::Terminated);
+
+        let subprocess = control(&scheduler, 5, ExecutionBackend::Subprocess);
+        subprocess.mark_accepted();
+        assert!(subprocess.begin_start());
+        assert!(subprocess.mark_started());
+        assert_eq!(
+            subprocess.request_cancel(CancelReason::User),
+            CancelOutcome::Requested
+        );
+        let expected = result(ExecutionBackend::Subprocess).output.clone();
+        let resolved = subprocess
+            .resolve_backend_result(
+                Ok(result(ExecutionBackend::Subprocess)),
+                ExecutionBackend::Subprocess,
+            )
+            .expect("subprocess cancellation must publish the first terminal result");
+        assert_eq!(resolved.0, ExecutionState::Terminated);
+        let failure = resolved.1.unwrap_err();
+        assert!(matches!(failure.error(), ExecutionError::Cancelled));
+        assert_eq!(failure.partial_output(), Some(&expected));
 
         let prestart = control(&scheduler, 3, ExecutionBackend::Subprocess);
         prestart.mark_accepted();
@@ -2620,6 +2798,170 @@ mod tests {
             next_id: 2,
         };
         assert_eq!(next_deadline(&state), None);
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn supervisor_timeout_category_is_a_terminated_backend_failure() {
+        let scheduler =
+            AdmissionScheduler::new(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 0));
+        let control = Arc::new(TaskControl::new(
+            1,
+            ExecutionBackend::Subprocess,
+            Instant::now(),
+            None,
+            ExecutionTiming::disabled(),
+            Arc::downgrade(&scheduler),
+        ));
+        control.mark_accepted();
+        assert!(control.begin_start());
+        assert_eq!(
+            control.request_cancel(CancelReason::Deadline),
+            CancelOutcome::Requested
+        );
+        let partial = ExecutionOutput {
+            stdout: b"deadline-prefix".to_vec(),
+            ..ExecutionOutput::default()
+        };
+        let failure = ExecutionFailure::new(
+            ExecutionError::Supervisor(SupervisorFailureCategory::Timeout),
+            control.report(
+                Some(ExecutionBackend::Subprocess),
+                ExecutionTiming::disabled(),
+            ),
+            Some(partial.clone()),
+        );
+        let resolved = control
+            .resolve_backend_result(Err(failure), ExecutionBackend::Subprocess)
+            .expect("supervisor timeout must publish a terminal result");
+        assert_eq!(resolved.0, ExecutionState::Terminated);
+        let failure = resolved.1.unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            ExecutionError::Supervisor(SupervisorFailureCategory::Timeout)
+        ));
+        assert_eq!(failure.partial_output(), Some(&partial));
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn supervisor_infrastructure_failure_overrides_cancellation() {
+        let scheduler =
+            AdmissionScheduler::new(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 0));
+        let control = Arc::new(TaskControl::new(
+            1,
+            ExecutionBackend::Subprocess,
+            Instant::now(),
+            None,
+            ExecutionTiming::disabled(),
+            Arc::downgrade(&scheduler),
+        ));
+        control.mark_accepted();
+        assert!(control.begin_start());
+        assert_eq!(
+            control.request_cancel(CancelReason::User),
+            CancelOutcome::Requested
+        );
+        let failure = ExecutionFailure::new(
+            ExecutionError::Supervisor(SupervisorFailureCategory::Infrastructure),
+            control.report(
+                Some(ExecutionBackend::Subprocess),
+                ExecutionTiming::disabled(),
+            ),
+            Some(ExecutionOutput::default()),
+        );
+        let resolved = control
+            .resolve_backend_result(Err(failure), ExecutionBackend::Subprocess)
+            .expect("supervisor infrastructure failure must remain visible");
+        assert_eq!(resolved.0, ExecutionState::Failed);
+        let failure = resolved.1.unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            ExecutionError::Supervisor(SupervisorFailureCategory::Infrastructure)
+        ));
+        assert!(failure.partial_output().is_some());
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn failed_supervisor_transport_does_not_replace_valid_terminal_result() {
+        let dispatch = ExecutorDispatch {
+            project_dir: PathBuf::new(),
+            backend: ExecutionBackend::Subprocess,
+            state: ExecutorBackend::Subprocess(PathBuf::new()),
+            panic_on_execute: false,
+        };
+        let output = dispatch
+            .finish_supervised(
+                Instant::now(),
+                Ok(crate::subprocess::SupervisorRunResult {
+                    exit_code: 7,
+                    partial_output: None,
+                    cleanup_strength: crate::supervisor::CleanupStrength::DirectChild,
+                    transport_status: crate::supervisor::SupervisorTransportStatus::Failed,
+                }),
+                &LibdenoOptions::default(),
+                ExecutionTiming::disabled(),
+            )
+            .expect("transport status must not replace a valid terminal");
+        assert_eq!(output.exit_code(), 7);
+        assert_eq!(
+            output.report().transport_status(),
+            Some(ExecutionTransportStatus::Failed)
+        );
+
+        let output = dispatch
+            .finish_supervised(
+                Instant::now(),
+                Ok(crate::subprocess::SupervisorRunResult {
+                    exit_code: 0,
+                    partial_output: Some(crate::subprocess::SupervisorPartialOutput {
+                        stdout: b"partial".to_vec(),
+                        stderr: Vec::new(),
+                        truncated: false,
+                        incomplete: true,
+                        reader_error: true,
+                    }),
+                    cleanup_strength: crate::supervisor::CleanupStrength::DirectChild,
+                    transport_status: crate::supervisor::SupervisorTransportStatus::Failed,
+                }),
+                &LibdenoOptions {
+                    capture_stdout: true,
+                    ..Default::default()
+                },
+                ExecutionTiming::disabled(),
+            )
+            .expect("reader failure must not replace a valid terminal");
+        assert_eq!(output.output().stdout(), b"partial");
+        assert!(output.output().capture_incomplete());
+        assert!(output.output().capture_reader_error());
+        assert_eq!(
+            output.report().transport_status(),
+            Some(ExecutionTransportStatus::Failed)
+        );
+
+        let failure = dispatch
+            .finish_supervised(
+                Instant::now(),
+                Err(crate::subprocess::SupervisedSubprocessError {
+                    error: LibdenoError::Runtime(deno_core::anyhow::anyhow!("ignored detail")),
+                    category: Some(SupervisorFailureCategory::Runtime),
+                    partial_output: None,
+                    cleanup_strength: Some(crate::supervisor::CleanupStrength::DirectChild),
+                    transport_status: Some(crate::supervisor::SupervisorTransportStatus::Failed),
+                }),
+                &LibdenoOptions::default(),
+                ExecutionTiming::disabled(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            ExecutionError::Supervisor(SupervisorFailureCategory::Runtime)
+        ));
+        assert_eq!(
+            failure.report().transport_status(),
+            Some(ExecutionTransportStatus::Failed)
+        );
     }
 
     #[cfg(feature = "execution-control")]
@@ -2826,6 +3168,8 @@ mod tests {
             stdout: b"partial".to_vec(),
             stderr: Vec::new(),
             truncated: true,
+            incomplete: false,
+            reader_error: false,
         };
         let report = ExecutionReport {
             requested_backend: ExecutionBackend::InProcess,

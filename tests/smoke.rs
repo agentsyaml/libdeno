@@ -156,6 +156,89 @@ fn in_process_deno_exit_returns_code() {
 }
 
 #[test]
+fn beforeunload_prevent_default_repeats_before_exit() {
+    let dir = temp_dir("beforeunload-repeat");
+    let entry = dir.join("main.js");
+    let events = dir.join("events.log");
+    fs::write(&events, "").unwrap();
+    fs::write(
+        &entry,
+        format!(
+            r#"const events = {:?};
+const append = (event) => Deno.writeTextFileSync(events, event + ",", {{ append: true }});
+let beforeunloadCount = 0;
+globalThis.addEventListener("beforeunload", (event) => {{
+  append("beforeunload");
+  if (++beforeunloadCount === 1) {{
+    event.preventDefault();
+    setTimeout(() => append("timer"), 0);
+  }}
+}});
+process.on("beforeExit", () => append("beforeExit"));
+globalThis.addEventListener("unload", () => append("unload"));
+process.on("exit", () => append("exit"));
+"#,
+            events
+        ),
+    )
+    .unwrap();
+    let code = run(
+        &entry,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(
+        fs::read_to_string(&events).unwrap(),
+        "beforeunload,timer,beforeunload,beforeExit,unload,exit,"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn process_before_exit_work_repeats_lifecycle() {
+    let dir = temp_dir("before-exit-repeat");
+    let entry = dir.join("main.js");
+    let events = dir.join("events.log");
+    fs::write(&events, "").unwrap();
+    fs::write(
+        &entry,
+        format!(
+            r#"const events = {:?};
+const append = (event) => Deno.writeTextFileSync(events, event + ",", {{ append: true }});
+let beforeExitCount = 0;
+globalThis.addEventListener("beforeunload", () => append("beforeunload"));
+process.on("beforeExit", () => {{
+  append("beforeExit");
+  if (++beforeExitCount === 1) setTimeout(() => append("timer"), 0);
+}});
+globalThis.addEventListener("unload", () => append("unload"));
+process.on("exit", () => append("exit"));
+"#,
+            events
+        ),
+    )
+    .unwrap();
+    let code = run(
+        &entry,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(
+        fs::read_to_string(&events).unwrap(),
+        "beforeunload,beforeExit,timer,beforeunload,beforeExit,unload,exit,"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn script_error_returns_runtime_error() {
     let dir = temp_dir("throw");
     let entry = dir.join("main.js");
@@ -932,6 +1015,30 @@ fn execution_deadline_terminates_infinite_loop() {
     fs::write(&entry, "while (true) {}").unwrap();
     let options = LibdenoOptions {
         execution_deadline: Some(std::time::Duration::from_millis(200)),
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let err = run(&entry, &options).unwrap_err();
+    assert!(
+        matches!(err, libdeno::LibdenoError::Timeout(_)),
+        "expected Timeout, got: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn execution_deadline_terminates_lifecycle_continuation_loop() {
+    // A beforeunload handler that always prevents the default must not spin
+    // forever outside the existing deadline boundary.
+    let dir = temp_dir("deadline-beforeunload");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "globalThis.addEventListener('beforeunload', (event) => event.preventDefault());",
+    )
+    .unwrap();
+    let options = LibdenoOptions {
+        execution_deadline: Some(std::time::Duration::from_millis(100)),
         allow_all_permissions: true,
         ..Default::default()
     };

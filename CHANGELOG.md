@@ -163,10 +163,11 @@ breaking changes are highlighted per release with migration notes.
   `LIBDENO_ANALYSIS_CACHE_ENTRIES`): a full reset is cheaper and more
   predictable than an LRU on this hot path, and a clear only costs the next
   run one rebuild (deliberate — see `src/analysis_cache.rs`).
-- **Disk code cache is untested and keyed with `DefaultHasher`**, whose
-  output is not stable across rustc upgrades: after a toolchain update the
-  on-disk entries are simply recompiled (a wasted compile, never a wrong hit
-  — perf-only).
+- **Disk code cache keys use `DefaultHasher`**, whose output is not stable
+  across rustc upgrades: after a toolchain update the on-disk entries are
+  simply recompiled (a wasted compile, never a wrong hit — perf-only). Its
+  nonblocking OS advisory lock is best-effort; unsupported filesystems skip
+  the disk tier.
 - **`features` behavior is covered**: tests cover default and custom
   in-process feature sets and subprocess forwarding.
 
@@ -248,12 +249,15 @@ breaking changes are highlighted per release with migration notes.
   upstream's streaming fallback (no reservation) remains the precise bound.
 - **Disk-backed V8 code cache**: compiled script bytes now survive process
   restarts — CLI-style hosts (every npm-plugin invocation is a fresh process)
-  skip recompilation on cold starts. Located at `LIBDENO_CODE_CACHE_DIR` or
-  `<DENO_DIR>/code_cache`; without either the cache stays in-memory (tests
-  are always in-memory). Keyed by (specifier, type, source hash) so stale or
+  skip recompilation on cold starts. Located under a dedicated
+  `libdeno-v8-code-cache-v1` namespace below `LIBDENO_CODE_CACHE_DIR` or
+  `<DENO_DIR>/code_cache`; without either the cache stays in-memory. Keyed by
+  (specifier, type, source hash) so stale or
   cross-project entries can never be served; V8 validates code-cache data
   itself, and all disk I/O is best-effort (a read-only cache dir never fails
-  a run). Directory hygiene: wiped when it exceeds the in-memory entry cap.
+  a run). A nonblocking OS advisory lock serializes cooperating processes.
+  Bounded disk maintenance is repeatable and evicts oldest entries first
+  without touching files outside that namespace.
 
 ### Tests
 

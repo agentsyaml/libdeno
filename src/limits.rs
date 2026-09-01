@@ -1,14 +1,22 @@
 //! Resource limits: V8 heap constraints, execution deadlines, child-mode IPC
 //! gating, and the in-process V8 code cache.
 
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::future::Future;
+use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 use deno_core::v8;
 use deno_core::v8::IsolateHandle;
@@ -250,6 +258,19 @@ const CODE_CACHE_MAX_ENTRIES: usize = 1024;
 /// OnceLock for the lifetime of the host).
 const CODE_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 
+/// Files from older libdeno versions lived directly below the configured
+/// directory. Keep that directory untouched and give this cache an owned,
+/// versioned namespace instead.
+const CODE_CACHE_NAMESPACE: &str = "libdeno-v8-code-cache-v1";
+const CODE_CACHE_LOCK_NAME: &str = ".libdeno-v8-code-cache-v1.lock";
+const CODE_CACHE_TEMP_PREFIX: &str = ".libdeno-v8-code-cache-v1-tmp-";
+
+// The lock is deliberately nonblocking and best-effort. Ownership is the
+// open-handle OS advisory lock, not mtime or file contents; unsupported or
+// contended disk operations simply fall back to memory/execution.
+
+static CODE_CACHE_DISK_ID: AtomicU64 = AtomicU64::new(0);
+
 /// (specifier, cache type, source hash) -> compiled script bytes.
 type CodeCacheKey = (String, CodeCacheType, u64);
 type CodeCacheEntry = (CodeCacheKey, Vec<u8>);
@@ -264,7 +285,8 @@ struct InMemoryCodeCache {
     /// keyed by a hash of (specifier, type, source hash) so stale or
     /// cross-project entries can never be served for the wrong source. V8
     /// validates code-cache data itself, so corrupted/tampered files are
-    /// rejected at compile time, never mis-executed. `None` in tests.
+    /// rejected at compile time, never mis-executed. Tests inject temporary
+    /// roots when exercising the disk layer.
     disk_dir: Option<PathBuf>,
 }
 
@@ -289,9 +311,10 @@ impl InMemoryCodeCache {
 }
 
 impl InMemoryCodeCache {
-    /// Disk directory for the code cache: `LIBDENO_CODE_CACHE_DIR` overrides,
-    /// else `<DENO_DIR>/code_cache`. Without either (and with an empty
-    /// override) the cache stays in-memory only.
+    /// Configured root for the code cache: `LIBDENO_CODE_CACHE_DIR` overrides,
+    /// else `<DENO_DIR>/code_cache`; cache files live in the versioned
+    /// namespace below that root. Without either (and with an empty override)
+    /// the cache stays in-memory only.
     fn disk_dir_from_env() -> Option<PathBuf> {
         if let Some(dir) = std::env::var_os("LIBDENO_CODE_CACHE_DIR") {
             return if dir.is_empty() {
@@ -310,13 +333,51 @@ impl InMemoryCodeCache {
         }
     }
 
+    #[cfg(test)]
+    fn with_disk_limits(dir: PathBuf, max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            disk_dir: Some(dir),
+            limits: (max_entries, max_bytes),
+            ..Default::default()
+        }
+    }
+
+    fn disk_namespace(&self) -> Option<PathBuf> {
+        self.disk_dir
+            .as_ref()
+            .map(|dir| dir.join(CODE_CACHE_NAMESPACE))
+    }
+
+    fn ensure_disk_namespace(&self) -> Option<PathBuf> {
+        let root = self.disk_dir.as_ref()?;
+        if std::fs::create_dir_all(root).is_err() {
+            return None;
+        }
+        let namespace = root.join(CODE_CACHE_NAMESPACE);
+        match std::fs::symlink_metadata(&namespace) {
+            Ok(metadata) if is_safe_namespace_directory(&metadata) => Some(namespace),
+            Ok(_) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::create_dir(&namespace).is_ok() {
+                    Some(namespace)
+                } else {
+                    match std::fs::symlink_metadata(&namespace) {
+                        Ok(metadata) if is_safe_namespace_directory(&metadata) => Some(namespace),
+                        _ => None,
+                    }
+                }
+            }
+            Err(_) => None,
+        }
+    }
+
     /// Deterministic file name for a cache key; the specifier itself never
     /// appears in the path (it can contain `/`, `..`, and platform
     /// separators). Source-hash in the key means a changed source writes a
     /// different file, never a stale hit.
     fn disk_path(&self, key: &CodeCacheKey) -> Option<PathBuf> {
         use std::hash::Hasher;
-        let dir = self.disk_dir.as_ref()?;
+        let dir = self.disk_namespace()?;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         h.write(key.0.as_bytes());
         h.write_u8(match key.1 {
@@ -326,40 +387,427 @@ impl InMemoryCodeCache {
         h.write_u64(key.2);
         Some(dir.join(format!("{:016x}.bin", h.finish())))
     }
-    /// Bounded disk hygiene: on the first write of a process, delete files
-    /// matching this cache's own naming scheme (16 hex chars + `.bin`) if
-    /// there are more of them than the in-memory entry cap (eviction is
-    /// best-effort anyway; a clear only costs one cold run). The check runs
-    /// once per process, so a long-lived host's disk tier can grow past the
-    /// in-memory cap between checks — cache loss at worst (V8 validates
-    /// every code-cache payload), never wrong execution.
-    fn maybe_clean_disk(&self) {
-        static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let Some(dir) = &self.disk_dir else { return };
-        if CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+}
+
+#[cfg(windows)]
+mod windows_namespace_lock {
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::os::windows::io::AsRawHandle;
+
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+
+    #[repr(C)]
+    pub(crate) struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut c_void,
+    }
+
+    impl Overlapped {
+        fn zeroed() -> Self {
+            Self {
+                internal: 0,
+                internal_high: 0,
+                offset: 0,
+                offset_high: 0,
+                event: std::ptr::null_mut(),
+            }
+        }
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        #[link_name = "LockFileEx"]
+        fn lock_file_ex(
+            file: *mut c_void,
+            flags: u32,
+            reserved: u32,
+            bytes_low: u32,
+            bytes_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        #[link_name = "UnlockFileEx"]
+        fn unlock_file_ex(
+            file: *mut c_void,
+            reserved: u32,
+            bytes_low: u32,
+            bytes_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    pub(crate) fn try_lock(file: &File) -> Option<Overlapped> {
+        let mut overlapped = Overlapped::zeroed();
+        let locked = unsafe {
+            lock_file_ex(
+                file.as_raw_handle(),
+                LOCKFILE_FAIL_IMMEDIATELY | LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            ) != 0
+        };
+        locked.then_some(overlapped)
+    }
+
+    pub(crate) fn unlock(file: &File, overlapped: &mut Overlapped) {
+        let _ = unsafe { unlock_file_ex(file.as_raw_handle(), 0, 1, 0, overlapped) };
+    }
+}
+
+struct NamespaceLock {
+    file: File,
+    #[cfg(windows)]
+    overlapped: windows_namespace_lock::Overlapped,
+}
+
+impl NamespaceLock {
+    #[cfg(not(any(unix, windows)))]
+    fn acquire(_namespace: &std::path::Path) -> Option<Self> {
+        None
+    }
+
+    #[cfg(any(unix, windows))]
+    fn acquire(namespace: &std::path::Path) -> Option<Self> {
+        let path = namespace.join(CODE_CACHE_LOCK_NAME);
+        let file = open_lock_file(&path)?;
+        #[cfg(unix)]
+        {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return None;
+            }
+            Some(Self { file })
+        }
+        #[cfg(windows)]
+        {
+            let overlapped = windows_namespace_lock::try_lock(&file)?;
+            Some(Self { file, overlapped })
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn open_lock_file(path: &std::path::Path) -> Option<File> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if is_safe_owned_file(&metadata) => {}
+        Ok(_) => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .ok()?;
+    if std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| is_safe_owned_file(&metadata))
+    {
+        Some(file)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Drop for NamespaceLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        #[cfg(windows)]
+        windows_namespace_lock::unlock(&self.file, &mut self.overlapped);
+    }
+}
+
+struct OwnedDiskFile {
+    name: String,
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn is_lower_hex_bin_name(name: &str) -> bool {
+    name.len() == 20
+        && name.ends_with(".bin")
+        && name.as_bytes()[..16]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
+}
+
+fn is_owned_temp_name(name: &str) -> bool {
+    name.strip_prefix(CODE_CACHE_TEMP_PREFIX)
+        .is_some_and(|suffix| !suffix.is_empty())
+}
+
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn is_safe_namespace_directory(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_dir() && !is_reparse_point(metadata)
+}
+
+fn is_safe_owned_file(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_file()
+        && !metadata.file_type().is_symlink()
+        && !is_reparse_point(metadata)
+}
+
+fn scan_owned_disk_files(namespace: &std::path::Path) -> std::io::Result<Vec<OwnedDiskFile>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(namespace)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_lower_hex_bin_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !is_safe_owned_file(&metadata) {
+            continue;
+        }
+        files.push(OwnedDiskFile {
+            name: name.to_owned(),
+            path,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        });
+    }
+    Ok(files)
+}
+
+fn cleanup_owned_temp_files(namespace: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(namespace)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_owned_temp_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !is_safe_owned_file(&metadata) {
+            continue;
+        }
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn remove_owned_disk_file(path: &std::path::Path) -> std::io::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if !is_safe_owned_file(&metadata) {
+        return Ok(false);
+    }
+    std::fs::remove_file(path)?;
+    Ok(true)
+}
+
+fn sort_owned_disk_files(files: &mut [OwnedDiskFile]) {
+    files.sort_by(|left, right| match (left.modified, right.modified) {
+        (None, None) => left.name.cmp(&right.name),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(left_time), Some(right_time)) => left_time
+            .cmp(&right_time)
+            .then_with(|| left.name.cmp(&right.name)),
+    });
+}
+
+fn maintain_disk_locked(
+    namespace: &std::path::Path,
+    max_entries: usize,
+    max_bytes: usize,
+) -> std::io::Result<()> {
+    cleanup_owned_temp_files(namespace)?;
+    let mut files = scan_owned_disk_files(namespace)?;
+    let max_bytes = u64::try_from(max_bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "code-cache byte limit does not fit in metadata length",
+        )
+    })?;
+    let mut total = files.iter().try_fold(0u64, |total, file| {
+        total.checked_add(file.len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "code-cache metadata length overflow",
+            )
+        })
+    })?;
+    sort_owned_disk_files(&mut files);
+    while files.len() > max_entries || total > max_bytes {
+        let file = files.remove(0);
+        let _ = remove_owned_disk_file(&file.path)?;
+        // A path that changed into a symlink/directory is no longer one of
+        // our owned regular files even when the removal helper preserved it.
+        total -= file.len;
+    }
+    Ok(())
+}
+
+fn create_disk_temp_file(namespace: &std::path::Path) -> std::io::Result<(PathBuf, File)> {
+    for _ in 0..1024 {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            CODE_CACHE_DISK_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = namespace.join(format!("{CODE_CACHE_TEMP_PREFIX}{suffix}"));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "unable to allocate a unique code-cache temporary file",
+    ))
+}
+
+fn final_path_is_publishable(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(is_safe_owned_file(&metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+fn publish_disk_file(
+    namespace: &std::path::Path,
+    final_path: &std::path::Path,
+    data: &[u8],
+) -> std::io::Result<bool> {
+    if !final_path_is_publishable(final_path)? {
+        return Ok(false);
+    }
+    let (temp_path, mut temp_file) = create_disk_temp_file(namespace)?;
+    if let Err(error) = temp_file
+        .write_all(data)
+        .and_then(|()| temp_file.sync_all())
+    {
+        drop(temp_file);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    drop(temp_file);
+
+    if !final_path_is_publishable(final_path)? {
+        let _ = std::fs::remove_file(&temp_path);
+        return Ok(false);
+    }
+
+    #[cfg(windows)]
+    if std::fs::symlink_metadata(final_path)
+        .ok()
+        .is_some_and(|metadata| is_safe_owned_file(&metadata))
+    {
+        // Windows rename does not replace an existing file. Readers take the
+        // same namespace lock, so this short remove/rename window cannot
+        // expose a partial file; a crash can leave a miss, which is safe.
+        std::fs::remove_file(final_path)?;
+    }
+
+    match std::fs::rename(&temp_path, final_path) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            Err(error)
+        }
+    }
+}
+
+impl InMemoryCodeCache {
+    fn read_disk(&self, key: &CodeCacheKey) -> Option<Vec<u8>> {
+        let namespace = self.ensure_disk_namespace()?;
+        let _lock = NamespaceLock::acquire(&namespace)?;
+        let path = self.disk_path(key)?;
+        let (max_entries, max_bytes) = self.limits;
+        if max_entries == 0 {
+            return None;
+        }
+        let max_bytes = u64::try_from(max_bytes).ok()?;
+        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        if !is_safe_owned_file(&metadata) {
+            return None;
+        }
+        if metadata.len() > max_bytes {
+            let removed = remove_owned_disk_file(&path).ok().unwrap_or(false);
+            if removed {
+                let _ = maintain_disk_locked(&namespace, max_entries, max_bytes as usize);
+            }
+            return None;
+        }
+
+        let file = File::open(&path).ok()?;
+        let mut data = Vec::new();
+        if file
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut data)
+            .is_err()
+        {
+            return None;
+        }
+        if data.len() > max_bytes as usize {
+            let removed = remove_owned_disk_file(&path).ok().unwrap_or(false);
+            if removed {
+                let _ = maintain_disk_locked(&namespace, max_entries, max_bytes as usize);
+            }
+            return None;
+        }
+        Some(data)
+    }
+
+    fn write_disk(&self, key: &CodeCacheKey, data: &[u8]) {
+        let Some(namespace) = self.ensure_disk_namespace() else {
+            return;
+        };
+        let Some(_lock) = NamespaceLock::acquire(&namespace) else {
+            return;
+        };
+        let (max_entries, max_bytes) = self.limits;
+        // A complete maintenance pass is required before publishing. If the
+        // scan or an eviction fails, the disk tier remains best-effort and the
+        // new value is not published with uncertain bounds.
+        if maintain_disk_locked(&namespace, max_entries, max_bytes).is_err()
+            || max_entries == 0
+            || data.len() > max_bytes
+        {
             return;
         }
-        let bin_entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
-            Ok(entries) => entries
-                .flatten()
-                .map(|e| e.path())
-                // Only this cache's own naming scheme (16 hex chars + .bin)
-                // is ever touched: other tools' .bin files in a shared
-                // LIBDENO_CODE_CACHE_DIR, or a concurrent libdeno process's
-                // entries, survive.
-                .filter(|p| {
-                    p.extension().is_some_and(|ext| ext == "bin")
-                        && p.file_stem().is_some_and(|stem| {
-                            let s = stem.to_str().unwrap_or("");
-                            s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
-                        })
-                })
-                .collect(),
-            Err(_) => return,
+        let Some(path) = self.disk_path(key) else {
+            return;
         };
-        if bin_entries.len() > CODE_CACHE_MAX_ENTRIES {
-            for path in bin_entries {
-                let _ = std::fs::remove_file(path);
+        if let Ok(true) = publish_disk_file(&namespace, &path, data) {
+            // The write itself is a mutation; maintain again while still
+            // holding the lock so every successful write leaves both
+            // production limits enforceable.
+            if maintain_disk_locked(&namespace, max_entries, max_bytes).is_err() {
+                let _ = remove_owned_disk_file(&path);
             }
         }
     }
@@ -388,7 +836,7 @@ impl CodeCache for InMemoryCodeCache {
         // per module here. No memory backfill — by the time get_sync runs the
         // compile will set_sync anyway (or the cached code is used and the
         // next process reads the disk again; either way the file is correct).
-        std::fs::read(self.disk_path(&key)?).ok()
+        self.read_disk(&key)
     }
 
     fn set_sync(
@@ -399,7 +847,7 @@ impl CodeCache for InMemoryCodeCache {
         data: &[u8],
     ) {
         let key = (specifier.as_str().to_owned(), code_cache_type, source_hash);
-        let disk_path = self.disk_path(&key);
+        let disk_key = self.disk_dir.as_ref().map(|_| key.clone());
         let (max_entries, max_bytes) = self.limits;
         let mut state = self.state.lock().unwrap();
         let (entries, total) = &mut *state;
@@ -430,14 +878,10 @@ impl CodeCache for InMemoryCodeCache {
         // "uncacheable" (larger than max_bytes) are skipped, keeping the
         // disk tier's per-entry bound identical to memory.
         drop(state);
-        if let Some(path) = disk_path {
-            if data.len() <= max_bytes {
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                let _ = std::fs::write(&path, data);
-                self.maybe_clean_disk();
-            }
+        if let Some(disk_key) = disk_key {
+            // A zero-capacity or oversized insert cannot be published, but a
+            // locked maintenance pass still cleans owned old entries.
+            self.write_disk(&disk_key, data);
         }
     }
 }
@@ -610,9 +1054,19 @@ where
 
     let _ = done_tx.send(());
     let _ = terminator.join();
+    let cancellation_requested = cancellation
+        .as_ref()
+        .is_some_and(CancellationContext::is_requested);
 
     if let Some(cancellation) = &cancellation {
         cancellation.clear();
+    }
+
+    // V8 can return its termination error in the same poll in which the
+    // cancellation notification becomes ready. Treat that result as the
+    // cancellation that caused it rather than leaking a low-level Core error.
+    if cancellation_requested {
+        return Err(ExecutionTermination::Cancelled);
     }
 
     if let Some(termination) = termination {
@@ -653,16 +1107,25 @@ pub(crate) async fn run_worker_cancellable(
     let _user_execution = timing.span(Phase::UserExecution);
     let run = async {
         worker.execute_main_module(main_module).await?;
-        worker.run_event_loop(false).await?;
         worker.dispatch_load_event()?;
-        worker.run_event_loop(false).await?;
-        worker.dispatch_beforeunload_event()?;
+        loop {
+            worker.run_event_loop(false).await?;
+            if worker.dispatch_beforeunload_event()? {
+                continue;
+            }
+            if worker.dispatch_process_beforeexit_event()? {
+                continue;
+            }
+            break;
+        }
         worker.dispatch_unload_event()?;
-        worker.dispatch_process_beforeexit_event()?;
         worker.dispatch_process_exit_event()?;
         Ok::<(), crate::LibdenoError>(())
     };
-    run_with_deadline_cancellable(run, execution_deadline, isolate_handle, cancellation).await
+    let result =
+        run_with_deadline_cancellable(run, execution_deadline, isolate_handle, cancellation).await;
+    worker.run_napi_ref_finalizers();
+    result
 }
 
 /// Environment marker pairing an IPC child with its spawner: set on the
@@ -895,6 +1358,772 @@ mod tests {
             cache.get_sync(&spec(4), CodeCacheType::Script, 4).unwrap(),
             vec![4u8; 60]
         );
+    }
+
+    fn disk_test_root(name: &str) -> PathBuf {
+        let id = CODE_CACHE_DISK_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "libdeno-v8-code-cache-v3-{}-{id}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn disk_test_specifier(index: u64) -> ModuleSpecifier {
+        ModuleSpecifier::parse(&format!("file:///libdeno-v8-code-cache-v3/{index}.js")).unwrap()
+    }
+
+    fn disk_test_paths(root: &std::path::Path) -> Vec<PathBuf> {
+        let namespace = root.join(CODE_CACHE_NAMESPACE);
+        let mut paths = std::fs::read_dir(namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_lower_hex_bin_name)
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn disk_test_cleanup(root: PathBuf) {
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn disk_test_set(cache: &InMemoryCodeCache, index: u64, data: &[u8]) {
+        cache.set_sync(
+            disk_test_specifier(index),
+            CodeCacheType::Script,
+            index,
+            data,
+        );
+    }
+
+    fn disk_test_set_modified(cache: &InMemoryCodeCache, index: u64, seconds_ago: u64) {
+        let path = cache
+            .disk_path(&(
+                disk_test_specifier(index).as_str().to_owned(),
+                CodeCacheType::Script,
+                index,
+            ))
+            .unwrap();
+        File::open(path)
+            .unwrap()
+            .set_modified(
+                SystemTime::now()
+                    .checked_sub(Duration::from_secs(seconds_ago))
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    struct TestChild(std::process::Child);
+
+    #[cfg(any(unix, windows))]
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    const DISK_WRITER_ROOT_ENV: &str = "LIBDENO_V8_CODE_CACHE_WRITER_ROOT";
+    #[cfg(any(unix, windows))]
+    const DISK_WRITER_ID_ENV: &str = "LIBDENO_V8_CODE_CACHE_WRITER_ID";
+    #[cfg(any(unix, windows))]
+    const DISK_WRITER_KEY_ENV: &str = "LIBDENO_V8_CODE_CACHE_WRITER_KEY";
+    #[cfg(any(unix, windows))]
+    const DISK_WRITER_BYTE_ENV: &str = "LIBDENO_V8_CODE_CACHE_WRITER_BYTE";
+    #[cfg(any(unix, windows))]
+    const DISK_WRITER_SIZE_ENV: &str = "LIBDENO_V8_CODE_CACHE_WRITER_SIZE";
+    #[cfg(any(unix, windows))]
+    const DISK_WRITER_ITERATIONS_ENV: &str = "LIBDENO_V8_CODE_CACHE_WRITER_ITERATIONS";
+    #[cfg(any(unix, windows))]
+    const DISK_WRITER_MAX_ENTRIES_ENV: &str = "LIBDENO_V8_CODE_CACHE_WRITER_MAX_ENTRIES";
+    #[cfg(any(unix, windows))]
+    const DISK_WRITER_MAX_BYTES_ENV: &str = "LIBDENO_V8_CODE_CACHE_WRITER_MAX_BYTES";
+    #[cfg(any(unix, windows))]
+    const DISK_WRITER_READY_PREFIX: &str = ".libdeno-v8-code-cache-writer-ready-";
+    #[cfg(any(unix, windows))]
+    const DISK_WRITER_START_NAME: &str = ".libdeno-v8-code-cache-writer-start";
+
+    #[cfg(any(unix, windows))]
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_disk_cache_writer(
+        root: &std::path::Path,
+        id: u64,
+        key: u64,
+        byte: u8,
+        size: usize,
+        iterations: u64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> TestChild {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "limits::tests::disk_cache_process_writer",
+                "--nocapture",
+            ])
+            .env(DISK_WRITER_ROOT_ENV, root)
+            .env(DISK_WRITER_ID_ENV, id.to_string())
+            .env(DISK_WRITER_KEY_ENV, key.to_string())
+            .env(DISK_WRITER_BYTE_ENV, byte.to_string())
+            .env(DISK_WRITER_SIZE_ENV, size.to_string())
+            .env(DISK_WRITER_ITERATIONS_ENV, iterations.to_string())
+            .env(DISK_WRITER_MAX_ENTRIES_ENV, max_entries.to_string())
+            .env(DISK_WRITER_MAX_BYTES_ENV, max_bytes.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        TestChild(child)
+    }
+
+    #[cfg(any(unix, windows))]
+    fn wait_for_disk_cache_writers(root: &std::path::Path, writer_count: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (0..writer_count).any(|id| {
+            !root
+                .join(format!("{DISK_WRITER_READY_PREFIX}{id}"))
+                .exists()
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "writer children never became ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn disk_test_owned_temp_paths(root: &std::path::Path) -> Vec<PathBuf> {
+        std::fs::read_dir(root.join(CODE_CACHE_NAMESPACE))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_owned_temp_name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn disk_cache_repeated_writes_enforce_count_and_bytes() {
+        let root = disk_test_root("repeated");
+        let cache = InMemoryCodeCache::with_disk_limits(root.clone(), 3, 10);
+        for index in 0..12 {
+            disk_test_set(&cache, index, &[index as u8; 4]);
+            let files = disk_test_paths(&root);
+            assert!(files.len() <= 3);
+            assert!(
+                files
+                    .iter()
+                    .map(|path| std::fs::metadata(path).unwrap().len())
+                    .sum::<u64>()
+                    <= 10
+            );
+        }
+        disk_test_cleanup(root);
+    }
+
+    #[test]
+    fn disk_cache_evicts_oldest_by_count_and_bytes() {
+        let count_root = disk_test_root("count-oldest");
+        let count_cache = InMemoryCodeCache::with_disk_limits(count_root.clone(), 2, 100);
+        disk_test_set(&count_cache, 0, b"zero");
+        disk_test_set_modified(&count_cache, 0, 3);
+        disk_test_set(&count_cache, 1, b"one");
+        disk_test_set_modified(&count_cache, 1, 2);
+        disk_test_set(&count_cache, 2, b"two");
+        let cold_count = InMemoryCodeCache::with_disk_limits(count_root.clone(), 2, 100);
+        assert!(cold_count
+            .get_sync(&disk_test_specifier(0), CodeCacheType::Script, 0)
+            .is_none());
+        assert_eq!(
+            cold_count
+                .get_sync(&disk_test_specifier(1), CodeCacheType::Script, 1)
+                .as_deref(),
+            Some(b"one".as_slice())
+        );
+        assert_eq!(
+            cold_count
+                .get_sync(&disk_test_specifier(2), CodeCacheType::Script, 2)
+                .as_deref(),
+            Some(b"two".as_slice())
+        );
+
+        let byte_root = disk_test_root("bytes-oldest");
+        let byte_cache = InMemoryCodeCache::with_disk_limits(byte_root.clone(), 10, 5);
+        disk_test_set(&byte_cache, 0, b"00");
+        disk_test_set_modified(&byte_cache, 0, 3);
+        disk_test_set(&byte_cache, 1, b"11");
+        disk_test_set_modified(&byte_cache, 1, 2);
+        disk_test_set(&byte_cache, 2, b"22");
+        let cold_bytes = InMemoryCodeCache::with_disk_limits(byte_root.clone(), 10, 5);
+        assert!(cold_bytes
+            .get_sync(&disk_test_specifier(0), CodeCacheType::Script, 0)
+            .is_none());
+        assert!(cold_bytes
+            .get_sync(&disk_test_specifier(1), CodeCacheType::Script, 1)
+            .is_some());
+        assert!(cold_bytes
+            .get_sync(&disk_test_specifier(2), CodeCacheType::Script, 2)
+            .is_some());
+        disk_test_cleanup(count_root);
+        disk_test_cleanup(byte_root);
+    }
+
+    #[test]
+    fn disk_cache_equal_mtime_uses_filename_tie_break() {
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let path = PathBuf::from("/tmp");
+        let mut files = vec![
+            OwnedDiskFile {
+                name: "000000000000000b.bin".to_string(),
+                path: path.clone(),
+                len: 1,
+                modified: Some(mtime),
+            },
+            OwnedDiskFile {
+                name: "000000000000000a.bin".to_string(),
+                path,
+                len: 1,
+                modified: Some(mtime),
+            },
+        ];
+        sort_owned_disk_files(&mut files);
+        assert_eq!(files[0].name, "000000000000000a.bin");
+
+        files[0].modified = None;
+        sort_owned_disk_files(&mut files);
+        assert!(files[0].modified.is_none());
+    }
+
+    #[test]
+    fn disk_cache_replacement_is_a_new_write_for_age() {
+        let root = disk_test_root("replacement-age");
+        let cache = InMemoryCodeCache::with_disk_limits(root.clone(), 2, 100);
+        disk_test_set(&cache, 0, b"old");
+        disk_test_set_modified(&cache, 0, 4);
+        disk_test_set(&cache, 1, b"one");
+        disk_test_set_modified(&cache, 1, 3);
+        let replacement_path = cache
+            .disk_path(&(
+                disk_test_specifier(0).as_str().to_owned(),
+                CodeCacheType::Script,
+                0,
+            ))
+            .unwrap();
+        let before = std::fs::metadata(&replacement_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        disk_test_set(&cache, 0, b"new");
+        let after = std::fs::metadata(&replacement_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(after > before, "replacement must refresh modified time");
+        disk_test_set_modified(&cache, 0, 2);
+        disk_test_set(&cache, 2, b"two");
+        let cold = InMemoryCodeCache::with_disk_limits(root.clone(), 2, 100);
+        assert_eq!(
+            cold.get_sync(&disk_test_specifier(0), CodeCacheType::Script, 0)
+                .as_deref(),
+            Some(b"new".as_slice())
+        );
+        assert!(cold
+            .get_sync(&disk_test_specifier(1), CodeCacheType::Script, 1)
+            .is_none());
+        assert!(cold
+            .get_sync(&disk_test_specifier(2), CodeCacheType::Script, 2)
+            .is_some());
+        disk_test_cleanup(root);
+    }
+
+    #[test]
+    fn disk_cache_reads_do_not_refresh_age() {
+        let root = disk_test_root("read-age");
+        let writer = InMemoryCodeCache::with_disk_limits(root.clone(), 2, 100);
+        disk_test_set(&writer, 0, b"zero");
+        disk_test_set_modified(&writer, 0, 4);
+        disk_test_set(&writer, 1, b"one");
+        disk_test_set_modified(&writer, 1, 3);
+        let path = writer
+            .disk_path(&(
+                disk_test_specifier(0).as_str().to_owned(),
+                CodeCacheType::Script,
+                0,
+            ))
+            .unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let reader = InMemoryCodeCache::with_disk_limits(root.clone(), 2, 100);
+        assert!(reader
+            .get_sync(&disk_test_specifier(0), CodeCacheType::Script, 0)
+            .is_some());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+        disk_test_set(&writer, 2, b"two");
+        let cold = InMemoryCodeCache::with_disk_limits(root.clone(), 2, 100);
+        assert!(cold
+            .get_sync(&disk_test_specifier(0), CodeCacheType::Script, 0)
+            .is_none());
+        disk_test_cleanup(root);
+    }
+
+    #[test]
+    fn disk_cache_exact_oversized_and_zero_capacity_limits() {
+        let exact_root = disk_test_root("exact");
+        let exact = InMemoryCodeCache::with_disk_limits(exact_root.clone(), 1, 4);
+        disk_test_set(&exact, 0, b"1234");
+        assert_eq!(disk_test_paths(&exact_root).len(), 1);
+        let exact_cold = InMemoryCodeCache::with_disk_limits(exact_root.clone(), 1, 4);
+        assert_eq!(
+            exact_cold
+                .get_sync(&disk_test_specifier(0), CodeCacheType::Script, 0)
+                .as_deref(),
+            Some(b"1234".as_slice())
+        );
+
+        let oversized_root = disk_test_root("oversized");
+        let oversized = InMemoryCodeCache::with_disk_limits(oversized_root.clone(), 1, 4);
+        disk_test_set(&oversized, 0, b"12345");
+        assert!(disk_test_paths(&oversized_root).is_empty());
+
+        let zero_root = disk_test_root("zero");
+        let zero = InMemoryCodeCache::with_disk_limits(zero_root.clone(), 0, 4);
+        disk_test_set(&zero, 0, b"1234");
+        assert!(disk_test_paths(&zero_root).is_empty());
+        let zero_cold = InMemoryCodeCache::with_disk_limits(zero_root.clone(), 0, 4);
+        assert!(zero_cold
+            .get_sync(&disk_test_specifier(0), CodeCacheType::Script, 0)
+            .is_none());
+
+        disk_test_cleanup(exact_root);
+        disk_test_cleanup(oversized_root);
+        disk_test_cleanup(zero_root);
+    }
+
+    #[test]
+    fn disk_cache_bounded_oversized_read_is_a_miss_and_cleanup_candidate() {
+        let root = disk_test_root("bounded-read");
+        let cache = InMemoryCodeCache::with_disk_limits(root.clone(), 2, 4);
+        let key = (
+            disk_test_specifier(0).as_str().to_owned(),
+            CodeCacheType::Script,
+            0,
+        );
+        let namespace = cache.ensure_disk_namespace().unwrap();
+        let path = cache.disk_path(&key).unwrap();
+        std::fs::write(&path, [0u8; 32]).unwrap();
+        let cold = InMemoryCodeCache::with_disk_limits(root.clone(), 2, 4);
+        assert!(cold
+            .get_sync(&disk_test_specifier(0), CodeCacheType::Script, 0)
+            .is_none());
+        assert!(!path.exists());
+        let entries = std::fs::read_dir(namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![CODE_CACHE_LOCK_NAME.to_string()]);
+        disk_test_cleanup(root);
+    }
+
+    #[test]
+    fn disk_cache_warm_read_keeps_type_and_hash_in_key() {
+        let root = disk_test_root("warm-key");
+        let writer = InMemoryCodeCache::with_disk_limits(root.clone(), 4, 100);
+        let specifier = disk_test_specifier(0);
+        writer.set_sync(specifier.clone(), CodeCacheType::Script, 7, b"warm");
+        let reader = InMemoryCodeCache::with_disk_limits(root.clone(), 4, 100);
+        assert_eq!(
+            reader
+                .get_sync(&specifier, CodeCacheType::Script, 7)
+                .as_deref(),
+            Some(b"warm".as_slice())
+        );
+        assert!(reader
+            .get_sync(&specifier, CodeCacheType::EsModule, 7)
+            .is_none());
+        assert!(reader
+            .get_sync(&specifier, CodeCacheType::Script, 8)
+            .is_none());
+        disk_test_cleanup(root);
+    }
+
+    #[test]
+    fn disk_cache_namespace_preserves_foreign_and_unknown_entries() {
+        let root = disk_test_root("namespace");
+        let legacy = root.join("0123456789abcdef.bin");
+        std::fs::write(&legacy, b"legacy").unwrap();
+        let sibling = root.join("sibling-cache");
+        std::fs::create_dir(&sibling).unwrap();
+        let sibling_file = sibling.join("0123456789abcdef.bin");
+        std::fs::write(&sibling_file, b"sibling").unwrap();
+
+        let cache = InMemoryCodeCache::with_disk_limits(root.clone(), 2, 100);
+        let namespace = cache.ensure_disk_namespace().unwrap();
+        let foreign = namespace.join("foreign.bin");
+        let uppercase = namespace.join("0123456789ABCDEF.bin");
+        let text = namespace.join("0123456789abcdef.txt");
+        let unknown_temp = namespace.join("foreign-tmp-keep");
+        std::fs::write(&foreign, b"foreign").unwrap();
+        std::fs::write(&uppercase, b"uppercase").unwrap();
+        std::fs::write(&text, b"text").unwrap();
+        std::fs::write(&unknown_temp, b"temp").unwrap();
+
+        let protected_dir = cache
+            .disk_path(&(
+                disk_test_specifier(0).as_str().to_owned(),
+                CodeCacheType::Script,
+                0,
+            ))
+            .unwrap();
+        std::fs::create_dir(&protected_dir).unwrap();
+        disk_test_set(&cache, 0, b"blocked");
+        disk_test_set(&cache, 1, b"owned");
+
+        assert!(protected_dir.is_dir());
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy");
+        assert_eq!(std::fs::read(&sibling_file).unwrap(), b"sibling");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign");
+        assert_eq!(std::fs::read(&uppercase).unwrap(), b"uppercase");
+        assert_eq!(std::fs::read(&text).unwrap(), b"text");
+        assert_eq!(std::fs::read(&unknown_temp).unwrap(), b"temp");
+        disk_test_cleanup(root);
+    }
+
+    #[test]
+    fn disk_cache_cleans_only_owned_stale_temps() {
+        let root = disk_test_root("temp-cleanup");
+        let cache = InMemoryCodeCache::with_disk_limits(root.clone(), 2, 100);
+        let namespace = cache.ensure_disk_namespace().unwrap();
+        let owned_temp = namespace.join(format!("{CODE_CACHE_TEMP_PREFIX}stale"));
+        let foreign_temp = namespace.join(".libdeno-v8-code-cache-v0-tmp-stale");
+        let owned_dir = namespace.join(format!("{CODE_CACHE_TEMP_PREFIX}directory"));
+        std::fs::write(&owned_temp, b"stale").unwrap();
+        std::fs::write(&foreign_temp, b"foreign").unwrap();
+        std::fs::create_dir(&owned_dir).unwrap();
+        disk_test_set(&cache, 0, b"owned");
+        assert!(!owned_temp.exists());
+        assert!(foreign_temp.exists());
+        assert!(owned_dir.is_dir());
+        disk_test_cleanup(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_cache_preserves_final_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = disk_test_root("symlink");
+        let cache = InMemoryCodeCache::with_disk_limits(root.clone(), 2, 100);
+        let target = root.join("target");
+        std::fs::write(&target, b"target").unwrap();
+        let link = cache
+            .disk_path(&(
+                disk_test_specifier(0).as_str().to_owned(),
+                CodeCacheType::Script,
+                0,
+            ))
+            .unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&target, &link).unwrap();
+        disk_test_set(&cache, 0, b"replacement");
+        let metadata = std::fs::symlink_metadata(&link).unwrap();
+        assert!(metadata.file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), b"target");
+        disk_test_cleanup(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disk_cache_preserves_reparse_namespace_junction() {
+        let root = disk_test_root("junction-namespace");
+        let outside = disk_test_root("junction-target");
+        let namespace = root.join(CODE_CACHE_NAMESPACE);
+        let outside_file = outside.join("0000000000000000.bin");
+        std::fs::write(&outside_file, b"outside").unwrap();
+        let command = format!(
+            "mklink /J \"{}\" \"{}\"",
+            namespace.display(),
+            outside.display()
+        );
+        let status = std::process::Command::new("cmd")
+            .args(["/C", &command])
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed: {status}");
+
+        let cache = InMemoryCodeCache::with_disk_limits(root.clone(), 2, 100);
+        disk_test_set(&cache, 1, b"must-not-follow-junction");
+
+        let metadata = std::fs::symlink_metadata(&namespace).unwrap();
+        assert!(is_reparse_point(&metadata));
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside");
+        let outside_entries = std::fs::read_dir(&outside)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outside_entries,
+            vec![outside_file.file_name().unwrap().to_owned()]
+        );
+        disk_test_cleanup(root);
+        disk_test_cleanup(outside);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn disk_cache_lock_contention_is_nonblocking_and_releases_on_drop() {
+        let root = disk_test_root("lock-contention");
+        let cache = InMemoryCodeCache::with_disk_limits(root.clone(), 1, 20);
+        let namespace = cache.ensure_disk_namespace().unwrap();
+        let lock_path = namespace.join(CODE_CACHE_LOCK_NAME);
+        let first = NamespaceLock::acquire(&namespace)
+            .expect("native lock acquisition must work on the local test filesystem");
+        assert!(lock_path.is_file());
+        assert!(NamespaceLock::acquire(&namespace).is_none());
+        drop(first);
+        assert!(NamespaceLock::acquire(&namespace).is_some());
+        assert!(lock_path.is_file());
+        disk_test_cleanup(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn disk_cache_child_death_releases_os_lock() {
+        const CHILD_ROOT_ENV: &str = "LIBDENO_V8_CODE_CACHE_LOCK_CHILD_ROOT";
+        const READY_NAME: &str = "lock-child-ready";
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
+            let cache = InMemoryCodeCache::with_disk_limits(PathBuf::from(root), 1, 20);
+            let namespace = cache.ensure_disk_namespace().unwrap();
+            let _lock = NamespaceLock::acquire(&namespace)
+                .expect("native lock acquisition must work on the local test filesystem");
+            std::fs::write(namespace.parent().unwrap().join(READY_NAME), b"ready").unwrap();
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
+
+        let root = disk_test_root("lock-child");
+        let cache = InMemoryCodeCache::with_disk_limits(root.clone(), 1, 20);
+        let namespace = cache.ensure_disk_namespace().unwrap();
+        let ready = root.join(READY_NAME);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "limits::tests::disk_cache_child_death_releases_os_lock",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT_ENV, &root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = TestChild(child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if ready.exists() {
+                break;
+            }
+            if let Some(status) = child.0.try_wait().unwrap() {
+                panic!("lock-holder child exited before signaling readiness: {status}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lock-holder child never became ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(NamespaceLock::acquire(&namespace).is_none());
+        let _ = child.0.kill();
+        let _ = child.0.wait();
+        assert!(NamespaceLock::acquire(&namespace).is_some());
+        disk_test_cleanup(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn disk_cache_process_writer() {
+        let Some(root) = std::env::var_os(DISK_WRITER_ROOT_ENV) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let id: u64 = std::env::var(DISK_WRITER_ID_ENV).unwrap().parse().unwrap();
+        let key: u64 = std::env::var(DISK_WRITER_KEY_ENV).unwrap().parse().unwrap();
+        let byte: u8 = std::env::var(DISK_WRITER_BYTE_ENV)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let size: usize = std::env::var(DISK_WRITER_SIZE_ENV)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let iterations: u64 = std::env::var(DISK_WRITER_ITERATIONS_ENV)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let max_entries: usize = std::env::var(DISK_WRITER_MAX_ENTRIES_ENV)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let max_bytes: usize = std::env::var(DISK_WRITER_MAX_BYTES_ENV)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let cache = InMemoryCodeCache::with_disk_limits(root.clone(), max_entries, max_bytes);
+        cache
+            .ensure_disk_namespace()
+            .expect("native writer child must create a safe namespace");
+        std::fs::write(
+            root.join(format!("{DISK_WRITER_READY_PREFIX}{id}")),
+            b"ready",
+        )
+        .unwrap();
+        let start = root.join(DISK_WRITER_START_NAME);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !start.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "writer parent never released children"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let data = vec![byte; size];
+        for _ in 0..iterations {
+            cache.set_sync(disk_test_specifier(key), CodeCacheType::Script, key, &data);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn disk_cache_same_key_writers_publish_complete_values() {
+        let root = disk_test_root("same-key");
+        let left = vec![b'L'; 4096];
+        let right = vec![b'R'; 4096];
+        let mut children = vec![
+            spawn_disk_cache_writer(&root, 0, 0, b'L', left.len(), 8, 2, 10_000),
+            spawn_disk_cache_writer(&root, 1, 0, b'R', right.len(), 8, 2, 10_000),
+        ];
+        wait_for_disk_cache_writers(&root, 2);
+        std::fs::write(root.join(DISK_WRITER_START_NAME), b"start").unwrap();
+        for child in &mut children {
+            assert!(child.0.wait().unwrap().success());
+        }
+        let files = disk_test_paths(&root);
+        assert_eq!(files.len(), 1);
+        let value = std::fs::read(&files[0]).unwrap();
+        assert!(value == left || value == right);
+        assert!(disk_test_owned_temp_paths(&root).is_empty());
+        disk_test_cleanup(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn disk_cache_distinct_key_writers_converge_within_caps() {
+        let root = disk_test_root("different-keys");
+        let mut children = (0..6u64)
+            .map(|index| spawn_disk_cache_writer(&root, index, index, index as u8, 64, 4, 3, 192))
+            .collect::<Vec<_>>();
+        wait_for_disk_cache_writers(&root, 6);
+        std::fs::write(root.join(DISK_WRITER_START_NAME), b"start").unwrap();
+        for child in &mut children {
+            assert!(child.0.wait().unwrap().success());
+        }
+        let files = disk_test_paths(&root);
+        assert!(!files.is_empty(), "concurrent writers must publish a value");
+        assert!(files.len() <= 3);
+        assert!(
+            files
+                .iter()
+                .map(|path| std::fs::metadata(path).unwrap().len())
+                .sum::<u64>()
+                <= 192
+        );
+        for path in files {
+            let value = std::fs::read(path).unwrap();
+            assert_eq!(value.len(), 64);
+            assert!(value.iter().all(|byte| *byte == value[0]));
+            assert!(value[0] < 6);
+        }
+        assert!(disk_test_owned_temp_paths(&root).is_empty());
+        disk_test_cleanup(root);
+    }
+
+    #[test]
+    fn disk_cache_failures_leave_memory_result_available() {
+        let invalid_parent = disk_test_root("invalid-parent");
+        let invalid_file = invalid_parent.join("not-a-directory");
+        std::fs::write(&invalid_file, b"file").unwrap();
+        let invalid = InMemoryCodeCache::with_disk_limits(invalid_file, 2, 20);
+        let invalid_specifier = disk_test_specifier(1);
+        invalid.set_sync(
+            invalid_specifier.clone(),
+            CodeCacheType::Script,
+            1,
+            b"memory",
+        );
+        assert_eq!(
+            invalid.get_sync(&invalid_specifier, CodeCacheType::Script, 1),
+            Some(b"memory".to_vec())
+        );
+        disk_test_cleanup(invalid_parent);
+
+        let lock_root = disk_test_root("lock-failure");
+        let lock_cache = InMemoryCodeCache::with_disk_limits(lock_root.clone(), 2, 20);
+        let namespace = lock_cache.ensure_disk_namespace().unwrap();
+        std::fs::create_dir(namespace.join(CODE_CACHE_LOCK_NAME)).unwrap();
+        let lock_specifier = disk_test_specifier(2);
+        lock_cache.set_sync(
+            lock_specifier.clone(),
+            CodeCacheType::Script,
+            2,
+            b"memory-lock",
+        );
+        assert_eq!(
+            lock_cache.get_sync(&lock_specifier, CodeCacheType::Script, 2),
+            Some(b"memory-lock".to_vec())
+        );
+        assert!(namespace.join(CODE_CACHE_LOCK_NAME).is_dir());
+        disk_test_cleanup(lock_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_cache_read_only_namespace_leaves_memory_result_available() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = disk_test_root("read-only");
+        let cache = InMemoryCodeCache::with_disk_limits(root.clone(), 2, 20);
+        let namespace = cache.ensure_disk_namespace().unwrap();
+        let mut permissions = std::fs::metadata(&namespace).unwrap().permissions();
+        permissions.set_mode(0o555);
+        std::fs::set_permissions(&namespace, permissions).unwrap();
+        let specifier = disk_test_specifier(3);
+        cache.set_sync(specifier.clone(), CodeCacheType::Script, 3, b"memory-ro");
+        assert_eq!(
+            cache.get_sync(&specifier, CodeCacheType::Script, 3),
+            Some(b"memory-ro".to_vec())
+        );
+        let mut permissions = std::fs::metadata(&namespace).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&namespace, permissions).unwrap();
+        disk_test_cleanup(root);
     }
 
     #[test]

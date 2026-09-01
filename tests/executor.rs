@@ -17,7 +17,7 @@ use libdeno::{
 #[cfg(feature = "execution-control")]
 use libdeno::{
     AdmissionConfig, CancelOutcome, ExecutionCleanupStrength, ExecutionState,
-    ExecutionTransportStatus, SubmissionOptions, SubmitError,
+    ExecutionTransportStatus, SubmissionOptions, SubmitError, SupervisorFailureCategory,
 };
 
 static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -642,6 +642,402 @@ mod execution_control {
     }
 
     #[test]
+    fn supervised_runtime_failure_is_categorized_and_redacted() {
+        let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("control-supervised-runtime-failure");
+        let entry = dir.join("main.js");
+        fs::write(
+            &entry,
+            "console.log('supervised-prefix'); throw new Error('secret runtime text');",
+        )
+        .unwrap();
+        let executor = build(
+            Executor::builder(&dir)
+                .backend(ExecutionBackend::Subprocess)
+                .host_executable(env!("CARGO_BIN_EXE_child_host"))
+                .admission(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 0)),
+        );
+        let handle = executor
+            .submit(
+                ExecutionRequest::new(
+                    &entry,
+                    LibdenoOptions {
+                        capture_stdout: true,
+                        ..allow_all()
+                    },
+                ),
+                SubmissionOptions::default(),
+            )
+            .unwrap();
+        let failure = runtime().block_on(handle.result()).unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            ExecutionError::Supervisor(SupervisorFailureCategory::Runtime)
+        ));
+        assert_eq!(
+            failure.supervisor_category(),
+            Some(SupervisorFailureCategory::Runtime)
+        );
+        assert!(!failure.to_string().contains("secret runtime text"));
+        assert!(failure.to_string().len() < 128);
+        let partial = failure
+            .partial_output()
+            .expect("supervisor capture must preserve runtime prefix");
+        assert!(String::from_utf8_lossy(partial.stdout()).contains("supervised-prefix"));
+        assert!(!partial.capture_truncated());
+        assert!(!partial.capture_incomplete());
+        assert!(!partial.capture_reader_error());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn supervised_permission_failure_is_categorized_and_redacted() {
+        let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("control-supervised-permission-failure");
+        let entry = dir.join("main.js");
+        fs::write(&entry, "Deno.exit(0);").unwrap();
+        let executor = build(
+            Executor::builder(&dir)
+                .backend(ExecutionBackend::Subprocess)
+                .host_executable(env!("CARGO_BIN_EXE_child_host"))
+                .admission(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 0)),
+        );
+        let handle = executor
+            .submit(
+                ExecutionRequest::new(
+                    &entry,
+                    LibdenoOptions {
+                        permissions: vec!["--allow-env".to_string()],
+                        capture_stdout: true,
+                        ..Default::default()
+                    },
+                ),
+                SubmissionOptions::default(),
+            )
+            .unwrap();
+        let failure = runtime().block_on(handle.result()).unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            ExecutionError::Supervisor(SupervisorFailureCategory::Permission)
+        ));
+        assert_eq!(
+            failure.supervisor_category(),
+            Some(SupervisorFailureCategory::Permission)
+        );
+        assert!(!failure
+            .to_string()
+            .contains(entry.to_string_lossy().as_ref()));
+        assert!(failure.to_string().len() < 128);
+        let partial = failure
+            .partial_output()
+            .expect("supervisor capture must preserve permission partial output");
+        assert!(partial.stdout().is_empty());
+        assert!(!partial.capture_incomplete());
+        assert!(!partial.capture_reader_error());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn supervised_child_configuration_failure_is_infrastructure() {
+        let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("control-supervised-child-configuration-failure");
+        let entry = dir.join("main.js");
+        fs::write(&entry, "Deno.exit(0);").unwrap();
+        let executor = build(
+            Executor::builder(&dir)
+                .backend(ExecutionBackend::Subprocess)
+                .host_executable(env!("CARGO_BIN_EXE_child_host"))
+                .admission(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 0)),
+        );
+        let handle = executor
+            .submit(
+                ExecutionRequest::new(
+                    &entry,
+                    LibdenoOptions {
+                        capture_stdout: true,
+                        ..Default::default()
+                    },
+                ),
+                SubmissionOptions::default(),
+            )
+            .unwrap();
+        let failure = runtime().block_on(handle.result()).unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            ExecutionError::Supervisor(SupervisorFailureCategory::Infrastructure)
+        ));
+        let partial = failure
+            .partial_output()
+            .expect("supervisor capture must preserve child configuration output");
+        assert!(partial.stdout().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn supervised_host_setup_failure_is_infrastructure() {
+        let dir = temp_dir("control-supervised-infrastructure-failure");
+        let entry = dir.join("main.js");
+        fs::write(&entry, "Deno.exit(0);").unwrap();
+        let executor = build(
+            Executor::builder(&dir)
+                .backend(ExecutionBackend::Subprocess)
+                .host_executable(dir.join("missing-supervisor-host"))
+                .admission(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 0)),
+        );
+        let handle = executor
+            .submit(
+                ExecutionRequest::new(
+                    &entry,
+                    LibdenoOptions {
+                        capture_stdout: true,
+                        ..allow_all()
+                    },
+                ),
+                SubmissionOptions::default(),
+            )
+            .unwrap();
+        let failure = runtime().block_on(handle.result()).unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            ExecutionError::Supervisor(SupervisorFailureCategory::Infrastructure)
+        ));
+        assert_eq!(
+            failure.supervisor_category(),
+            Some(SupervisorFailureCategory::Infrastructure)
+        );
+        let partial = failure
+            .partial_output()
+            .expect("requested supervisor capture must return an empty record");
+        assert!(partial.stdout().is_empty());
+        assert!(partial.stderr().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn supervised_capture_is_parent_bounded_and_zero_budget_truncates() {
+        let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("control-supervised-capture-bound");
+        let entry = dir.join("main.js");
+        fs::write(
+            &entry,
+            "console.log('0123456789'); console.error('unrequested-stderr');",
+        )
+        .unwrap();
+        let executor = build(
+            Executor::builder(&dir)
+                .backend(ExecutionBackend::Subprocess)
+                .host_executable(env!("CARGO_BIN_EXE_child_host"))
+                .admission(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 0)),
+        );
+
+        let bounded = executor
+            .submit(
+                ExecutionRequest::new(
+                    &entry,
+                    LibdenoOptions {
+                        capture_stdout: true,
+                        max_capture_bytes: Some(4),
+                        ..allow_all()
+                    },
+                ),
+                SubmissionOptions::default(),
+            )
+            .unwrap();
+        let bounded = runtime().block_on(bounded.result()).unwrap();
+        assert!(bounded.output().stdout().len() <= 4);
+        assert!(bounded.output().stderr().is_empty());
+        assert!(bounded.output().capture_truncated());
+        assert!(!bounded.output().capture_incomplete());
+        assert!(!bounded.output().capture_reader_error());
+
+        let zero = executor
+            .submit(
+                ExecutionRequest::new(
+                    &entry,
+                    LibdenoOptions {
+                        capture_stdout: true,
+                        max_capture_bytes: Some(0),
+                        ..allow_all()
+                    },
+                ),
+                SubmissionOptions::default(),
+            )
+            .unwrap();
+        let zero = runtime().block_on(zero.result()).unwrap();
+        assert!(zero.output().stdout().is_empty());
+        assert!(zero.output().stderr().is_empty());
+        assert!(zero.output().capture_truncated());
+        assert!(!zero.output().capture_incomplete());
+        assert!(!zero.output().capture_reader_error());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_descendant_pipe_marks_success_transport_failed() {
+        let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("control-supervised-descendant-pipe");
+        let entry = dir.join("main.js");
+        fs::write(
+            &entry,
+            "console.log('descendant-prefix');\n\
+             new Deno.Command('/bin/sh', { args: ['-c', 'sleep 1 &'], stdout: 'inherit', stderr: 'null' }).outputSync();\n\
+             Deno.exit(0);",
+        )
+        .unwrap();
+        let executor = build(
+            Executor::builder(&dir)
+                .backend(ExecutionBackend::Subprocess)
+                .host_executable(env!("CARGO_BIN_EXE_child_host"))
+                .admission(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 0)),
+        );
+        let handle = executor
+            .submit(
+                ExecutionRequest::new(
+                    &entry,
+                    LibdenoOptions {
+                        capture_stdout: true,
+                        ..allow_all()
+                    },
+                ),
+                SubmissionOptions::default(),
+            )
+            .unwrap();
+        let result = runtime().block_on(handle.result()).unwrap();
+        assert_eq!(result.exit_code(), 0);
+        assert!(String::from_utf8_lossy(result.output().stdout()).contains("descendant-prefix"));
+        assert!(result.output().capture_incomplete());
+        assert!(!result.output().capture_reader_error());
+        assert_eq!(
+            result.report().transport_status(),
+            Some(ExecutionTransportStatus::Failed)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_request_timeout_bounds_parent_output_collection() {
+        let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("control-supervised-request-timeout-capture");
+        let entry = dir.join("main.js");
+        let started = dir.join("started");
+        fs::write(
+            &entry,
+            format!(
+                "Deno.writeTextFileSync({started:?}, 'started');\n\
+                 await new Promise((resolve) => setTimeout(resolve, 700));\n\
+                 console.log('request-timeout-prefix');\n\
+                 new Deno.Command('/bin/sh', {{ args: ['-c', 'sleep 1 &'], stdout: 'inherit', stderr: 'null' }}).outputSync();\n\
+                 Deno.exit(0);"
+            ),
+        )
+        .unwrap();
+        let executor = build(
+            Executor::builder(&dir)
+                .backend(ExecutionBackend::Subprocess)
+                .host_executable(env!("CARGO_BIN_EXE_child_host"))
+                .admission(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 0)),
+        );
+        let handle = executor
+            .submit(
+                ExecutionRequest::new(
+                    &entry,
+                    LibdenoOptions {
+                        capture_stdout: true,
+                        ..allow_all()
+                    },
+                ),
+                SubmissionOptions::new(Some(Duration::from_millis(1200))),
+            )
+            .unwrap();
+        wait_for(&started);
+
+        let failure = runtime().block_on(handle.result()).unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            ExecutionError::Supervisor(SupervisorFailureCategory::Timeout)
+        ));
+        let partial = failure
+            .partial_output()
+            .expect("request timeout must preserve supervisor capture");
+        assert!(String::from_utf8_lossy(partial.stdout()).contains("request-timeout-prefix"));
+        assert!(!partial.capture_truncated());
+        assert!(partial.capture_incomplete());
+        assert!(!partial.capture_reader_error());
+        assert_eq!(
+            failure.report().transport_status(),
+            Some(ExecutionTransportStatus::Failed)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_drain_deadline_does_not_override_post_terminal_cancellation() {
+        let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        for (index, shutdown) in [(0, false), (1, true)] {
+            let dir = temp_dir(&format!("control-supervised-drain-cancel-{index}"));
+            let entry = dir.join("main.js");
+            let terminal_marker = dir.join("terminal.marker");
+            fs::write(
+                &entry,
+                format!(
+                    "new Deno.Command('/bin/sh', {{ args: ['-c', 'sleep 2 &'], stdout: 'inherit', stderr: 'null' }}).outputSync();\n\
+                     await new Promise((resolve) => setTimeout(resolve, 100));\n\
+                     console.log('combined-cancel-prefix');\n\
+                     Deno.writeTextFileSync({terminal_marker:?}, 'terminal');\n\
+                     Deno.exit(0);"
+                ),
+            )
+            .unwrap();
+            let executor = build(
+                Executor::builder(&dir)
+                    .backend(ExecutionBackend::Subprocess)
+                    .host_executable(env!("CARGO_BIN_EXE_child_host"))
+                    .admission(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 0)),
+            );
+            let handle = executor
+                .submit(
+                    ExecutionRequest::new(
+                        &entry,
+                        LibdenoOptions {
+                            capture_stdout: true,
+                            execution_deadline: Some(Duration::from_millis(1500)),
+                            ..allow_all()
+                        },
+                    ),
+                    SubmissionOptions::default(),
+                )
+                .unwrap();
+            wait_for(&terminal_marker);
+            std::thread::sleep(Duration::from_millis(100));
+
+            if shutdown {
+                executor.shutdown(Duration::ZERO);
+            } else {
+                assert_eq!(handle.cancel(), CancelOutcome::Requested);
+            }
+
+            let failure = runtime().block_on(handle.result()).unwrap_err();
+            assert!(matches!(failure.error(), ExecutionError::Cancelled));
+            let partial = failure
+                .partial_output()
+                .expect("post-terminal cancellation must preserve supervisor capture");
+            assert!(String::from_utf8_lossy(partial.stdout()).contains("combined-cancel-prefix"));
+            assert!(!partial.capture_truncated());
+            assert!(partial.capture_incomplete());
+            assert!(!partial.capture_reader_error());
+            assert_eq!(
+                failure.report().transport_status(),
+                Some(ExecutionTransportStatus::Failed)
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
     fn queued_cancel_and_deadline_do_not_start_and_release_queue_capacity() {
         let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = temp_dir("control-queued-cancel");
@@ -698,10 +1094,15 @@ mod execution_control {
             rt.block_on(cancelled.result()).unwrap_err().error(),
             ExecutionError::Cancelled
         ));
-        assert!(matches!(
-            rt.block_on(deadline.result()).unwrap_err().error(),
-            ExecutionError::Libdeno(LibdenoError::Timeout(_))
-        ));
+        let deadline_failure = rt.block_on(deadline.result()).unwrap_err();
+        assert!(
+            matches!(
+                deadline_failure.error(),
+                ExecutionError::Libdeno(LibdenoError::Timeout(_))
+            ),
+            "unexpected deadline error: {:?}",
+            deadline_failure.error()
+        );
         assert!(!cancelled_marker.exists());
         assert!(!deadline_marker.exists());
 
@@ -752,10 +1153,15 @@ mod execution_control {
             )
             .unwrap();
         wait_for(&deadline_started);
-        assert!(matches!(
-            rt.block_on(deadline.result()).unwrap_err().error(),
-            ExecutionError::Libdeno(LibdenoError::Timeout(_))
-        ));
+        let deadline_failure = rt.block_on(deadline.result()).unwrap_err();
+        assert!(
+            matches!(
+                deadline_failure.error(),
+                ExecutionError::Libdeno(LibdenoError::Timeout(_))
+            ),
+            "unexpected deadline error: {:?}",
+            deadline_failure.error()
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1268,7 +1674,14 @@ mod execution_control {
         let completed = dir.join("completed");
         let queued_entry = dir.join("queued.js");
         let queued_marker = dir.join("queued.marker");
-        fs::write(&entry, blocking_script(&started, &completed, 100)).unwrap();
+        fs::write(
+            &entry,
+            format!(
+                "console.log('cancel-prefix');\n{}",
+                blocking_script(&started, &completed, 100)
+            ),
+        )
+        .unwrap();
         fs::write(
             &queued_entry,
             format!("Deno.writeTextFileSync({queued_marker:?}, 'queued');"),
@@ -1282,7 +1695,13 @@ mod execution_control {
         );
         let handle = executor
             .submit(
-                ExecutionRequest::new(&entry, allow_all()),
+                ExecutionRequest::new(
+                    &entry,
+                    LibdenoOptions {
+                        capture_stdout: true,
+                        ..allow_all()
+                    },
+                ),
                 SubmissionOptions::default(),
             )
             .unwrap();
@@ -1298,6 +1717,14 @@ mod execution_control {
         let rt = runtime();
         let failure = rt.block_on(handle.result()).unwrap_err();
         assert!(matches!(failure.error(), ExecutionError::Cancelled));
+        let partial = failure
+            .partial_output()
+            .expect("supervisor cancellation must preserve requested capture");
+        assert!(String::from_utf8_lossy(partial.stdout()).contains("cancel-prefix"));
+        assert!(!partial.capture_truncated());
+        assert!(!partial.capture_incomplete());
+        assert!(!partial.capture_reader_error());
+        assert!(failure.supervisor_category().is_none());
         assert_eq!(
             failure.report().cleanup_strength(),
             Some(ExecutionCleanupStrength::DirectChild)
@@ -1308,6 +1735,56 @@ mod execution_control {
         ));
         assert!(rt.block_on(queued.result()).is_ok());
         assert!(queued_marker.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn supervised_deadline_preserves_partial_output() {
+        let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("control-supervised-deadline");
+        let entry = dir.join("main.js");
+        let started = dir.join("started");
+        fs::write(
+            &entry,
+            format!(
+                "console.log('deadline-prefix');\n\
+                 Deno.writeTextFileSync({started:?}, 'started');\n\
+                 await new Promise((resolve) => setTimeout(resolve, 60000));"
+            ),
+        )
+        .unwrap();
+        let executor = build(
+            Executor::builder(&dir)
+                .backend(ExecutionBackend::Subprocess)
+                .host_executable(env!("CARGO_BIN_EXE_child_host"))
+                .admission(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 0)),
+        );
+        let handle = executor
+            .submit(
+                ExecutionRequest::new(
+                    &entry,
+                    LibdenoOptions {
+                        capture_stdout: true,
+                        execution_deadline: Some(Duration::from_secs(3)),
+                        ..allow_all()
+                    },
+                ),
+                SubmissionOptions::default(),
+            )
+            .unwrap();
+        wait_for(&started);
+        let failure = runtime().block_on(handle.result()).unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            ExecutionError::Supervisor(SupervisorFailureCategory::Timeout)
+        ));
+        let partial = failure
+            .partial_output()
+            .expect("supervisor deadline must preserve requested capture");
+        assert!(String::from_utf8_lossy(partial.stdout()).contains("deadline-prefix"));
+        assert!(!partial.capture_truncated());
+        assert!(partial.capture_incomplete());
+        assert!(!partial.capture_reader_error());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1401,6 +1878,8 @@ mod execution_control {
         let result = runtime().block_on(handle.result()).unwrap();
         assert_eq!(result.exit_code(), 0);
         assert!(String::from_utf8_lossy(result.output().stdout()).contains("supervised-submit"));
+        assert!(!result.output().capture_incomplete());
+        assert!(!result.output().capture_reader_error());
         assert!(result.report().cleanup_strength().is_some());
         assert!(result.report().transport_status().is_some());
 
@@ -1425,6 +1904,7 @@ mod execution_control {
             failure.report().transport_status(),
             Some(ExecutionTransportStatus::Clean)
         );
+        assert!(failure.partial_output().is_none());
         let _ = fs::remove_dir_all(dir);
     }
 }

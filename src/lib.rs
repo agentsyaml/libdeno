@@ -58,6 +58,7 @@ pub use executor::PhaseDiagnostics;
 pub use executor::{
     AdmissionConfig, CancelOutcome, ExecutionCleanupStrength, ExecutionHandle, ExecutionState,
     ExecutionTransportStatus, ShutdownReport, SubmissionOptions, SubmitError,
+    SupervisorFailureCategory,
 };
 pub use executor::{
     CapabilityAvailability, CapabilityOutcome, CapabilityReport, ExecutionBackend,

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub(crate) const SUPERVISOR_MAGIC: [u8; 4] = *b"LDSV";
-pub(crate) const SUPERVISOR_VERSION: u8 = 1;
+pub(crate) const SUPERVISOR_VERSION: u8 = 2;
 pub(crate) const MAX_SUPERVISOR_FRAME_PAYLOAD: usize = 1 << 20;
 pub(crate) const SUPERVISOR_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const SUPERVISOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -396,6 +396,8 @@ pub(crate) struct SupervisorRequest {
 pub(crate) struct SupervisorTerminal {
     pub(crate) outcome: SupervisorOutcome,
     pub(crate) exit_code: Option<i32>,
+    #[serde(default)]
+    pub(crate) category: Option<SupervisorFailureCategory>,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
     pub(crate) truncated: bool,
@@ -408,6 +410,67 @@ pub(crate) enum SupervisorOutcome {
     Failed,
     Cancelled,
     Deadline,
+}
+
+/// Closed supervisor failure categories. The enum is shared by the terminal
+/// wire payload and the hidden execution-control error surface; no child
+/// error text crosses the supervisor boundary.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorFailureCategory {
+    Permission,
+    Timeout,
+    Runtime,
+    Infrastructure,
+    ChildCrash,
+}
+
+impl SupervisorFailureCategory {
+    pub(crate) const fn summary(self) -> &'static str {
+        match self {
+            Self::Permission => "supervisor child permission failure",
+            Self::Timeout => "supervisor session timed out",
+            Self::Runtime => "supervisor child runtime failure",
+            Self::Infrastructure => "supervisor infrastructure failure",
+            Self::ChildCrash => "supervisor child exited without a terminal result",
+        }
+    }
+}
+
+impl fmt::Display for SupervisorFailureCategory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str((*self).summary())
+    }
+}
+
+/// Validates the part of a TERMINAL payload that is independent of the
+/// request's capture settings.
+pub(crate) fn validate_supervisor_terminal_shape(terminal: &SupervisorTerminal) -> io::Result<()> {
+    let valid = match terminal.outcome {
+        SupervisorOutcome::Completed => terminal.exit_code.is_some() && terminal.category.is_none(),
+        SupervisorOutcome::Failed => {
+            terminal.exit_code.is_none()
+                && matches!(
+                    terminal.category,
+                    Some(
+                        SupervisorFailureCategory::Permission
+                            | SupervisorFailureCategory::Runtime
+                            | SupervisorFailureCategory::Infrastructure,
+                    )
+                )
+        }
+        SupervisorOutcome::Cancelled | SupervisorOutcome::Deadline => {
+            terminal.exit_code.is_none() && terminal.category.is_none()
+        }
+    };
+    if !valid {
+        Err(invalid_data("invalid supervisor TERMINAL result fields"))
+    } else if !terminal.stdout.is_empty() || !terminal.stderr.is_empty() || terminal.truncated {
+        Err(invalid_data("supervisor v2 TERMINAL must not carry output"))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,13 +494,6 @@ pub(crate) enum CleanupStrength {
     DirectChild,
     ProcessGroup,
     WindowsJob,
-}
-
-#[derive(Debug)]
-pub(crate) struct SupervisorRunResult {
-    pub(crate) output: crate::RunOutput,
-    pub(crate) cleanup_strength: CleanupStrength,
-    pub(crate) transport_status: SupervisorTransportStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,6 +703,7 @@ impl SupervisorParentSession {
             },
             FrameKind::Terminal => {
                 let terminal: SupervisorTerminal = decode_payload(&frame.payload)?;
+                validate_supervisor_terminal_shape(&terminal)?;
                 if let Some(previous) = &self.terminal {
                     if previous == &terminal {
                         return Ok(SupervisorFrameEvent::Terminal);
@@ -765,6 +822,7 @@ impl SupervisorChildSession {
     }
 
     pub(crate) fn mark_terminal(&mut self, terminal: SupervisorTerminal) -> io::Result<bool> {
+        validate_supervisor_terminal_shape(&terminal)?;
         if let Some(previous) = &self.terminal {
             if previous == &terminal {
                 return Ok(false);
@@ -884,7 +942,9 @@ mod tests {
     fn terminal(outcome: SupervisorOutcome) -> SupervisorTerminal {
         SupervisorTerminal {
             outcome,
-            exit_code: Some(0),
+            exit_code: (outcome == SupervisorOutcome::Completed).then_some(0),
+            category: (outcome == SupervisorOutcome::Failed)
+                .then_some(SupervisorFailureCategory::Runtime),
             stdout: Vec::new(),
             stderr: Vec::new(),
             truncated: false,
@@ -975,6 +1035,7 @@ mod tests {
             encode_payload(&SupervisorTerminal {
                 outcome: SupervisorOutcome::Cancelled,
                 exit_code: None,
+                category: None,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 truncated: false,
@@ -1092,6 +1153,68 @@ mod tests {
             vec![0; MAX_SUPERVISOR_FRAME_PAYLOAD + 1]
         )
         .is_err());
+    }
+
+    #[test]
+    fn terminal_shape_keeps_outcome_fields_disjoint() {
+        assert!(
+            validate_supervisor_terminal_shape(&terminal(SupervisorOutcome::Completed)).is_ok()
+        );
+        assert!(validate_supervisor_terminal_shape(&terminal(SupervisorOutcome::Failed)).is_ok());
+        for outcome in [SupervisorOutcome::Cancelled, SupervisorOutcome::Deadline] {
+            assert!(validate_supervisor_terminal_shape(&terminal(outcome)).is_ok());
+        }
+
+        let mut invalid = terminal(SupervisorOutcome::Completed);
+        invalid.category = Some(SupervisorFailureCategory::Runtime);
+        assert!(validate_supervisor_terminal_shape(&invalid).is_err());
+        invalid = terminal(SupervisorOutcome::Failed);
+        invalid.category = Some(SupervisorFailureCategory::Infrastructure);
+        assert!(validate_supervisor_terminal_shape(&invalid).is_ok());
+        invalid.category = Some(SupervisorFailureCategory::ChildCrash);
+        assert!(validate_supervisor_terminal_shape(&invalid).is_err());
+        invalid = terminal(SupervisorOutcome::Deadline);
+        invalid.category = Some(SupervisorFailureCategory::Timeout);
+        assert!(validate_supervisor_terminal_shape(&invalid).is_err());
+
+        invalid = terminal(SupervisorOutcome::Completed);
+        invalid.stdout = b"child output".to_vec();
+        assert!(validate_supervisor_terminal_shape(&invalid).is_err());
+        invalid.stdout.clear();
+        invalid.stderr = b"child error".to_vec();
+        assert!(validate_supervisor_terminal_shape(&invalid).is_err());
+        invalid.stderr.clear();
+        invalid.truncated = true;
+        assert!(validate_supervisor_terminal_shape(&invalid).is_err());
+    }
+
+    #[test]
+    fn version_one_frame_is_rejected_before_state_transition() {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&SUPERVISOR_MAGIC);
+            frame.push(1);
+            frame.push(FrameKind::Hello.to_byte());
+            frame.extend_from_slice(&0u64.to_be_bytes());
+            frame.extend_from_slice(&0u32.to_be_bytes());
+            stream.write_all(&frame).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let error = read_frame(
+            &mut stream,
+            FrameDirection::ChildToParent,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        writer.join().unwrap();
     }
 
     #[test]
