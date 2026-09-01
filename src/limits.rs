@@ -1410,8 +1410,20 @@ mod tests {
                 index,
             ))
             .unwrap();
-        File::open(path)
-            .unwrap()
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            // File::open requests GENERIC_READ on Windows; SetFileTime needs
+            // FILE_WRITE_ATTRIBUTES and does not require file-data access.
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+            OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .open(path)
+        };
+        #[cfg(not(windows))]
+        let file = File::open(path);
+        file.unwrap()
             .set_modified(
                 SystemTime::now()
                     .checked_sub(Duration::from_secs(seconds_ago))
@@ -1856,13 +1868,10 @@ mod tests {
         let namespace = root.join(CODE_CACHE_NAMESPACE);
         let outside_file = outside.join("0000000000000000.bin");
         std::fs::write(&outside_file, b"outside").unwrap();
-        let command = format!(
-            "mklink /J \"{}\" \"{}\"",
-            namespace.display(),
-            outside.display()
-        );
         let status = std::process::Command::new("cmd")
-            .args(["/C", &command])
+            .args(["/C", "mklink", "/J"])
+            .arg(&namespace)
+            .arg(&outside)
             .status()
             .unwrap();
         assert!(status.success(), "mklink /J failed: {status}");
