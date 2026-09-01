@@ -228,7 +228,7 @@ fn node_addon_finalizer_runs_after_execution_deadline() {
             format!("--allow-read={}", dir.display()),
             format!("--allow-ffi={}", dir.display()),
         ],
-        execution_deadline: Some(std::time::Duration::from_millis(200)),
+        execution_deadline: Some(std::time::Duration::from_secs(3)),
         ..Default::default()
     };
     let error = run(&entry, &options).unwrap_err();
