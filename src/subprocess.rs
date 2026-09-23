@@ -2617,7 +2617,7 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
     let runtime_result = {
         let _user_execution = ExecutionTiming::disabled().span(Phase::UserExecution);
         crate::run_with_output_observed_cancellable(
-            &request.entry,
+            &crate::EntrySource::from_path(&request.entry),
             &options,
             ExecutionTiming::disabled(),
             Some(cancellation.context()),

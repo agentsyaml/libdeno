@@ -24,10 +24,15 @@ use deno_cache_dir::GlobalHttpCacheRc;
 use deno_cache_dir::GlobalOrLocalHttpCache;
 use deno_graph::GraphKind;
 use deno_graph::ModuleGraph;
+#[cfg(feature = "npm")]
 use deno_npm_installer::graph::NpmCachingStrategy;
+#[cfg(feature = "npm")]
 use deno_npm_installer::lifecycle_scripts::LifecycleScriptsExecutorOptions;
+#[cfg(feature = "npm")]
 use deno_npm_installer::LogReporter;
+#[cfg(feature = "npm")]
 use deno_npm_installer::NpmInstallerFactory;
+#[cfg(feature = "npm")]
 use deno_npm_installer::NpmInstallerFactoryOptions;
 use deno_resolver::factory::ResolverFactory;
 use deno_resolver::file_fetcher::PermissionedFileFetcher;
@@ -43,16 +48,19 @@ use crate::timing::{ExecutionTiming, Phase};
 /// npm process state propagated to `child_process.fork` children (mirrors
 /// deno_lib's `NpmProcessStateProvider` so the forked child can restore the
 /// npm resolution snapshot).
+#[cfg(feature = "npm")]
 pub struct NpmProcessStateProviderImpl {
     kind: NpmProcessStateProviderKind,
     local_node_modules_path: Option<String>,
 }
 
+#[cfg(feature = "npm")]
 enum NpmProcessStateProviderKind {
     Managed(deno_resolver::npm::managed::NpmResolutionCellRc),
     Byonm,
 }
 
+#[cfg(feature = "npm")]
 #[derive(serde::Serialize, serde::Deserialize)]
 enum NpmProcessStateKind {
     Snapshot(deno_npm::resolution::SerializedNpmResolutionSnapshot),
@@ -67,12 +75,14 @@ enum NpmProcessStateKind {
 /// provider keeps only the resolution cell and serializes it at fork time, so
 /// it does not retain or expose an obsolete snapshot through its debug
 /// representation.
+#[cfg(feature = "npm")]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct NpmProcessState {
     kind: NpmProcessStateKind,
     local_node_modules_path: Option<String>,
 }
 
+#[cfg(feature = "npm")]
 impl std::fmt::Debug for NpmProcessStateProviderImpl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NpmProcessStateProviderImpl")
@@ -88,6 +98,7 @@ impl std::fmt::Debug for NpmProcessStateProviderImpl {
     }
 }
 
+#[cfg(feature = "npm")]
 impl deno_runtime::deno_process::NpmProcessStateProvider for NpmProcessStateProviderImpl {
     fn get_npm_process_state(&self) -> String {
         let kind = match &self.kind {
@@ -111,6 +122,7 @@ impl deno_runtime::deno_process::NpmProcessStateProvider for NpmProcessStateProv
 /// system shell, exactly like npm does (`sh -c <script>` with the npm_*
 /// environment and the package's `.bin` on PATH). Scripts that need a
 /// runtime (node, node-gyp, ...) must be available on PATH.
+#[cfg(feature = "npm")]
 #[derive(Debug)]
 pub struct ShellLifecycleScriptsExecutor;
 
@@ -121,9 +133,12 @@ pub struct ShellLifecycleScriptsExecutor;
 /// added.
 // ponytail: direct-child supervision now; add process groups/Job Objects after
 // the platform-specific lifecycle research is available.
+#[cfg(feature = "npm")]
 const LIFECYCLE_SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(feature = "npm")]
 const LIFECYCLE_KILL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[cfg(feature = "npm")]
 async fn supervise_lifecycle_script(
     mut child: tokio::process::Child,
     package: &str,
@@ -170,6 +185,7 @@ async fn supervise_lifecycle_script(
     }
 }
 
+#[cfg(feature = "npm")]
 #[async_trait::async_trait(?Send)]
 impl deno_npm_installer::lifecycle_scripts::LifecycleScriptsExecutor
     for ShellLifecycleScriptsExecutor
@@ -243,6 +259,7 @@ impl deno_npm_installer::lifecycle_scripts::LifecycleScriptsExecutor
 /// (see `NpmProcessState`) may embed registry credentials — it is generated
 /// only when deno_process is about to fork and must never be logged or sent
 /// off-machine.
+#[cfg(feature = "npm")]
 pub fn create_npm_process_state_provider(
     resolver_factory: &Arc<ResolverFactory<RealSys>>,
 ) -> deno_core::anyhow::Result<deno_runtime::deno_process::NpmProcessStateProviderRc> {
@@ -260,6 +277,7 @@ pub fn create_npm_process_state_provider(
 pub type RealFileFetcher = PermissionedFileFetcher<NullBlobStore, RealSys, ReqwestHttpClient>;
 pub type RealGraphLoader =
     deno_resolver::file_fetcher::DenoGraphLoader<NullBlobStore, RealSys, ReqwestHttpClient>;
+#[cfg(feature = "npm")]
 pub type RealNpmInstallerFactory = NpmInstallerFactory<ReqwestHttpClient, LogReporter, RealSys>;
 
 /// The permission-free half of the resolver pipeline, built once and reused
@@ -284,9 +302,6 @@ pub struct SharedServices {
     /// graph loader (which are themselves per-run: they bind permissions).
     pub http_cache: Arc<GlobalOrLocalHttpCache<RealSys>>,
     pub global_http_cache: GlobalHttpCacheRc<RealSys>,
-    /// In-memory virtual files (deno_resolver MemoryFiles) backing the
-    /// per-run file fetcher.
-    pub memory_files: Arc<MemoryFiles>,
     /// Implements deno_graph's `Resolver` and `NpmResolver` traits for graph
     /// building.
     pub graph_resolver: Arc<GraphResolver>,
@@ -296,6 +311,9 @@ pub struct SharedServices {
     /// run.
     pub module_info_cache: Arc<crate::analysis_cache::ModuleInfoCache>,
     /// npm process state for `child_process.fork` (npm snapshot propagation).
+    /// Under `not(feature = "npm")` it is an
+    /// `EmptyNpmProcessStateProvider` (whose `get_npm_process_state` returns an
+    /// empty string), so forks carry no npm state.
     pub npm_process_state_provider: deno_runtime::deno_process::NpmProcessStateProviderRc,
     /// Accepted resolver inputs from the same construction attempt. Runtime
     /// invalidation probes this manifest; it is never reconstructed into a
@@ -304,6 +322,7 @@ pub struct SharedServices {
     /// Immutable resolver-bound identity shared by snapshot lookup and save.
     /// It is `None` for lockfile-backed, BYONM, or credential-bearing
     /// configuration.
+    #[cfg(feature = "npm")]
     npm_snapshot_key: Option<Arc<crate::npm_cache::ManagedNpmSnapshotKey>>,
 }
 
@@ -398,6 +417,7 @@ impl SharedServices {
             &workspace_factory,
             &resolver_factory,
         )?;
+        #[cfg(feature = "npm")]
         let npm_snapshot_key =
             crate::npm_cache::managed_snapshot_key(&input_manifest).map(Arc::new);
 
@@ -406,6 +426,7 @@ impl SharedServices {
         // during stack construction here; the graph resolver and per-run
         // pieces share the resolver/graph state via `SharedServices` instead.
         let http_client = Arc::new(ReqwestHttpClient::new()?);
+        #[cfg(feature = "npm")]
         #[allow(clippy::arc_with_non_send_sync)]
         let npm_installer_factory = Arc::new(NpmInstallerFactory::new(
             resolver_factory.clone(),
@@ -442,7 +463,6 @@ impl SharedServices {
             },
         ));
 
-        let memory_files = Arc::new(MemoryFiles::default());
         let http_cache = Arc::new(workspace_factory.http_cache()?.clone());
         let global_http_cache = workspace_factory.global_http_cache()?.clone();
 
@@ -452,13 +472,25 @@ impl SharedServices {
         // RuntimeServices::save_npm_snapshot_cache): on a cache miss the
         // initializer returns Ok(None) without resolving anything, so caching
         // here would store an empty resolution forever.
+        #[cfg(feature = "npm")]
         npm_installer_factory
             .initialize_npm_resolution_if_managed()
             .await?;
         let graph_resolver = Arc::new(
-            GraphResolver::new(resolver_factory.clone(), npm_installer_factory.clone()).await?,
+            GraphResolver::new(
+                resolver_factory.clone(),
+                #[cfg(feature = "npm")]
+                Some(npm_installer_factory.clone()),
+                #[cfg(not(feature = "npm"))]
+                (),
+            )
+            .await?,
         );
+        #[cfg(feature = "npm")]
         let npm_process_state_provider = create_npm_process_state_provider(&resolver_factory)?;
+        #[cfg(not(feature = "npm"))]
+        let npm_process_state_provider: deno_runtime::deno_process::NpmProcessStateProviderRc =
+            deno_fs::sync::MaybeArc::new(deno_runtime::deno_process::EmptyNpmProcessStateProvider);
         let module_info_cache = crate::analysis_cache::module_info_cache();
 
         Ok(Arc::new(Self {
@@ -468,11 +500,11 @@ impl SharedServices {
             http_client,
             http_cache,
             global_http_cache,
-            memory_files,
             graph_resolver,
             module_info_cache,
             npm_process_state_provider,
             input_manifest,
+            #[cfg(feature = "npm")]
             npm_snapshot_key,
         }))
     }
@@ -522,6 +554,11 @@ pub struct RuntimeServices {
     pub graph_loader: Arc<RealGraphLoader>,
     /// Per-run module graph. `prepare_load` builds it, `load` reads from it.
     pub graph: Arc<tokio::sync::Mutex<ModuleGraph>>,
+    /// Per-run in-memory virtual files (deno_resolver MemoryFiles) backing the
+    /// file fetcher. Fresh per run: upstream `MemoryFiles` has no per-key
+    /// removal, so a shared map would leak one entry per `run_source*` call
+    /// over a long-lived resolver stack.
+    pub(crate) memory_files: Arc<MemoryFiles>,
     /// Shared sink for this run and its web workers.
     pub(crate) timing: ExecutionTiming,
 }
@@ -536,22 +573,30 @@ impl RuntimeServices {
     /// their snapshot comes from the on-disk lockfile (and the resolve
     /// callback never serves them).
     pub fn save_npm_snapshot_cache(&self) {
-        // Do not save a candidate after its accepted inputs changed. This also
-        // re-checks lockfile/auth transitions so lookup and save stay paired.
-        if !self.shared.input_manifest.is_current().unwrap_or(false) {
-            return;
+        #[cfg(feature = "npm")]
+        {
+            // Do not save a candidate after its accepted inputs changed. This also
+            // re-checks lockfile/auth transitions so lookup and save stay paired.
+            if !self.shared.input_manifest.is_current().unwrap_or(false) {
+                return;
+            }
+            use deno_resolver::npm::NpmResolver;
+            let Ok(NpmResolver::Managed(managed)) = self.shared.resolver_factory.npm_resolver()
+            else {
+                return;
+            };
+            let Some(snapshot_key) = self.shared.npm_snapshot_key.as_ref() else {
+                return;
+            };
+            crate::npm_cache::insert(
+                snapshot_key.clone(),
+                managed.resolution().serialized_valid_snapshot(),
+            );
         }
-        use deno_resolver::npm::NpmResolver;
-        let Ok(NpmResolver::Managed(managed)) = self.shared.resolver_factory.npm_resolver() else {
-            return;
-        };
-        let Some(snapshot_key) = self.shared.npm_snapshot_key.as_ref() else {
-            return;
-        };
-        crate::npm_cache::insert(
-            snapshot_key.clone(),
-            managed.resolution().serialized_valid_snapshot(),
-        );
+        #[cfg(not(feature = "npm"))]
+        {
+            // ponytail: npm feature off — snapshot cache machinery absent, no-op.
+        }
     }
 
     /// Builds the per-run permission-bound components over an existing
@@ -563,11 +608,14 @@ impl RuntimeServices {
         timing: ExecutionTiming,
     ) -> deno_core::anyhow::Result<Self> {
         let in_npm_pkg_checker = shared.resolver_factory.in_npm_package_checker()?.clone();
+        // Fresh per-run map: the main module (if in-memory) is registered into
+        // it by resolve_main_module after this constructor returns.
+        let memory_files = Arc::new(MemoryFiles::default());
         let file_fetcher = Arc::new(PermissionedFileFetcher::new(
             NullBlobStore,
             shared.http_cache.clone(),
             (*shared.http_client).clone(),
-            shared.memory_files.clone(),
+            memory_files.clone(),
             shared.sys.clone(),
             PermissionedFileFetcherOptions {
                 allow_remote: true,
@@ -606,6 +654,7 @@ impl RuntimeServices {
             file_fetcher,
             graph_loader,
             graph,
+            memory_files,
             timing,
         })
     }
@@ -614,6 +663,7 @@ impl RuntimeServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "npm")]
     use deno_runtime::deno_process::NpmProcessStateProvider;
 
     static STABILITY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -629,6 +679,7 @@ mod tests {
         *hooks.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    #[cfg(feature = "npm")]
     #[test]
     fn npm_process_state_provider_reads_latest_snapshot_for_repeated_forks() {
         let resolution = deno_fs::sync::MaybeArc::new(
@@ -672,6 +723,7 @@ mod tests {
         assert!(!format!("{provider:?}").contains("state-pkg@1.0.0"));
     }
 
+    #[cfg(feature = "npm")]
     #[cfg(unix)]
     #[test]
     fn lifecycle_supervision_times_out_and_reaps_direct_child() {

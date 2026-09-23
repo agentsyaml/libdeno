@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::PathBuf;
 
-use libdeno::{run, LibdenoOptions};
+use libdeno::{run, run_source, LibdenoOptions, SourceLang};
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("libdeno-e2e-{}-{}", std::process::id(), name));
@@ -1693,6 +1693,196 @@ fn subprocess_write_times_out_when_host_never_services_child_mode() {
     assert!(
         elapsed < std::time::Duration::from_secs(30),
         "the bounded write must return in ~10s, took {elapsed:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn runs_in_memory_js_source() {
+    let dir = temp_dir("in-memory-js");
+    let code = run_source(
+        "console.log('in-memory');",
+        SourceLang::JavaScript,
+        &dir,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn runs_in_memory_typescript_source() {
+    // `const x: number` is invalid JS: this only passes if the in-memory
+    // source really went through the TypeScript transpile path.
+    let dir = temp_dir("in-memory-ts");
+    let code = run_source(
+        "const x: number = 1;\nconsole.log(x);",
+        SourceLang::TypeScript,
+        &dir,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn in_memory_source_imports_sibling_from_disk() {
+    // Relative imports resolve against the virtual specifier's parent
+    // (base_dir), so an on-disk sibling loads and its value is visible.
+    let dir = temp_dir("in-memory-sibling");
+    fs::write(dir.join("sibling.js"), "export const v = 42;").unwrap();
+    let code = run_source(
+        "import { v } from './sibling.js';\nif (v !== 42) Deno.exit(3);",
+        SourceLang::JavaScript,
+        &dir,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn in_memory_source_respects_scoped_read_permission() {
+    // Without allow-all: grant read on the directory only (same mechanism as
+    // the other scoped-permission smoke tests). This covers the known risk
+    // that the file fetcher permission-checks the virtual `file:` URL before
+    // the in-memory hit — the entry itself and the on-disk sibling import
+    // must both be covered by the --allow-read grant on base_dir.
+    let dir = temp_dir("in-memory-perm");
+    // Canonicalize so the --allow-read scope matches the canonicalized
+    // base_dir / virtual-entry path exactly (same pattern as the
+    // symlink-inside-grant smoke test; /var -> /private/var on macOS).
+    let dir = fs::canonicalize(&dir).unwrap();
+    fs::write(dir.join("sibling.js"), "export const v = 42;").unwrap();
+    let options = LibdenoOptions {
+        permissions: vec![format!("--allow-read={}", dir.display())],
+        ..Default::default()
+    };
+    let code = run_source(
+        "import { v } from './sibling.js';\nif (v !== 42) Deno.exit(3);",
+        SourceLang::JavaScript,
+        &dir,
+        &options,
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn in_memory_source_denied_without_read_permission() {
+    // The entry read-permission check applies to the memory entry's virtual
+    // path (which lives inside base_dir): granting read only on a DIFFERENT
+    // directory must deny the run with a permission error, even though the
+    // entry itself is never read from disk.
+    let base_dir = temp_dir("in-memory-perm-denied");
+    let granted = temp_dir("in-memory-perm-denied-granted");
+    let base_dir = fs::canonicalize(&base_dir).unwrap();
+    // Canonicalize the grant too so the --allow-read scope matches what the
+    // permission system canonicalizes to (same pattern as the other tests;
+    // /var -> /private/var on macOS).
+    let granted = fs::canonicalize(&granted).unwrap();
+    let options = LibdenoOptions {
+        permissions: vec![format!("--allow-read={}", granted.display())],
+        ..Default::default()
+    };
+    let err = run_source(
+        "console.log('must not run');",
+        SourceLang::JavaScript,
+        &base_dir,
+        &options,
+    )
+    .unwrap_err();
+    assert!(
+        err.is_permission_error(),
+        "expected a permission error for the ungranted base_dir, got: {err}"
+    );
+    let _ = fs::remove_dir_all(&base_dir);
+    let _ = fs::remove_dir_all(&granted);
+}
+
+#[test]
+fn run_source_with_nonexistent_base_dir_is_rejected() {
+    // entry_source_memory must fail fast when base_dir cannot be canonicalized
+    // (the virtual URL must be canonical for permission matching); the raw
+    // path would make scoped --allow-read grants miss and produce an opaque
+    // NotFound instead of a clear configuration error.
+    let parent = temp_dir("in-memory-missing-base");
+    let missing = parent.join("does-not-exist");
+    let err = run_source(
+        "console.log('never runs');",
+        SourceLang::JavaScript,
+        &missing,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, libdeno::LibdenoError::Configuration(_)),
+        "expected a configuration error for the missing base_dir, got: {err}"
+    );
+    let _ = fs::remove_dir_all(&parent);
+}
+
+#[test]
+fn run_source_with_file_as_base_dir_is_rejected() {
+    // canonicalize succeeds for an existing file too, so entry_source_memory
+    // must reject a non-directory base_dir explicitly (a file base_dir would
+    // make relative imports resolve to <file>/sibling.js and fail opaquely).
+    let parent = temp_dir("in-memory-file-base");
+    let file = parent.join("base.js");
+    fs::write(&file, "// not a directory\n").unwrap();
+    let err = run_source(
+        "console.log('never runs');",
+        SourceLang::JavaScript,
+        &file,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, libdeno::LibdenoError::Configuration(_)),
+        "expected a configuration error for a file base_dir, got: {err}"
+    );
+    let _ = fs::remove_dir_all(&parent);
+}
+
+#[cfg(not(feature = "npm"))]
+#[test]
+fn npm_specifier_fails_cleanly_when_feature_disabled() {
+    // With the npm feature compiled out, an `npm:` import must return a clean
+    // error (no panic, no hang) carrying the wording promised in the README.
+    let dir = temp_dir("npm-disabled");
+    let err = run_source(
+        "import 'npm:some-pkg';",
+        SourceLang::JavaScript,
+        &dir,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("npm support is disabled in this build"),
+        "unexpected npm-disabled error: {message}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

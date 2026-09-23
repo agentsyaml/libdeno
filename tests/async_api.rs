@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 #[cfg(not(windows))]
 use libdeno::run_with_output_async;
-use libdeno::{run_async, LibdenoOptions, LibdenoRuntime};
+use libdeno::{run_async, run_source_async, LibdenoOptions, LibdenoRuntime, SourceLang};
 
 /// The capture test's exclusivity lease rejects any concurrent run, so tests
 /// in this file (which cargo test runs in parallel) must take this lock —
@@ -249,6 +249,32 @@ fn async_run_on_multi_thread_runtime_via_local_set() {
     let options_c = options.clone();
     let code = local
         .block_on(&rt, async move { run_async(entry_c, &options_c).await })
+        .unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_source_async_smoke() {
+    // In-memory source on the caller's tokio runtime: same !Send / guard
+    // rules as run_async — one sequential run is enough for the smoke.
+    let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("source-async");
+    fs::write(dir.join("sibling.js"), "export const v = 7;").unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let code = rt
+        .block_on(run_source_async(
+            "import { v } from './sibling.js';\nif (v !== 7) Deno.exit(3);",
+            SourceLang::JavaScript,
+            &dir,
+            &LibdenoOptions {
+                allow_all_permissions: true,
+                ..Default::default()
+            },
+        ))
         .unwrap();
     assert_eq!(code, 0);
     let _ = fs::remove_dir_all(&dir);

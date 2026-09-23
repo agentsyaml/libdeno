@@ -113,6 +113,9 @@ pub(crate) fn build_main_worker(
         fs,
         module_loader,
         node_services,
+        // Always Some: the npm-off provider is EmptyNpmProcessStateProvider,
+        // and deno_process treats None identically (falls back to the same
+        // empty provider) — passing Some keeps one code path.
         npm_process_state_provider: Some(services.shared.npm_process_state_provider.clone()),
         permissions,
         root_cert_store_provider: None,

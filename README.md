@@ -21,6 +21,8 @@ libdeno is a Rust crate that embeds a full Deno runtime (V8 + the official modul
 - **Permission model**: CLI-style `--allow-*` capability strings; permissions are opt-in — an empty list is a construction error unless `allow_all_permissions` is set.
 - **Unstable APIs enabled out of the box**: `Deno.openKv`, cron, FFI, WebGPU, etc. (an "everything enabled" stance, like `deno run --unstable`).
 - **Prebuilt V8 snapshot**: runtime extensions are compiled into a snapshot at build time for faster cold start.
+- **In-memory script API**: `run_source` / `run_source_with_output` (+ async variants) execute JS/TS source held in memory (`&str`, `String`, `&[u8]`, `Vec<u8>`) without writing a temp file.
+- **Optional `npm` Cargo feature**: the npm installer / npm-cache machinery is behind the default-on `npm` feature and can be compiled out (see [Build](#build)).
 
 ---
 
@@ -43,6 +45,28 @@ let exit_code = run("app.js", &options).unwrap();
 - A file: `run("app.ts", ...)`
 - A directory: `run("./my-app", ...)` (uses its `package.json` `main`, default `index.js`)
 - A `package.json` itself: `run("./my-app/package.json", ...)`
+
+### Run in-memory source: `run_source`
+
+`run_source(code, lang, base_dir, &options)` executes JS or TS source held in memory — no temp file, no disk round-trip for the entry itself. `code` is anything `AsRef<[u8]>` (`&str`, `String`, `&[u8]`, `Vec<u8>`); `lang` is `SourceLang::JavaScript` or `SourceLang::TypeScript`:
+
+```rust
+use libdeno::{run_source, SourceLang, LibdenoOptions};
+
+let options = LibdenoOptions { allow_all_permissions: true, ..Default::default() };
+run_source("console.log('hi')", SourceLang::JavaScript, "./my-app", &options).unwrap();
+run_source("const x: number = 1 + 2; console.log(x)", SourceLang::TypeScript, "./my-app", &options).unwrap();
+```
+
+The source is registered under a unique virtual `file:` URL inside `base_dir` (e.g. `<base_dir>/__libdeno_virtual_3.ts`) and then flows through the entire normal pipeline — graph build, TypeScript transpile, CJS, JSON, npm/remote imports — exactly like a file on disk. Consequences:
+
+- Relative imports resolve against `base_dir` (they load real files from disk next to the virtual entry).
+- `import.meta.url` / `Deno.mainModule` show the virtual specifier, not a caller-chosen name; the URL is unique per call.
+- Resolver/config discovery (deno.json / package.json / node_modules) starts at `base_dir`.
+- The memory entry's virtual path lies inside `base_dir`, so the same entry read-permission check applies to it as to its child imports (the entry is still not read from disk); granting read on `base_dir` covers both.
+- The subprocess / `Executor` backends do **not** support in-memory sources (their payload is a filesystem path) — use the in-process APIs.
+
+Semantics otherwise match the path-based APIs exactly: `run_source_with_output` captures output under the same exclusive lease as `run_with_output`; `run_source_async` / `run_with_source_async` follow `run_async`'s rules (`!Send` future, no interleaving on one thread). On a reusable `LibdenoRuntime` the equivalents are `libdeno::runtime::run_with_source` / `run_with_output_source` / `run_with_source_async` / `run_with_output_source_async`.
 
 ### Reuse the resolver stack: `LibdenoRuntime` + `run_with`
 
@@ -201,6 +225,12 @@ output capture): [`examples/npm-plugin.md`](examples/npm-plugin.md).
 - The build script (`build.rs`) generates the V8 snapshot and pre-transpiles residual lazy-load sources; `DENO_SNAPSHOT_MINIFY_SOURCES` triggers source minification.
 - The first build is slow (V8 snapshot + full dependency tree). Release debug symbols are disabled in `Cargo.toml`.
 - `.node` native addon symbol export: the example host uses `.cargo/config.toml` (dev-only) to export `napi_*`. Real embedders should call `deno_napi::print_linker_flags("<host-binary-name>")` in their own `build.rs`.
+
+### Cargo feature: `npm`
+
+`npm` is in the default feature set (`default = ["snapshot", "npm"]`). Building with `--no-default-features --features snapshot` removes the npm installer (`deno_npm_installer`) and npm-cache (`deno_npm_cache`) machinery, including the npm lifecycle-script executor. In such a build, `npm:` imports fail with a clear "npm support is disabled in this build (enable the `npm` feature)" error.
+
+Honest caveat: `deno_resolver`/`node_resolver` depend unconditionally on `deno_npm` and `deno_npmrc`, so those crates stay in the build; disabling `npm` removes bare `npm:` specifier install support but leaves `node_modules`/BYONM resolution working. It is a dependency/API-surface and compile-time reduction — **not** a meaningful binary-size win (the statically linked V8 runtime dominates binary size).
 
 ---
 

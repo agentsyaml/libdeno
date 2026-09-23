@@ -17,6 +17,8 @@ English: [README.md](README.md)
 - **权限模型**：与 CLI 一致的 `--allow-*` 能力字符串；权限为显式选择——空列表是构造错误，除非设置 `allow_all_permissions`。
 - **开箱即用的 unstable API**：`Deno.openKv`、cron、FFI、WebGPU 等默认启用（匹配 `deno run --unstable` 的"全开"立场）。
 - **预构建 V8 快照**：构建时把运行时扩展编译进快照，冷启动更快。
+- **内存脚本 API**：`run_source` / `run_source_with_output`（及异步变体）直接执行内存中的 JS/TS 源码（`&str`、`String`、`&[u8]`、`Vec<u8>`），无需写临时文件。
+- **可选的 `npm` Cargo feature**：npm 安装器 / npm-cache 机制位于默认开启的 `npm` feature 之后，可以编译掉（见[构建](#构建)）。
 
 ---
 
@@ -39,6 +41,28 @@ let exit_code = run("app.js", &options).unwrap();
 - 一个文件：`run("app.ts", ...)`
 - 一个目录：`run("./my-app", ...)`（使用其中的 `package.json` 的 `main`，默认 `index.js`）
 - 一个 `package.json` 本身：`run("./my-app/package.json", ...)`
+
+### 运行内存源码：`run_source`
+
+`run_source(code, lang, base_dir, &options)` 直接执行内存中的 JS/TS 源码——不写临时文件，入口本身也不落盘。`code` 是任何实现了 `AsRef<[u8]>` 的类型（`&str`、`String`、`&[u8]`、`Vec<u8>`）；`lang` 为 `SourceLang::JavaScript` 或 `SourceLang::TypeScript`：
+
+```rust
+use libdeno::{run_source, SourceLang, LibdenoOptions};
+
+let options = LibdenoOptions { allow_all_permissions: true, ..Default::default() };
+run_source("console.log('hi')", SourceLang::JavaScript, "./my-app", &options).unwrap();
+run_source("const x: number = 1 + 2; console.log(x)", SourceLang::TypeScript, "./my-app", &options).unwrap();
+```
+
+源码会注册到 `base_dir` 下一个唯一的虚拟 `file:` URL（例如 `<base_dir>/__libdeno_virtual_3.ts`），然后走**完整的**正常管线——模块图构建、TypeScript 转译、CJS、JSON、npm/远程导入——与磁盘上的文件完全一致。由此带来的行为：
+
+- 相对导入按 `base_dir` 解析（会从磁盘加载虚拟入口旁边的真实文件）。
+- `import.meta.url` / `Deno.mainModule` 显示的是虚拟说明符，而不是调用方指定的名字；URL 每次调用唯一。
+- 解析器/配置发现（deno.json / package.json / node_modules）从 `base_dir` 开始。
+- 内存入口的虚拟路径位于 `base_dir` 内部，因此与子导入一样，它同样要经过入口读取权限检查（入口本身仍不从磁盘读取）；授予 `base_dir` 的读权限即可同时覆盖两者。
+- 子进程 / `Executor` 后端**不支持**内存源码（其载荷是文件系统路径）——请使用进程内 API。
+
+其余语义与基于路径的 API 完全一致：`run_source_with_output` 与 `run_with_output` 一样在独占租约下捕获输出；`run_source_async` / `run_with_source_async` 遵循 `run_async` 的规则（future 非 `Send`，同一线程不可交错运行）。在可复用的 `LibdenoRuntime` 上对应的是 `libdeno::runtime::run_with_source` / `run_with_output_source` / `run_with_source_async` / `run_with_output_source_async`。
 
 ### 复用解析器栈：`LibdenoRuntime` + `run_with`
 
@@ -145,6 +169,12 @@ println!("exit={} stdout={:?}", out.exit_code, out.stdout);
 - 构建脚本（`build.rs`）生成 V8 快照并预转译残留的懒加载源；`DENO_SNAPSHOT_MINIFY_SOURCES` 环境变量可触发源压缩。
 - 首次构建较慢（V8 快照 + 全量依赖）。Release 配置在 `Cargo.toml` 中关闭 debug 符号。
 - `.node` 原生插件的符号导出：示例宿主通过 `.cargo/config.toml`（仅开发用）导出 `napi_*`。真实嵌入方应在自己的 `build.rs` 调用 `deno_napi::print_linker_flags("<host-binary-name>")`。
+
+### Cargo feature：`npm`
+
+`npm` 在默认 feature 集中（`default = ["snapshot", "npm"]`）。使用 `--no-default-features --features snapshot` 构建会移除 npm 安装器（`deno_npm_installer`）与 npm-cache（`deno_npm_cache`）机制，包括 npm 生命周期脚本执行器。在这样的构建中，`npm:` 导入会以明确的 "npm support is disabled in this build (enable the `npm` feature)" 错误失败。
+
+需要说明的实话：`deno_resolver`/`node_resolver` 无条件依赖 `deno_npm` 与 `deno_npmrc`，这些 crate 无法从构建中移除；关闭 `npm` 只会去掉裸 `npm:` 说明符的安装支持，`node_modules`/BYONM 解析仍然可用。它是依赖/API 表面与编译时间的缩减——**不是**有意义的二进制体积收益（静态链接的 V8 运行时主导二进制大小）。
 
 ---
 

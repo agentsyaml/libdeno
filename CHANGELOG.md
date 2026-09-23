@@ -5,6 +5,50 @@ breaking changes are highlighted per release with migration notes.
 
 [keep a changelog]: https://keepachangelog.com/en/1.1.0/
 
+## Unreleased
+
+### Added
+
+- **In-memory source API**: `run_source` / `run_source_with_output` (plus async
+  `run_source_async` / `run_source_with_output_async`) execute JS/TS source
+  held in memory (`&str`, `String`, `&[u8]`, `Vec<u8>` — anything
+  `AsRef<[u8]>`). The source is registered under a unique virtual `file:` URL
+  inside `base_dir` and flows through the entire normal pipeline — graph
+  build, TypeScript transpile, CJS, JSON, npm/remote imports — exactly like a
+  file on disk. Relative imports resolve against `base_dir`; resolver/config
+  discovery starts there; `import.meta.url` / `Deno.mainModule` show the
+  virtual specifier (unique per call); the memory entry's virtual path lies
+  inside `base_dir`, so the same read-permission check applies to it and to its
+  child imports — the entry itself is not read from disk, and granting read on
+  `base_dir` covers both. The subprocess/`Executor` backends do not
+  support in-memory sources. On a reusable `LibdenoRuntime`, the same family
+  is available as `runtime::run_with_source` / `run_with_output_source` /
+  `run_with_source_async` / `run_with_output_source_async`; semantics match
+  the path-based APIs otherwise (tokio re-entry handling, capture-exclusivity
+  lease).
+- **Optional `npm` Cargo feature**: `deno_npm_installer` and
+  `deno_npm_cache` are now optional behind the default-on `npm` feature.
+  Building with `--no-default-features --features snapshot` removes the npm
+  installer / npm-cache host machinery and the lifecycle-script executor;
+  in such a build `npm:` imports fail with a clear "npm support is disabled
+  in this build (enable the `npm` feature)" error instead of panicking.
+  Honest caveat:
+  `deno_resolver`/`node_resolver` depend unconditionally on `deno_npm` and
+  `deno_npmrc`, so those crates cannot be removed from the build — disabling
+  `npm` removes bare `npm:` specifier install support but leaves
+  `node_modules`/BYONM resolution working. It is a dependency/API-surface and
+  compile-time reduction, not a meaningful binary-size win (the statically
+  linked V8 runtime dominates binary size).
+
+### Changed
+
+- **`npm:` install support is now behind the default-on `npm` feature**
+  (migration note): previously `deno_npm_installer`/`deno_npm_cache` were
+  unconditional, so npm install support was always compiled in. Consumers
+  building with `default-features = false` must now add `"npm"` to their
+  feature list to keep `npm:` install support; without it, `npm:` imports
+  fail with a clear error at graph build time.
+
 ## 0.3.2
 
 ### Phase 1 / Phase 2 behavior changes

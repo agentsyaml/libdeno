@@ -6,7 +6,8 @@ use std::fs;
 use std::future::Future;
 use std::path::PathBuf;
 
-use libdeno::{run_with, LibdenoOptions, LibdenoRuntime};
+use libdeno::runtime::run_with_source;
+use libdeno::{run_with, LibdenoOptions, LibdenoRuntime, SourceLang};
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("libdeno-runtime-{}-{}", std::process::id(), name));
@@ -429,6 +430,70 @@ fn reusable_async_run_rebuilds_when_config_changes() {
     write_config("b");
     assert_eq!(rt.block_on(runtime.run_async(&entry, &options)).unwrap(), 0);
     assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), "b");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reusable_runtime_runs_in_memory_source() {
+    // run_with_source / run_with_output_source: in-memory sources through the
+    // reusable stack — the exit code comes back. The captured variant
+    // (run_with_output_source) is intentionally not asserted here: capture
+    // holds a process-global exclusive lease, which races with the captured
+    // tests in async_api.rs (captured coverage lives there under its FILE_LOCK).
+    let dir = temp_dir("run-with-source");
+    let runtime = build_runtime(&dir);
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let code = run_with_source(
+        &runtime,
+        "console.log('reusable in-memory');",
+        SourceLang::JavaScript,
+        &dir,
+        &options,
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    // ponytail: skip the captured variant here — capture holds a process-global
+    // exclusive lease, which races with the captured tests in async_api.rs
+    // (captured coverage lives there under its FILE_LOCK).
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn concurrent_in_memory_runs_on_one_runtime_succeed() {
+    // Two concurrent in-memory runs on one runtime each get their own
+    // per-run `memory_files` map, so both must complete with exit code 0.
+    let dir = temp_dir("concurrent-source");
+    let runtime = build_runtime(&dir);
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let codes = std::thread::scope(|s| {
+        let h1 = s.spawn(|| {
+            run_with_source(
+                &runtime,
+                "console.log('concurrent a');",
+                SourceLang::JavaScript,
+                &dir,
+                &options,
+            )
+        });
+        let h2 = s.spawn(|| {
+            run_with_source(
+                &runtime,
+                "console.log('concurrent b');",
+                SourceLang::JavaScript,
+                &dir,
+                &options,
+            )
+        });
+        (h1.join().unwrap(), h2.join().unwrap())
+    });
+    assert_eq!(codes.0.unwrap(), 0);
+    assert_eq!(codes.1.unwrap(), 0);
     let _ = fs::remove_dir_all(&dir);
 }
 

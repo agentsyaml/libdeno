@@ -12,10 +12,14 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(any(feature = "npm", test))]
 use std::sync::Arc;
+#[cfg(any(feature = "npm", test))]
 use std::sync::Mutex;
+#[cfg(any(feature = "npm", test))]
 use std::sync::OnceLock;
 
+#[cfg(any(feature = "npm", test))]
 use deno_npm::resolution::ValidSerializedNpmResolutionSnapshot;
 use deno_npmrc::ReplaceRegistryHost;
 use deno_resolver::factory::ResolverFactory;
@@ -132,6 +136,7 @@ struct EnvironmentValueProbe {
 /// resolution. It contains no npmrc source, token, auth flag, certificate
 /// path, or private URL userinfo.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg(any(feature = "npm", test))]
 pub(crate) struct ManagedNpmSnapshotKey {
     identity: ResolverInputIdentity,
 }
@@ -437,6 +442,7 @@ impl ResolverInputManifest {
 
 /// Builds the only key used by the production snapshot cache. It is derived
 /// from the accepted manifest's parsed baseline; no paths are re-read here.
+#[cfg(any(feature = "npm", test))]
 pub(crate) fn managed_snapshot_key(
     manifest: &ResolverInputManifest,
 ) -> Option<ManagedNpmSnapshotKey> {
@@ -940,19 +946,24 @@ fn meta_fingerprint(metadata: &std::fs::Metadata) -> Option<u64> {
 /// FIFO cache of recent snapshots; bounded so a long-lived process serving
 /// many projects does not grow without limit. Key construction is bounded but
 /// deliberately has no public latency guarantee.
+#[cfg(any(feature = "npm", test))]
 type SnapshotCache = Vec<(
     Arc<ManagedNpmSnapshotKey>,
     ValidSerializedNpmResolutionSnapshot,
 )>;
 
+#[cfg(any(feature = "npm", test))]
 static CACHE: OnceLock<Mutex<SnapshotCache>> = OnceLock::new();
+#[cfg(any(feature = "npm", test))]
 const MAX_ENTRIES: usize = 8;
 
+#[cfg(any(feature = "npm", test))]
 fn cache() -> &'static Mutex<SnapshotCache> {
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Returns a clone of the snapshot cached for `key`, if any.
+#[cfg(any(feature = "npm", test))]
 pub(crate) fn get(key: &ManagedNpmSnapshotKey) -> Option<ValidSerializedNpmResolutionSnapshot> {
     let entries = cache().lock().unwrap_or_else(|e| e.into_inner());
     entries
@@ -963,6 +974,7 @@ pub(crate) fn get(key: &ManagedNpmSnapshotKey) -> Option<ValidSerializedNpmResol
 
 /// Caches `snapshot` under `key`, replacing an existing entry with the same
 /// key. On overflow the oldest entry is dropped (FIFO).
+#[cfg(any(feature = "npm", test))]
 pub(crate) fn insert(
     key: Arc<ManagedNpmSnapshotKey>,
     snapshot: ValidSerializedNpmResolutionSnapshot,

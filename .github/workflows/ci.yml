@@ -58,3 +58,9 @@ jobs:
 
       - name: Check docs.rs mode
         run: DOCS_RS=1 cargo check --no-default-features --lib --locked
+
+      - name: Check npm-disabled feature set
+        run: cargo check --all-targets --no-default-features --features snapshot --locked
+
+      - name: Test npm-disabled feature set
+        run: cargo test --no-default-features --features snapshot --test smoke --test runtime --test async_api --locked

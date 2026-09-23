@@ -110,6 +110,7 @@ pub(crate) fn resolver_byonm_and_root_node_modules_path(
 
 /// Returns only upstream resolver data needed by the service-owned process
 /// state serializer. The provider implementation remains in `services`.
+#[cfg(feature = "npm")]
 pub(crate) fn npm_process_state_inputs(
     resolver_factory: &Arc<ResolverFactory<RealSys>>,
 ) -> deno_core::anyhow::Result<(

@@ -1893,7 +1893,7 @@ impl ExecutorDispatch {
             ExecutorBackend::InProcess(runtime) => {
                 let result = crate::run_with_output_observed_cancellable_until(
                     runtime,
-                    &request.entry,
+                    &crate::EntrySource::from_path(&request.entry),
                     &options,
                     timing.clone(),
                     Some(cancellation),
@@ -2295,7 +2295,7 @@ impl Executor {
                 let dispatched = Some(ExecutionBackend::InProcess);
                 match crate::runtime::run_with_output_async_observed(
                     runtime,
-                    &request.entry,
+                    &crate::EntrySource::from_path(&request.entry),
                     &options,
                     timing.clone(),
                 )
@@ -2376,7 +2376,7 @@ impl Executor {
             ExecutorBackend::InProcess(runtime) => {
                 let result = crate::runtime::run_with_output_observed(
                     runtime,
-                    &request.entry,
+                    &crate::EntrySource::from_path(&request.entry),
                     &options,
                     timing.clone(),
                 );

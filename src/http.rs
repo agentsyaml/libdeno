@@ -5,13 +5,21 @@
 use deno_cache_dir::file_fetcher::HttpClient;
 use deno_cache_dir::file_fetcher::SendError;
 use deno_cache_dir::file_fetcher::SendResponse;
+#[cfg(feature = "npm")]
 use deno_npm_cache::DownloadError;
+#[cfg(feature = "npm")]
 use deno_npm_cache::NpmCacheHttpClient;
+#[cfg(feature = "npm")]
 use deno_npm_cache::NpmCacheHttpClientBytesResponse;
+#[cfg(feature = "npm")]
 use deno_npm_cache::NpmCacheHttpClientResponse;
+#[cfg(feature = "npm")]
 use deno_npmrc::RegistryConfig;
+#[cfg(feature = "npm")]
 use http::header::AUTHORIZATION;
+#[cfg(feature = "npm")]
 use http::header::ETAG;
+#[cfg(feature = "npm")]
 use http::header::IF_NONE_MATCH;
 use http::header::LOCATION;
 use http::HeaderMap;
@@ -33,6 +41,7 @@ const MAX_RESPONSE_BODY_BYTES: usize = 256 << 20;
 /// remains compressed tarball data here. The ISIZE guard below is a coarse
 /// publisher-controlled pre-check; neither boundary accounts for allocations
 /// inside upstream extraction.
+#[cfg(feature = "npm")]
 const MAX_TARBALL_BODY_BYTES: usize = 1 << 30;
 
 /// Total wall-clock budget for one HTTP operation, including retries,
@@ -72,7 +81,7 @@ impl ReqwestHttpClient {
 /// buffering an unbounded response. HTTP Content-Encoding has already been
 /// decoded, while an npm `.tgz` response body remains compressed tarball data.
 /// The caller picks the bound: module fetches pin the module cap, while npm
-/// registry downloads use the explicit tarball-path check in [`npm_body_limit`].
+/// registry downloads use the explicit tarball-path check in `npm_body_limit`.
 /// Over-limit is an error, never a retry.
 async fn read_body_limited(
     response: &mut reqwest::Response,
@@ -97,6 +106,7 @@ async fn read_body_limited(
 /// declaring a large `Content-Length`, and chunked metadata remains on the
 /// module cap. An explicit `.tgz` path is bounded by the tarball cap even when
 /// the registry omits `Content-Length`.
+#[cfg(feature = "npm")]
 fn npm_body_limit(is_tarball: bool, _content_length: Option<u64>) -> usize {
     if is_tarball {
         MAX_TARBALL_BODY_BYTES
@@ -121,6 +131,7 @@ fn remaining_http_budget(deadline: Instant) -> Result<Duration, String> {
 /// (`LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`). The budget is used for the
 /// publisher-controlled ISIZE guard; it is deliberately configurable so hosts with
 /// unusual packages can raise it.
+#[cfg(feature = "npm")]
 fn tarball_decompress_budget() -> usize {
     const DEFAULT: usize = 1 << 30;
     static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -143,6 +154,7 @@ fn tarball_decompress_budget() -> usize {
 /// upstream falls back to streaming (no reservation) when the reserve fails,
 /// and that path plus this check bound the practical exposure. The
 /// `read_body_limited` cap above bounds the *compressed* bytes already.
+#[cfg(feature = "npm")]
 fn guard_tarball_isize(is_tarball: bool, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     // Only .tgz URLs carry gzip-compressed tar data; registry metadata
     // (JSON, possibly transport-gzip-encoded) must not be size-checked here —
@@ -288,6 +300,7 @@ impl HttpClient for ReqwestHttpClient {
     }
 }
 
+#[cfg(feature = "npm")]
 #[async_trait::async_trait(?Send)]
 impl NpmCacheHttpClient for ReqwestHttpClient {
     async fn download_with_retries_on_any_tokio_runtime(
@@ -521,10 +534,12 @@ mod tests {
     /// Like `serve_many`, but accepts two connections in sequence: the first
     /// gets `first`, the second gets `second`. Used to simulate a redirect
     /// followed by the real response.
+    #[cfg(feature = "npm")]
     fn serve_then(first: &'static str, second: &'static str) -> String {
         serve_many(vec![first, second])
     }
 
+    #[cfg(feature = "npm")]
     fn serve_then_bytes(first: &'static str, second: Vec<u8>) -> String {
         serve_many_bytes(vec![first.as_bytes().to_vec(), second])
     }
@@ -651,6 +666,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "npm")]
     #[test]
     fn body_budget_requires_explicit_tgz_path() {
         // A `.tgz` path is the only evidence that permits the larger budget;
@@ -681,6 +697,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "npm")]
     #[test]
     fn npm_download_follows_redirect() {
         // A registry 302 to a relative Location must be followed to the target
@@ -707,6 +724,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "npm")]
     #[test]
     fn npm_download_preserves_tarball_identity_through_opaque_redirect() {
         let mut body = vec![0x1f, 0x8b]; // gzip magic
@@ -740,6 +758,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "npm")]
     #[test]
     fn isize_guard_rejects_inflated_trailer() {
         // A small tarball whose gzip ISIZE trailer claims ~4 GiB must be
@@ -755,6 +774,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "npm")]
     #[test]
     fn isize_guard_passes_small_trailer() {
         let mut bytes = vec![0x1f, 0x8b];
@@ -763,6 +783,7 @@ mod tests {
         assert!(guard_tarball_isize(true, bytes).is_ok());
     }
 
+    #[cfg(feature = "npm")]
     #[test]
     fn isize_guard_checks_the_last_member_of_a_multi_member_tarball() {
         // ISIZE is a per-member trailer. Keep this pre-check deliberately
@@ -777,6 +798,7 @@ mod tests {
         assert!(guard_tarball_isize(true, bytes).is_err());
     }
 
+    #[cfg(feature = "npm")]
     #[test]
     fn isize_guard_ignores_non_tarball_paths() {
         // Registry metadata (JSON) must never be size-checked: its trailer
@@ -790,6 +812,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "npm")]
     #[test]
     fn isize_guard_ignores_non_gzip_bytes() {
         let bytes = vec![0u8; 64]; // no gzip magic

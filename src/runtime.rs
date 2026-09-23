@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crate::npm_cache::ResolverInputManifest;
 use crate::services::SharedServices;
 use crate::timing::{ExecutionTiming, Phase};
+use crate::EntrySource;
 use crate::LibdenoError;
 use crate::LibdenoOptions;
 use crate::RunLease;
@@ -135,19 +136,57 @@ impl LibdenoRuntime {
         entry: impl AsRef<Path>,
         options: &LibdenoOptions,
     ) -> Result<crate::RunOutput, LibdenoError> {
-        run_with_output_async_observed(self, entry, options, ExecutionTiming::disabled()).await
+        let entry = EntrySource::from_path(entry.as_ref());
+        run_with_output_async_observed(self, &entry, options, ExecutionTiming::disabled()).await
+    }
+
+    /// Runs an **in-memory** JS/TS source (see [`crate::run_source`]) on the
+    /// caller's tokio runtime using this runtime's shared resolver stack, and
+    /// returns its exit code. The virtual entry is registered in the run's
+    /// per-run `RuntimeServices::memory_files` map. `base_dir` determines the
+    /// virtual entry's location, so relative imports resolve against it; the
+    /// shared resolver stack's config/discovery base remains the runtime's
+    /// directory. Note that `LibdenoOptions.cwd`
+    /// restrictions apply as in [`Self::run_async`] — a mismatched `cwd` is
+    /// rejected against the runtime's directory. The subprocess/`Executor`
+    /// backends do not support in-memory sources.
+    pub async fn run_with_source_async(
+        &self,
+        code: impl AsRef<[u8]>,
+        lang: crate::SourceLang,
+        base_dir: impl AsRef<Path>,
+        options: &LibdenoOptions,
+    ) -> Result<i32, LibdenoError> {
+        self.run_with_output_source_async(code, lang, base_dir, options)
+            .await
+            .map(|o| o.exit_code)
+    }
+
+    /// Captured-output variant of [`Self::run_with_source_async`]; capture
+    /// semantics match [`Self::run_with_output_async`] (exclusive process-
+    /// global lease, byte cap, Windows rejection).
+    pub async fn run_with_output_source_async(
+        &self,
+        code: impl AsRef<[u8]>,
+        lang: crate::SourceLang,
+        base_dir: impl AsRef<Path>,
+        options: &LibdenoOptions,
+    ) -> Result<crate::RunOutput, LibdenoError> {
+        reject_unusable_cwd(self, options)?;
+        let entry = crate::entry_source_memory(code, lang, base_dir)?;
+        run_with_output_async_observed(self, &entry, options, ExecutionTiming::disabled()).await
     }
 }
 
 pub(crate) async fn run_with_output_async_observed(
     runtime: &LibdenoRuntime,
-    entry: impl AsRef<Path>,
+    entry: &EntrySource,
     options: &LibdenoOptions,
     timing: ExecutionTiming,
 ) -> Result<crate::RunOutput, LibdenoError> {
     crate::check_async_context()?;
     reject_unusable_cwd(runtime, options)?;
-    let entry = entry.as_ref().to_path_buf();
+    let entry = entry.clone();
     crate::run_with_output_async_guarded(options, timing.clone(), async move {
         let shared = shared_for_run(runtime, timing.clone()).await?;
         crate::run_inner_with(shared, runtime.cwd.clone(), &entry, options, timing).await
@@ -185,7 +224,53 @@ pub fn run_with(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<i32, LibdenoError> {
-    // run_with never captures (it returns only the exit code) — reject the
+    run_with_exit_code(runtime, &EntrySource::from_path(entry.as_ref()), options)
+}
+
+/// Runs an **in-memory** JS/TS source (see [`crate::run_source`]) through a
+/// prebuilt [`LibdenoRuntime`]'s resolver stack and returns its exit code.
+///
+/// Semantics match [`run_with`] — including the tokio re-entry escape,
+/// the capture-flag rejection and the mismatched-`cwd` rejection. The virtual
+/// entry is registered in that run's per-run `RuntimeServices::memory_files`
+/// map. `base_dir` determines the virtual entry's location, so relative
+/// imports resolve against it; the shared resolver stack's config/discovery
+/// base remains the runtime's directory (pass that directory — or a path inside
+/// it — as `base_dir`). The subprocess/`Executor` backends do not support
+/// in-memory sources.
+pub fn run_with_source(
+    runtime: &LibdenoRuntime,
+    code: impl AsRef<[u8]>,
+    lang: crate::SourceLang,
+    base_dir: impl AsRef<Path>,
+    options: &LibdenoOptions,
+) -> Result<i32, LibdenoError> {
+    let entry = crate::entry_source_memory(code, lang, base_dir)?;
+    run_with_exit_code(runtime, &entry, options)
+}
+
+/// Captured-output variant of [`run_with_source`]; capture semantics match
+/// [`run_with_output`] (exclusive process-global lease, byte cap, Windows
+/// rejection).
+pub fn run_with_output_source(
+    runtime: &LibdenoRuntime,
+    code: impl AsRef<[u8]>,
+    lang: crate::SourceLang,
+    base_dir: impl AsRef<Path>,
+    options: &LibdenoOptions,
+) -> Result<crate::RunOutput, LibdenoError> {
+    let entry = crate::entry_source_memory(code, lang, base_dir)?;
+    run_with_output_observed(runtime, &entry, options, ExecutionTiming::disabled())
+}
+
+// Exit-code-only path: rejects capture flags (same error message as before),
+// exactly the original run_with body.
+fn run_with_exit_code(
+    runtime: &LibdenoRuntime,
+    entry: &EntrySource,
+    options: &LibdenoOptions,
+) -> Result<i32, LibdenoError> {
+    // The reusable-stack run returns only the exit code — reject the capture
     // flags instead of silently ignoring them (matching the Windows-capture
     // rejection pattern; a silent no-op here would also reject concurrent
     // runs for no benefit under the capture-exclusivity protocol).
@@ -202,13 +287,12 @@ pub fn run_with(
     // instead of silently resolving against a different directory.
     reject_unusable_cwd(runtime, options)?;
     // Take the capture-exclusivity lease before the run starts (see
-    // RunLease); ordinary runs are otherwise fully parallel. run_with never
-    // captures (rejected above), so the lease is taken as a plain parallel
-    // run.
+    // RunLease); ordinary runs are otherwise fully parallel. The exit-code
+    // path never captures, so the lease is taken as a plain parallel run.
     let _lease = RunLease::acquire(false)?;
     // Capture the entry-time child-IPC marker (fork children inherit it).
     crate::limits::capture_spawned_ipc_marker();
-    let entry = entry.as_ref().to_path_buf();
+    let entry = entry.clone();
     let options = options.clone();
     let runtime = runtime.clone();
     // Same tokio re-entry handling as run(): building a runtime inside a
@@ -267,12 +351,17 @@ pub fn run_with_output(
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<crate::RunOutput, LibdenoError> {
-    run_with_output_observed(runtime, entry, options, ExecutionTiming::disabled())
+    run_with_output_observed(
+        runtime,
+        &EntrySource::from_path(entry.as_ref()),
+        options,
+        ExecutionTiming::disabled(),
+    )
 }
 
 pub(crate) fn run_with_output_observed(
     runtime: &LibdenoRuntime,
-    entry: impl AsRef<Path>,
+    entry: &EntrySource,
     options: &LibdenoOptions,
     timing: ExecutionTiming,
 ) -> Result<crate::RunOutput, LibdenoError> {
@@ -281,7 +370,7 @@ pub(crate) fn run_with_output_observed(
 
 pub(crate) fn run_with_output_observed_cancellable(
     runtime: &LibdenoRuntime,
-    entry: impl AsRef<Path>,
+    entry: &EntrySource,
     options: &LibdenoOptions,
     timing: ExecutionTiming,
     cancellation: Option<crate::limits::CancellationContext>,
@@ -292,7 +381,7 @@ pub(crate) fn run_with_output_observed_cancellable(
         RunLease::acquire(options.capture_stdout || options.capture_stderr)?
     };
     crate::limits::capture_spawned_ipc_marker();
-    let entry = entry.as_ref().to_path_buf();
+    let entry = entry.clone();
     let options = options.clone();
     let runtime = runtime.clone();
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -312,7 +401,7 @@ pub(crate) fn run_with_output_observed_cancellable(
 /// mirror `crate::run_sync_output`.
 fn run_with_sync_output_cancellable(
     runtime: &LibdenoRuntime,
-    entry: &Path,
+    entry: &EntrySource,
     options: &LibdenoOptions,
     timing: ExecutionTiming,
     cancellation: Option<crate::limits::CancellationContext>,
@@ -355,7 +444,7 @@ fn run_with_sync_output_cancellable(
 /// runtime; [`run_with`] routes such callers onto a fresh thread first.
 fn run_with_sync(
     runtime: &LibdenoRuntime,
-    entry: &Path,
+    entry: &EntrySource,
     options: &LibdenoOptions,
     timing: ExecutionTiming,
 ) -> Result<i32, LibdenoError> {
@@ -364,7 +453,7 @@ fn run_with_sync(
 
 fn run_with_sync_cancellable(
     runtime: &LibdenoRuntime,
-    entry: &Path,
+    entry: &EntrySource,
     options: &LibdenoOptions,
     timing: ExecutionTiming,
     cancellation: Option<crate::limits::CancellationContext>,

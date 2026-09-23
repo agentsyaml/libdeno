@@ -1,6 +1,11 @@
 //! End-to-end npm snapshot-cache test (P1-1 fix): a local mock npm registry
 //! proves that a second run in the same process skips the network entirely —
 //! the registry is taken down between runs and the second run still succeeds.
+//!
+//! This file depends on the npm installation chain (the deno_npm_installer /
+//! deno_npm_cache host machinery) and compiles to nothing in a
+//! `--no-default-features` (no `npm` feature) build.
+#![cfg(feature = "npm")]
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
