@@ -141,15 +141,16 @@ impl deno_graph::source::NpmResolver for GraphResolver {
     }
 
     async fn resolve_pkg_reqs(&self, package_reqs: &[PackageReq]) -> NpmResolvePkgReqsResult {
-        // In BYONM mode the installer is absent and npm: specifiers are
-        // rejected; in managed mode this installs/resolves the packages.
+        // With the `npm` feature this always delegates: `npm_resolver` is
+        // `Some` in both managed and BYONM mode (BYONM is served by the same
+        // `NpmDenoGraphResolver`).
         #[cfg(feature = "npm")]
         if let Some(npm_resolver) = &self.npm_resolver {
             return npm_resolver.resolve_pkg_reqs(package_reqs).await;
         }
         let _ = package_reqs;
-        // npm support disabled in this build (or BYONM): fail fast with a
-        // clear error instead of panicking.
+        // npm support disabled in this build: fail fast with a clear error
+        // instead of panicking.
         NpmResolvePkgReqsResult {
             results: package_reqs
                 .iter()
@@ -160,15 +161,23 @@ impl deno_graph::source::NpmResolver for GraphResolver {
                     // on the graph but never read by this crate, so putting
                     // the message there would never reach the user.
                     Err(deno_graph::NpmLoadError::PackageReqResolution(Arc::new(
-                        deno_error::JsErrorBox::generic(
+                        JsErrorBox::generic(
                             "npm support is disabled in this build (enable the `npm` feature)",
                         ),
                     )))
                 })
                 .collect(),
-            dep_graph_result: Err(Arc::new(deno_error::JsErrorBox::generic(
-                "npm support is disabled in this build (enable the `npm` feature)",
-            ))),
+            // deno_graph calls this on every build even with no npm: imports;
+            // an empty request list means the script is npm-free, so there is
+            // nothing to fail and poisoning the graph's public
+            // `npm_dep_graph_result` would be wrong.
+            dep_graph_result: if package_reqs.is_empty() {
+                Ok(())
+            } else {
+                Err(Arc::new(JsErrorBox::generic(
+                    "npm support is disabled in this build (enable the `npm` feature)",
+                )))
+            },
         }
     }
 }

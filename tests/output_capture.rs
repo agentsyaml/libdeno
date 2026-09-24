@@ -17,7 +17,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use libdeno::{run, run_with_output, LibdenoOptions};
+use libdeno::{run, run_source_with_output, run_with_output, LibdenoOptions, SourceLang};
 
 /// Capture is process-global (fd redirection) and exclusive: a captured run
 /// rejects any concurrent run. `cargo test` runs tests in parallel, so every
@@ -206,6 +206,32 @@ fn capture_within_budget_is_not_truncated() {
         String::from_utf8_lossy(&out.stdout)
     );
     assert!(!out.capture_truncated, "small output must not truncate");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capture_in_memory_source_gets_console_log() {
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // The in-memory entry path must honor capture the same way file entries
+    // do: run_source_with_output pipes stdout through the same fd redirection.
+    let dir = temp_dir("src-out");
+    let out = run_source_with_output(
+        "console.log('captured from memory');",
+        SourceLang::JavaScript,
+        &dir,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            capture_stdout: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("captured from memory\n"),
+        "captured stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

@@ -172,7 +172,6 @@ impl LibdenoRuntime {
         base_dir: impl AsRef<Path>,
         options: &LibdenoOptions,
     ) -> Result<crate::RunOutput, LibdenoError> {
-        reject_unusable_cwd(self, options)?;
         let entry = crate::entry_source_memory(code, lang, base_dir)?;
         run_with_output_async_observed(self, &entry, options, ExecutionTiming::disabled()).await
     }

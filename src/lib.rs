@@ -1068,9 +1068,11 @@ pub(crate) async fn run_inner_with_cancellation(
     };
     cancellation_checkpoint(cancellation.as_ref())?;
     // The file fetcher permission-checks the same virtual path via
-    // validate_fetch, so this early check passes for in-memory entries exactly
-    // when the loader would allow the read — it just turns the failure into a
-    // typed "main module" error instead of a later loader error.
+    // validate_fetch, so for in-memory entries this early check should agree
+    // with what the loader would allow; it turns any denial into a typed
+    // "main module" error instead of a later loader error. The two checks use
+    // different api names ("main module" here, "import" in the loader), so a
+    // custom permission hook/broker can observe different names.
     check_entry_read_permission(&permissions, &main_module)?;
 
     // has_node_modules_dir must come AFTER RuntimeServices::new: that runs

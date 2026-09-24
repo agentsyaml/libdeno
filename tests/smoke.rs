@@ -1754,6 +1754,62 @@ fn in_memory_source_imports_sibling_from_disk() {
 }
 
 #[test]
+fn in_memory_source_uses_base_dir_import_map() {
+    // Resolver/config discovery starts at base_dir: a deno.json import map
+    // inside base_dir must be picked up, so the bare "mapped" specifier
+    // resolves to the on-disk sibling.
+    let dir = temp_dir("in-memory-import-map");
+    fs::write(
+        dir.join("deno.json"),
+        r#"{"imports":{"mapped":"./sibling.js"}}"#,
+    )
+    .unwrap();
+    fs::write(dir.join("sibling.js"), "export const v = 41 + 1;").unwrap();
+    let code = run_source(
+        "import { v } from 'mapped';\nif (v !== 42) Deno.exit(3);",
+        SourceLang::JavaScript,
+        &dir,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn in_memory_source_reports_virtual_module_url() {
+    // The entry is registered under a virtual __libdeno_virtual_* specifier:
+    // import.meta.url / Deno.mainModule must show that URL (this test writes
+    // to disk instead of using output capture so it does not contend on the
+    // process-global capture lease).
+    let dir = temp_dir("in-memory-url");
+    let result_file = dir.join("module-url.txt");
+    let result_abs = result_file.display().to_string();
+    let code = run_source(
+        format!(
+            "Deno.writeTextFileSync({result_abs:?}, import.meta.url + '\\n' + Deno.mainModule);"
+        ),
+        SourceLang::JavaScript,
+        &dir,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let reported = fs::read_to_string(&result_file).unwrap();
+    assert!(
+        reported.contains("__libdeno_virtual_"),
+        "expected the virtual specifier in {reported:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn in_memory_source_respects_scoped_read_permission() {
     // Without allow-all: grant read on the directory only (same mechanism as
     // the other scoped-permission smoke tests). This covers the known risk

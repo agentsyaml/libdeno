@@ -62,5 +62,8 @@ jobs:
       - name: Check npm-disabled feature set
         run: cargo check --all-targets --no-default-features --features snapshot --locked
 
+      - name: Check npm-disabled + execution-control feature set
+        run: cargo check --all-targets --no-default-features --features snapshot,execution-control,phase-diagnostics --locked
+
       - name: Test npm-disabled feature set
-        run: cargo test --no-default-features --features snapshot --test smoke --test runtime --test async_api --locked
+        run: cargo test --no-default-features --features snapshot --lib --test smoke --test runtime --test async_api --locked
