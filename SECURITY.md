@@ -90,6 +90,7 @@ flows into the tree.
 | RUSTSEC-2026-0118 | hickory-proto 0.25.x | NSEC3 denial-of-service, `patched = []` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0118) / [GHSA-3v94-mw7p-v465](https://github.com/hickory-dns/hickory-dns/security/advisories/GHSA-3v94-mw7p-v465) |
 | RUSTSEC-2026-0119 | hickory-proto 0.25.x | Denial-of-service, fixed `>= 0.26.1` (deno main not moved off 0.25) | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0119) / [GHSA-q2qq-hmj6-3wpp](https://github.com/hickory-dns/hickory-dns/security/advisories/GHSA-q2qq-hmj6-3wpp) |
 | RUSTSEC-2023-0071 | rsa 0.9.x | CVE-2023-49092 (Marvin timing attack), `patched = []` — no stable fixed release | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2023-0071) / [RustCrypto/RSA#626](https://github.com/RustCrypto/RSA/issues/626) |
+| RUSTSEC-2026-0285 | rustls 0.23.40 | TLS 1.3 handshake messages incorrectly accepted across encryption-level boundaries, fixed `>= 0.23.45` — `deno_tls` 0.244.0 exact-pins `rustls = "=0.23.40"` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0285) |
 
 Informational (no vulnerability): bincode 1.x (RUSTSEC-2025-0141),
 rustls-pemfile (RUSTSEC-2025-0134), smartstring (RUSTSEC-2026-0249), paste
