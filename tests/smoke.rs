@@ -1919,6 +1919,169 @@ fn run_source_with_file_as_base_dir_is_rejected() {
     let _ = fs::remove_dir_all(&parent);
 }
 
+#[test]
+fn in_memory_relative_base_dir_resolves_against_options_cwd() {
+    // A relative base_dir must resolve against the same effective cwd a
+    // relative *entry path* does (options.cwd, else the process cwd) — not
+    // unconditionally against the process cwd.
+    let cwd = temp_dir("in-memory-relative-cwd");
+    let dir = cwd.join("app");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("sibling.js"), "export const v = 42;").unwrap();
+    let code = run_source(
+        "import { v } from './sibling.js';\nif (v !== 42) Deno.exit(3);",
+        SourceLang::JavaScript,
+        "app",
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            cwd: Some(cwd.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&cwd);
+}
+
+#[test]
+fn reusable_runtime_relative_base_dir_resolves_against_runtime_dir() {
+    // The reusable stack resolves a relative base_dir against the runtime's own
+    // directory — the same base a relative entry path uses there — not the
+    // process cwd. The process cwd is the crate root here, so "app" would not
+    // exist if this regressed to process-cwd resolution.
+    let base = temp_dir("in-memory-relative-runtime-cwd");
+    let runtime_dir = base.join("runtime");
+    let app = runtime_dir.join("app");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(app.join("sibling.js"), "export const v = 42;").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(libdeno::LibdenoRuntime::new(&runtime_dir))
+        .unwrap();
+    let code = libdeno::runtime::run_with_source(
+        &runtime,
+        "import { v } from './sibling.js';\nif (v !== 42) Deno.exit(3);",
+        SourceLang::JavaScript,
+        "app",
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn run_with_source_rejects_capture_flags_before_resolving_base_dir() {
+    // F1: the capture-flag rejection must win over a bad base_dir, so the
+    // documented `run_with does not support output capture` error is what a
+    // caller with both mistakes actually sees.
+    let dir = temp_dir("source-capture-flag-order");
+    let missing = dir.join("does-not-exist");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(libdeno::LibdenoRuntime::new(&dir))
+        .unwrap();
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        capture_stdout: true,
+        ..Default::default()
+    };
+    let err = libdeno::runtime::run_with_source(
+        &runtime,
+        "console.log('x');",
+        SourceLang::JavaScript,
+        &missing,
+        &options,
+    )
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("run_with does not support output capture"),
+        "capture rejection must precede base_dir resolution, got: {message}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_source_with_output_async_rejects_missing_base_dir_outside_tokio() {
+    // F1 counterpart: the async-context check must win over a bad base_dir, so
+    // a non-tokio caller sees the runtime-context error, not the path one.
+    let dir = temp_dir("source-async-ctx-order");
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let err = futures_util::future::FutureExt::now_or_never(libdeno::run_source_with_output_async(
+        "console.log('x');",
+        SourceLang::JavaScript,
+        dir.join("does-not-exist"),
+        &options,
+    ))
+    .expect("must resolve immediately, without needing a tokio runtime")
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("tokio runtime"),
+        "async-context rejection must precede base_dir resolution, got: {message}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn in_memory_virtual_entry_name_is_unique_per_run() {
+    // The virtual entry name keeps the `__libdeno_virtual_` prefix plus a
+    // random suffix, so two runs never share a URL. This checks the name
+    // format and that two consecutive runs differ; whether an on-disk file can
+    // shadow the entry is not testable here (a 64-bit random suffix is
+    // unguessable by construction).
+    let dir = temp_dir("in-memory-virtual-name");
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let mut names = Vec::new();
+    for index in 0..2 {
+        let result_file = dir.join(format!("url-{index}.txt"));
+        let abs = result_file.display().to_string();
+        let code = run_source(
+            format!("Deno.writeTextFileSync({abs:?}, import.meta.url);"),
+            SourceLang::JavaScript,
+            &dir,
+            &options,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        names.push(fs::read_to_string(&result_file).unwrap());
+    }
+    assert_ne!(
+        names[0], names[1],
+        "virtual entry names must differ per run"
+    );
+    for name in &names {
+        let name = name.trim();
+        let suffix = name
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .strip_prefix("__libdeno_virtual_")
+            .unwrap_or_else(|| panic!("unexpected virtual entry name: {name}"));
+        let (random, ext) = suffix.rsplit_once('.').unwrap();
+        assert_eq!(ext, "js", "unexpected virtual entry name: {name}");
+        assert!(
+            random.len() == 16 && random.chars().all(|c| c.is_ascii_hexdigit()),
+            "expected 16 hex digits of entropy in {name}"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[cfg(not(feature = "npm"))]
 #[test]
 fn npm_specifier_fails_cleanly_when_feature_disabled() {
@@ -1927,6 +2090,40 @@ fn npm_specifier_fails_cleanly_when_feature_disabled() {
     let dir = temp_dir("npm-disabled");
     let err = run_source(
         "import 'npm:some-pkg';",
+        SourceLang::JavaScript,
+        &dir,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("npm support is disabled in this build"),
+        "unexpected npm-disabled error: {message}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(feature = "npm"))]
+#[test]
+fn managed_project_bare_import_reports_npm_disabled() {
+    // The managed case must be as clear as the bare `npm:` one above: a
+    // package.json with dependencies and no node_modules is the default
+    // `nodeModulesDir: auto` mode, so the resolver rewrites the bare
+    // specifier to an npm: URL and resolve_pkg_reqs rejects it there — even
+    // though initialize_npm_resolution_if_managed never ran (npm is off).
+    // Verified: the error is Npm(PackageReqResolution(...)), unchanged by
+    // anything in the resolver's bare-specifier path.
+    let dir = temp_dir("npm-disabled-managed");
+    fs::write(
+        dir.join("package.json"),
+        r#"{"name":"app","dependencies":{"chalk":"5"}}"#,
+    )
+    .unwrap();
+    let err = run_source(
+        "import chalk from 'chalk';\nconsole.log(chalk);",
         SourceLang::JavaScript,
         &dir,
         &LibdenoOptions {
