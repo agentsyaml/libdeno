@@ -144,12 +144,13 @@ impl LibdenoRuntime {
     /// caller's tokio runtime using this runtime's shared resolver stack, and
     /// returns its exit code. The virtual entry is registered in the run's
     /// per-run `RuntimeServices::memory_files` map. `base_dir` determines the
-    /// virtual entry's location, so relative imports resolve against it; the
-    /// shared resolver stack's config/discovery base remains the runtime's
-    /// directory. Note that `LibdenoOptions.cwd`
-    /// restrictions apply as in [`Self::run_async`] — a mismatched `cwd` is
-    /// rejected against the runtime's directory. The subprocess/`Executor`
-    /// backends do not support in-memory sources.
+    /// virtual entry's location, so relative imports resolve against it; a
+    /// relative `base_dir` resolves against the runtime's directory (the same
+    /// base a relative entry path resolves against here). The shared resolver
+    /// stack's config/discovery base remains the runtime's directory. Note that
+    /// `LibdenoOptions.cwd` restrictions apply as in [`Self::run_async`] — a
+    /// mismatched `cwd` is rejected against the runtime's directory. The
+    /// subprocess/`Executor` backends do not support in-memory sources.
     pub async fn run_with_source_async(
         &self,
         code: impl AsRef<[u8]>,
@@ -172,7 +173,8 @@ impl LibdenoRuntime {
         base_dir: impl AsRef<Path>,
         options: &LibdenoOptions,
     ) -> Result<crate::RunOutput, LibdenoError> {
-        let entry = crate::entry_source_memory(code, lang, base_dir)?;
+        check_source_preconditions_async(self, options)?;
+        let entry = crate::entry_source_memory(code, lang, base_dir, &self.cwd)?;
         run_with_output_async_observed(self, &entry, options, ExecutionTiming::disabled()).await
     }
 }
@@ -233,10 +235,12 @@ pub fn run_with(
 /// the capture-flag rejection and the mismatched-`cwd` rejection. The virtual
 /// entry is registered in that run's per-run `RuntimeServices::memory_files`
 /// map. `base_dir` determines the virtual entry's location, so relative
-/// imports resolve against it; the shared resolver stack's config/discovery
-/// base remains the runtime's directory (pass that directory — or a path inside
-/// it — as `base_dir`). The subprocess/`Executor` backends do not support
-/// in-memory sources.
+/// imports resolve against it; a relative `base_dir` resolves against the
+/// runtime's directory (the same base a relative entry path resolves against
+/// here). The shared resolver stack's config/discovery base remains the
+/// runtime's directory (pass that directory — or a path inside it — as
+/// `base_dir`). The subprocess/`Executor` backends do not support in-memory
+/// sources.
 pub fn run_with_source(
     runtime: &LibdenoRuntime,
     code: impl AsRef<[u8]>,
@@ -244,7 +248,8 @@ pub fn run_with_source(
     base_dir: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<i32, LibdenoError> {
-    let entry = crate::entry_source_memory(code, lang, base_dir)?;
+    check_source_preconditions(runtime, options, false)?;
+    let entry = crate::entry_source_memory(code, lang, base_dir, &runtime.cwd)?;
     run_with_exit_code(runtime, &entry, options)
 }
 
@@ -258,7 +263,8 @@ pub fn run_with_output_source(
     base_dir: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<crate::RunOutput, LibdenoError> {
-    let entry = crate::entry_source_memory(code, lang, base_dir)?;
+    check_source_preconditions(runtime, options, true)?;
+    let entry = crate::entry_source_memory(code, lang, base_dir, &runtime.cwd)?;
     run_with_output_observed(runtime, &entry, options, ExecutionTiming::disabled())
 }
 
@@ -269,18 +275,7 @@ fn run_with_exit_code(
     entry: &EntrySource,
     options: &LibdenoOptions,
 ) -> Result<i32, LibdenoError> {
-    // The reusable-stack run returns only the exit code — reject the capture
-    // flags instead of silently ignoring them (matching the Windows-capture
-    // rejection pattern; a silent no-op here would also reject concurrent
-    // runs for no benefit under the capture-exclusivity protocol).
-    if options.capture_stdout || options.capture_stderr {
-        return Err(LibdenoError::Configuration(
-            "run_with does not support output capture (it returns only the \
-             exit code); use run_with_output for capture on the reusable \
-             stack"
-                .to_string(),
-        ));
-    }
+    reject_capture_flags(options)?;
     // options.cwd is a resolution base that the reusable stack ignores (it
     // is scoped to the runtime's directory) — reject a mismatched base
     // instead of silently resolving against a different directory.
@@ -307,6 +302,50 @@ fn run_with_exit_code(
     } else {
         run_with_sync(&runtime, &entry, &options, timing)
     }
+}
+
+/// The reusable-stack run returns only the exit code — reject the capture
+/// flags instead of silently ignoring them (matching the Windows-capture
+/// rejection pattern; a silent no-op here would also reject concurrent runs
+/// for no benefit under the capture-exclusivity protocol).
+fn reject_capture_flags(options: &LibdenoOptions) -> Result<(), LibdenoError> {
+    if options.capture_stdout || options.capture_stderr {
+        return Err(LibdenoError::Configuration(
+            "run_with does not support output capture (it returns only the \
+             exit code); use run_with_output for capture on the reusable \
+             stack"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Preconditions for the sync in-memory source entry points
+/// ([`run_with_source`] / [`run_with_output_source`]), checked *before* the
+/// memory entry is built so a bad `base_dir` cannot mask them. Both guards are
+/// re-applied by the run path (`run_with_exit_code` /
+/// `run_with_output_observed_cancellable`); repeating them here is idempotent
+/// and cheap — a bool test plus, only when `options.cwd` is set, one
+/// canonicalize comparison.
+fn check_source_preconditions(
+    runtime: &LibdenoRuntime,
+    options: &LibdenoOptions,
+    capture_flags_allowed: bool,
+) -> Result<(), LibdenoError> {
+    if !capture_flags_allowed {
+        reject_capture_flags(options)?;
+    }
+    reject_unusable_cwd(runtime, options)
+}
+
+/// Async twin of [`check_source_preconditions`]: the tokio-context check plus
+/// the same cwd check, before the memory entry is built.
+fn check_source_preconditions_async(
+    runtime: &LibdenoRuntime,
+    options: &LibdenoOptions,
+) -> Result<(), LibdenoError> {
+    crate::check_async_context()?;
+    reject_unusable_cwd(runtime, options)
 }
 
 /// Rejects options the reusable stack cannot honor: `LibdenoOptions.cwd` is

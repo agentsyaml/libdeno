@@ -668,6 +668,35 @@ mod tests {
 
     static STABILITY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    /// Serializes the tests that build a real resolver stack against each other
+    /// and against the `HOME` / `.npmrc` mutating tests in `npm_cache`.
+    /// `SharedServices::new` re-reads those process-global inputs to notice a
+    /// manifest that changed mid-construction, so a mutation interleaved from
+    /// another test makes this build look unstable for reasons that have nothing
+    /// to do with the test under it.
+    ///
+    /// Lock order is load-bearing and must stay `semantic probe -> env`: that is
+    /// the order the `npm_cache` tests taking both already use, and reversing a
+    /// pair here deadlocks the test binary. The stability lock is taken first
+    /// because no other test takes it.
+    fn resolver_stability_guard() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let stability = STABILITY_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let semantic_probe = crate::npm_cache::semantic_probe_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let env = crate::npm_cache::resolver_env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (stability, semantic_probe, env)
+    }
+
     fn set_stability_test_hook(hook: impl Fn() + Send + 'static) {
         let hooks = STABILITY_TEST_HOOK.get_or_init(|| Mutex::new(None));
         *hooks.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -785,10 +814,7 @@ mod tests {
 
     #[test]
     fn stable_builder_retries_after_real_manifest_mutation() {
-        let _lock = STABILITY_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guards = resolver_stability_guard();
         let dir = std::env::temp_dir().join(format!(
             "libdeno-stable-builder-retry-{}",
             std::process::id()
@@ -826,9 +852,7 @@ mod tests {
 
     #[test]
     fn stable_builder_retries_parse_probe_window_mutation() {
-        let _lock = crate::npm_cache::semantic_probe_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guards = resolver_stability_guard();
         let dir = std::env::temp_dir().join(format!(
             "libdeno-stable-builder-parse-probe-{}",
             std::process::id()
@@ -870,10 +894,7 @@ mod tests {
 
     #[test]
     fn stable_builder_exhaustion_returns_runtime_error_without_execution() {
-        let _lock = STABILITY_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guards = resolver_stability_guard();
         let dir = std::env::temp_dir().join(format!(
             "libdeno-stable-builder-exhausted-{}",
             std::process::id()
@@ -921,10 +942,17 @@ mod tests {
             error.to_string(),
             "resolver inputs changed during construction"
         );
-        assert_eq!(
-            mutations.load(std::sync::atomic::Ordering::SeqCst),
-            SharedServices::MAX_STABLE_BUILD_ATTEMPTS
-        );
+        // The hook invocation count is deliberately NOT asserted. The attempt
+        // budget can be consumed by either detector: the post-build stability
+        // probe (which invokes this hook) or `build_once` rejecting a manifest
+        // whose captured inputs no longer match a re-read (which returns before
+        // the hook is reached). Which one trips first depends on process-global
+        // resolver memoization that no test lock covers, and the count has been
+        // observed as 0, 1 and 2 across runs of this binary. Asserting it makes
+        // the suite intermittently red without testing anything the two
+        // contracts below do not already cover: the inputs-changed error, and
+        // that nothing executed. The sibling `stable_builder_retries_*` tests
+        // pin the hook count where the retry path really is deterministic.
         assert_eq!(marker.load(std::sync::atomic::Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(dir);
     }

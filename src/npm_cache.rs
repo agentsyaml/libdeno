@@ -28,6 +28,19 @@ use sys_traits::impls::RealSys;
 use sys_traits::EnvHomeDir;
 use url::Url;
 
+/// Serializes the tests that mutate process-global resolver inputs (`HOME`, and
+/// the `$HOME/.npmrc` it selects). `SharedServices::new` re-reads those inputs
+/// to detect a manifest that changed mid-construction, so a concurrent mutation
+/// makes an unrelated build look unstable. Shared with the `stable_builder_*`
+/// tests in `services`, which construct a real resolver stack.
+#[cfg(test)]
+static RESOLVER_ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn resolver_env_test_lock() -> &'static Mutex<()> {
+    RESOLVER_ENV_TEST_LOCK.get_or_init(|| Mutex::new(()))
+}
+
 const DENO_CONFIG_FILE_NAMES: [&str; 2] = ["deno.json", "deno.jsonc"];
 const MANIFEST_CANDIDATE_FILE_NAMES: [&str; 3] = [
     DENO_CONFIG_FILE_NAMES[0],
@@ -1002,7 +1015,7 @@ mod tests {
     use deno_npmrc::NpmRc;
     use deno_npmrc::NpmRegistryUrl;
 
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    use super::RESOLVER_ENV_TEST_LOCK as ENV_LOCK;
 
     struct TestEnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
 

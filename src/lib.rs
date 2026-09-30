@@ -191,10 +191,15 @@ pub(crate) enum EntrySource {
         ext: &'static str,
         /// Absolute, canonicalized directory the virtual entry lives in;
         /// relative imports resolve against it. `entry_source_memory` fails if
-        /// `base_dir` cannot be canonicalized. Canonicalized so the
-        /// permission system's `check_open` canonicalization of the virtual
-        /// path maps back to the exact inserted URL.
+        /// the (already cwd-resolved) `base_dir` cannot be canonicalized.
+        /// Canonicalized so the permission system's `check_open`
+        /// canonicalization of the virtual path maps back to the exact
+        /// inserted URL.
         base_dir: PathBuf,
+        /// The effective resolution base `base_dir` was resolved against (see
+        /// [`effective_cwd`]). Carried in the entry so the run reuses this
+        /// exact value instead of reading the process cwd a second time.
+        cwd: PathBuf,
     },
 }
 
@@ -204,24 +209,48 @@ impl EntrySource {
     }
 }
 
-/// Unique suffix counter for virtual in-memory entry specifiers: two
-/// concurrent runs must never share a URL (the source would be swapped).
-static VIRTUAL_ENTRY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The run's effective resolution base: `options.cwd` when set, otherwise the
+/// process cwd, canonicalized (falling back to the raw path). Shared by the
+/// path entry points, the permission grants and a relative in-memory
+/// `base_dir`, so all three agree on the base. When `options.cwd` is unset the
+/// process cwd is read per use: an in-memory run reads it exactly once (the
+/// entry carries the result, see [`entry_cwd`]), while a path run reads it once
+/// per run — set `options.cwd` to pin the base explicitly if the host changes
+/// the process cwd concurrently.
+pub(crate) fn effective_cwd(options: &LibdenoOptions) -> Result<PathBuf, LibdenoError> {
+    let raw = options.cwd.clone().unwrap_or(std::env::current_dir()?);
+    Ok(std::fs::canonicalize(&raw).unwrap_or(raw))
+}
 
-/// Builds the in-memory entry for the `run_source*` family: canonicalizes
-/// `base_dir` (so permission-check canonicalization maps back to the inserted
-/// URL) and captures the source bytes. `base_dir` must be an existing
-/// directory — a relative path resolves against the process cwd first.
+/// The run's resolution base: an in-memory entry's own (already computed and
+/// validated) base, otherwise [`effective_cwd`]. Path entries have no earlier
+/// read to reuse, so they resolve here — once.
+pub(crate) fn entry_cwd(
+    entry: &EntrySource,
+    options: &LibdenoOptions,
+) -> Result<PathBuf, LibdenoError> {
+    match entry {
+        EntrySource::Memory { cwd, .. } => Ok(cwd.clone()),
+        EntrySource::Path(_) => effective_cwd(options),
+    }
+}
+
+/// Builds the in-memory entry for the `run_source*` family: resolves
+/// `base_dir` against `cwd` (the caller's effective resolution base — see
+/// [`effective_cwd`]), canonicalizes the result (so permission-check
+/// canonicalization maps back to the inserted URL) and captures the source
+/// bytes. `base_dir` must be an existing directory.
 pub(crate) fn entry_source_memory(
     code: impl AsRef<[u8]>,
     lang: SourceLang,
     base_dir: impl AsRef<Path>,
+    cwd: &Path,
 ) -> Result<EntrySource, LibdenoError> {
     let raw = base_dir.as_ref();
     let base = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
-        std::env::current_dir()?.join(raw)
+        cwd.join(raw)
     };
     let base = std::fs::canonicalize(&base).map_err(|e| {
         LibdenoError::Configuration(format!(
@@ -239,6 +268,7 @@ pub(crate) fn entry_source_memory(
         code: Arc::from(code.as_ref()),
         ext: lang.ext(),
         base_dir: base,
+        cwd: cwd.to_path_buf(),
     })
 }
 
@@ -484,7 +514,7 @@ pub fn run(entry: impl AsRef<Path>, options: &LibdenoOptions) -> Result<i32, Lib
 /// `Vec<u8>` — anything `AsRef<[u8]>`) to completion and returns the exit code.
 ///
 /// The source is registered under a unique virtual `file:` URL inside
-/// `base_dir` (e.g. `<base_dir>/__libdeno_virtual_3.ts` for
+/// `base_dir` (e.g. `<base_dir>/__libdeno_virtual_<random-hex>.ts` for
 /// [`SourceLang::TypeScript`]) and then flows through the *entire* normal
 /// pipeline — graph build, TypeScript transpile, CJS, JSON, npm/remote
 /// imports — exactly like a file on disk. That means:
@@ -502,10 +532,11 @@ pub fn run(entry: impl AsRef<Path>, options: &LibdenoOptions) -> Result<i32, Lib
 ///   sibling imports.
 /// - Resolver/config discovery starts at `base_dir` (deno.json /
 ///   package.json / node_modules), matching how a real file inside
-///   `base_dir` would behave. A relative `base_dir` resolves against the
-///   process cwd, then is canonicalized. `base_dir` must be an existing
-///   directory; a non-existent path is rejected with
-///   [`LibdenoError::Configuration`].
+///   `base_dir` would behave. A relative `base_dir` resolves against the same
+///   effective cwd a relative *entry path* does — `options.cwd` when set,
+///   otherwise the process cwd (canonicalized) — then is canonicalized.
+///   `base_dir` must be an existing directory; a non-existent path is rejected
+///   with [`LibdenoError::Configuration`].
 ///
 /// The subprocess/`Executor` backends do not support in-memory sources (their
 /// request payload is a filesystem path); use the in-process APIs instead.
@@ -535,7 +566,7 @@ pub fn run_source_with_output(
     base_dir: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<RunOutput, LibdenoError> {
-    let entry = entry_source_memory(code, lang, base_dir)?;
+    let entry = entry_source_memory(code, lang, base_dir, &effective_cwd(options)?)?;
     run_with_output_observed(&entry, options, ExecutionTiming::disabled())
 }
 
@@ -563,8 +594,8 @@ pub async fn run_source_with_output_async(
     base_dir: impl AsRef<Path>,
     options: &LibdenoOptions,
 ) -> Result<RunOutput, LibdenoError> {
-    let entry = entry_source_memory(code, lang, base_dir)?;
     check_async_context()?;
+    let entry = entry_source_memory(code, lang, base_dir, &effective_cwd(options)?)?;
     let timing = ExecutionTiming::disabled();
     run_with_output_async_guarded(options, timing.clone(), run_inner(&entry, options, timing)).await
 }
@@ -718,22 +749,8 @@ fn run_sync_cancellable(
         .build()
         .map_err(|error| LibdenoError::Runtime(deno_core::anyhow::anyhow!(error)))?;
     runtime.block_on(async {
-        let cwd_raw = options.cwd.clone().unwrap_or(std::env::current_dir()?);
-        let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
-        // For an in-memory entry there is no on-disk entry file: resolver/config
-        // discovery starts at the virtual file's directory. Path entries keep the
-        // existing behavior (the resolved entry's parent).
-        let config_start_paths = match entry {
-            EntrySource::Memory { base_dir, .. } => vec![base_dir.clone()],
-            EntrySource::Path(path) => {
-                let main_module = resolve_entry(path, &cwd).map_err(LibdenoError::Entry)?;
-                main_module
-                    .to_file_path()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| vec![d.to_path_buf()]))
-                    .unwrap_or_else(|| vec![cwd.clone()])
-            }
-        };
+        let cwd = entry_cwd(entry, options)?;
+        let config_start_paths = config_start_paths(entry, &cwd)?;
         let shared =
             SharedServices::new_with_timing(cwd.clone(), config_start_paths, Some(timing.clone()))
                 .await
@@ -968,6 +985,24 @@ fn run_sync(
     runtime.block_on(run_inner(entry, options, timing))
 }
 
+/// Where resolver/config discovery (deno.json / package.json / node_modules)
+/// starts. For an in-memory entry there is no on-disk entry file, so discovery
+/// starts at the virtual file's directory; path entries use the resolved
+/// entry's parent (falling back to `cwd` for a non-`file:` entry).
+fn config_start_paths(entry: &EntrySource, cwd: &Path) -> Result<Vec<PathBuf>, LibdenoError> {
+    Ok(match entry {
+        EntrySource::Memory { base_dir, .. } => vec![base_dir.clone()],
+        EntrySource::Path(path) => {
+            let main_module = resolve_entry(path, cwd).map_err(LibdenoError::Entry)?;
+            main_module
+                .to_file_path()
+                .ok()
+                .and_then(|p| p.parent().map(|d| vec![d.to_path_buf()]))
+                .unwrap_or_else(|| vec![cwd.to_path_buf()])
+        }
+    })
+}
+
 async fn run_inner(
     entry: &EntrySource,
     options: &LibdenoOptions,
@@ -979,22 +1014,8 @@ async fn run_inner(
     // options.cwd would otherwise split grants/entry (aliased) from the
     // canonical path. This is a resolution-base only — the process cwd is
     // never switched (see the module docs: the script observes the host cwd).
-    let cwd_raw = options.cwd.clone().unwrap_or(std::env::current_dir()?);
-    let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
-    // For an in-memory entry there is no on-disk entry file: resolver/config
-    // discovery starts at the virtual file's directory. Path entries keep the
-    // existing behavior (the resolved entry's parent).
-    let config_start_paths = match entry {
-        EntrySource::Memory { base_dir, .. } => vec![base_dir.clone()],
-        EntrySource::Path(path) => {
-            let main_module = resolve_entry(path, &cwd).map_err(LibdenoError::Entry)?;
-            main_module
-                .to_file_path()
-                .ok()
-                .and_then(|p| p.parent().map(|d| vec![d.to_path_buf()]))
-                .unwrap_or_else(|| vec![cwd.clone()])
-        }
-    };
+    let cwd = entry_cwd(entry, options)?;
+    let config_start_paths = config_start_paths(entry, &cwd)?;
     let shared = {
         let _rebuild = timing.span(Phase::ResolverRebuild);
         SharedServices::new_with_timing(cwd.clone(), config_start_paths, Some(timing.clone()))
@@ -1063,7 +1084,7 @@ pub(crate) async fn run_inner_with_cancellation(
             RuntimeServices::new(shared, permissions.clone(), timing.clone())
                 .map_err(LibdenoError::Runtime)?,
         );
-        let main_module = resolve_main_module(&services.memory_files, entry, &cwd).await?;
+        let main_module = resolve_main_module(&services.memory_files, entry, &cwd)?;
         (permissions, services, main_module)
     };
     cancellation_checkpoint(cancellation.as_ref())?;
@@ -1173,7 +1194,7 @@ fn cancellation_checkpoint(
 /// `RuntimeServices::memory_files`, so the file fetcher serves it before
 /// touching disk/http — the whole normal pipeline (graph, transpile, CJS,
 /// relative imports) then works unchanged.
-async fn resolve_main_module(
+fn resolve_main_module(
     memory_files: &Arc<MemoryFiles>,
     entry: &EntrySource,
     cwd: &Path,
@@ -1184,12 +1205,26 @@ async fn resolve_main_module(
             code,
             ext,
             base_dir,
+            ..
         } => {
             // The map is per-run (built by RuntimeServices::new just before
             // this call), so the registered virtual file lives only as long
             // as this run — no cross-run leak.
-            let n = VIRTUAL_ENTRY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let virtual_path = base_dir.join(format!("__libdeno_virtual_{n}.{ext}"));
+            // Random suffix rather than a process-global counter: two runs must
+            // never share a URL, or one would serve the other's source. The name
+            // is not a shadowing guard — the map is the run's in-memory overlay
+            // and is consulted before disk, so a same-named real file could not
+            // win either way.
+            let mut suffix = [0u8; 8];
+            getrandom::fill(&mut suffix).map_err(|e| {
+                LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                    "failed to generate a virtual in-memory entry name: {e}"
+                ))
+            })?;
+            let virtual_path = base_dir.join(format!(
+                "__libdeno_virtual_{:016x}.{ext}",
+                u64::from_ne_bytes(suffix)
+            ));
             let url = ModuleSpecifier::from_file_path(&virtual_path).map_err(|_| {
                 LibdenoError::Entry(deno_core::anyhow::anyhow!(
                     "Invalid in-memory entry path: {}",
