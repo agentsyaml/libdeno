@@ -58,7 +58,7 @@ run_source("console.log('hi')", SourceLang::JavaScript, "./my-app", &options).un
 run_source("const x: number = 1 + 2; console.log(x)", SourceLang::TypeScript, "./my-app", &options).unwrap();
 ```
 
-The source is registered under a unique virtual `file:` URL inside `base_dir` (e.g. `<base_dir>/__libdeno_virtual_3.ts`) and then flows through the entire normal pipeline — graph build, TypeScript transpile, CJS, JSON, npm/remote imports — exactly like a file on disk. Consequences:
+The source is registered under a unique virtual `file:` URL inside `base_dir` (e.g. `<base_dir>/__libdeno_virtual_9f2c1ab4d7e5f001.ts`) and then flows through the entire normal pipeline — graph build, TypeScript transpile, CJS, JSON, npm/remote imports — exactly like a file on disk. Consequences:
 
 - Relative imports resolve against `base_dir` (they load real files from disk next to the virtual entry).
 - `import.meta.url` / `Deno.mainModule` show the virtual specifier, not a caller-chosen name; the URL is unique per call.

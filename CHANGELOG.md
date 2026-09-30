@@ -31,7 +31,10 @@ breaking changes are highlighted per release with migration notes.
   Building with `--no-default-features --features snapshot` removes the npm
   installer / npm-cache host machinery and the lifecycle-script executor;
   in such a build `npm:` imports fail with a clear "npm support is disabled
-  in this build (enable the `npm` feature)" error instead of panicking.
+  in this build (enable the `npm` feature)" error instead of panicking. The
+  same clear error covers a managed project (a `package.json` dependency
+  imported by bare specifier) — the resolver rewrites it to an `npm:` URL and
+  `resolve_pkg_reqs` rejects it there.
   Honest caveat:
   `deno_resolver`/`node_resolver` depend unconditionally on `deno_npm` and
   `deno_npmrc`, so those crates cannot be removed from the build — disabling
@@ -42,6 +45,30 @@ breaking changes are highlighted per release with migration notes.
 
 ### Changed
 
+- **In-memory `base_dir` resolution**: a relative `base_dir` now resolves
+  against the same effective cwd the path-based entry points use — `options.cwd`
+  when set, otherwise the process cwd, canonicalized the same way — instead of
+  unconditionally against the process cwd, so `run_source(code, lang, "app",
+  &options)` and `run("app/index.js", &options)` always see the same directory.
+  On a reusable `LibdenoRuntime` a relative `base_dir` resolves against the
+  runtime's directory (the base a relative entry path resolves against there).
+  The resolution base is computed once per run and carried by the entry, so a
+  concurrent process-cwd change cannot split `base_dir` from the run's
+  `config_start_paths` and permission grants.
+- **Collision-resistant virtual entry name**: the in-memory entry is registered
+  as `__libdeno_virtual_<16-hex-digits>.<ext>` (random suffix from `getrandom`)
+  instead of `__libdeno_virtual_<n>.<ext>` with a process-global counter. The
+  `__libdeno_virtual_` prefix is unchanged, and the random suffix keeps the
+  per-call uniqueness guarantee. Hosts that recognize the virtual entry should
+  match the `__libdeno_virtual_` prefix, not the characters after it — the
+  suffix is now 16 hex digits, not a decimal counter.
+- **Source entry points validate preconditions before resolving `base_dir`**:
+  the async-context, mismatched-`cwd` and capture-flag checks now run before the
+  in-memory entry is built, so those errors are no longer masked by a bad
+  `base_dir`. Covers `run_source_with_output_async`,
+  `LibdenoRuntime::run_with_source_async`,
+  `LibdenoRuntime::run_with_output_source_async`, `run_with_source` and
+  `run_with_output_source`.
 - **`npm:` install support is now behind the default-on `npm` feature**
   (migration note): previously `deno_npm_installer`/`deno_npm_cache` were
   unconditional, so npm install support was always compiled in. Consumers

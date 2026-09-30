@@ -4,6 +4,42 @@ libdeno runs the official Deno module graph pipeline end to end. Everything
 the CLI's loader does — `npm:`, `jsr:`, remote modules, import maps, CJS
 packages, WASM, JSON — comes from the graph.
 
+## Optional `npm` Cargo feature
+
+The npm installer / npm-cache host machinery is behind a default-on `npm`
+feature:
+
+```toml
+[features]
+default = ["snapshot", "npm"]
+npm = ["dep:deno_npm_installer", "dep:deno_npm_cache"]
+```
+
+Building with `--no-default-features --features snapshot` removes
+`deno_npm_installer` and `deno_npm_cache` (and the npm lifecycle-script
+executor) from the dependency graph. In such a build, `npm:` imports fail with
+a clear `npm support is disabled in this build (enable the \`npm\` feature)`
+error instead of attempting an install.
+
+The same clear error covers a **managed** project with the feature off: a
+`package.json` dependency imported by bare specifier (`import chalk from
+"chalk"`) is rewritten by the resolver to `npm:chalk@5` and then rejected by
+`GraphResolver::resolve_pkg_reqs` with the message above, even though
+`initialize_npm_resolution_if_managed` never runs. A bare specifier that is *not*
+in `package.json` keeps the accurate `Import "x" not a dependency` error
+instead — with npm compiled out there is nothing it could resolve to, but
+blaming npm there would be wrong (deno does not auto-add undeclared
+dependencies with npm support enabled either).
+
+Caveats:
+
+- `deno_npm` and `deno_npmrc` are unconditional `deno_resolver` dependencies and
+  cannot be removed; `node_modules` / BYONM resolution keeps working.
+- This is a dependency / compile-surface reduction, not a binary-size win — the
+  statically linked V8 runtime dominates binary size.
+- Consumers building with `default-features = false` must add `"npm"` to keep
+  `npm:` install support.
+
 ## npm modes
 
 `node_modules_dir` is `Auto` (the CLI default):

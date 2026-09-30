@@ -65,6 +65,77 @@ or not) is rejected with `LibdenoError::Configuration`. For captured runs
 alongside parallel execution use `run_in_subprocess_with_output`, which pipes
 the child's own fds back to the parent.
 
+## `run_source`
+
+```rust
+pub enum SourceLang {
+  JavaScript, // virtual entry gets a .js extension
+  TypeScript, // virtual entry gets a .ts extension and is transpiled
+}
+
+pub fn run_source(
+  code: impl AsRef<[u8]>,
+  lang: SourceLang,
+  base_dir: impl AsRef<Path>,
+  options: &LibdenoOptions,
+) -> Result<i32, LibdenoError>
+
+pub fn run_source_with_output(
+  code: impl AsRef<[u8]>,
+  lang: SourceLang,
+  base_dir: impl AsRef<Path>,
+  options: &LibdenoOptions,
+) -> Result<RunOutput, LibdenoError>
+
+pub async fn run_source_async(
+  code: impl AsRef<[u8]>,
+  lang: SourceLang,
+  base_dir: impl AsRef<Path>,
+  options: &LibdenoOptions,
+) -> Result<i32, LibdenoError>
+
+pub async fn run_source_with_output_async(
+  code: impl AsRef<[u8]>,
+  lang: SourceLang,
+  base_dir: impl AsRef<Path>,
+  options: &LibdenoOptions,
+) -> Result<RunOutput, LibdenoError>
+```
+
+Runs JS/TS **source held in memory** (`&str`, `String`, `&[u8]`, `Vec<u8>` —
+anything `AsRef<[u8]>`) without writing a temp file. The source is registered
+under a unique virtual `file:` URL inside `base_dir` and then flows through the
+normal pipeline — graph build, TypeScript transpile, CJS, JSON, npm/remote
+imports — exactly like a file on disk.
+
+Behavior notes:
+
+- `base_dir` must be an existing directory; a missing path or a non-directory is
+  rejected with `LibdenoError::Configuration`. A relative `base_dir` resolves
+  against the same effective cwd a relative entry path does — `options.cwd`
+  when set, otherwise the process cwd (canonicalized) — so `run_source(code,
+  lang, "app", &options)` and `run("app/index.js", &options)` see the same
+  directory.
+- Relative imports resolve against `base_dir` (they load real files next to the
+  virtual entry), and resolver/config discovery (`deno.json` / `package.json` /
+  `node_modules`) starts there.
+- `import.meta.url` / `Deno.mainModule` show the virtual specifier
+  (`__libdeno_virtual_<16-hex-digits>.<ext>` — a fixed prefix plus a random
+  suffix, so two runs never collide), unique per call — there is no API to
+  choose a custom module name.
+- The entry's virtual path is subject to the same read-permission check as any
+  import, so granting read on `base_dir` covers both the entry and its imports.
+- The subprocess / `Executor` backends do not support in-memory sources (their
+  request payload is a filesystem path); use the in-process APIs.
+- Capture, exclusivity, deadlines, tokio re-entry and every other option behave
+  exactly as in the path-based entry points.
+- The async and reusable-stack source entry points
+  (`run_source_with_output_async`, `LibdenoRuntime::run_with_source_async`,
+  `run_with_output_source_async`, `run_with_source`, `run_with_output_source`)
+  check their preconditions before building the memory entry, so an invalid
+  `options` — async context, mismatched `cwd`, or capture flags on an
+  exit-code-only variant — is reported instead of a bad `base_dir`.
+
 ## `run_async` / `run_with_output_async`
 
 ```rust
@@ -164,6 +235,22 @@ impl LibdenoRuntime {
     entry: impl AsRef<Path>,
     options: &LibdenoOptions,
   ) -> Result<RunOutput, LibdenoError>
+
+  pub async fn run_with_source_async(
+    &self,
+    code: impl AsRef<[u8]>,
+    lang: SourceLang,
+    base_dir: impl AsRef<Path>,
+    options: &LibdenoOptions,
+  ) -> Result<i32, LibdenoError>
+
+  pub async fn run_with_output_source_async(
+    &self,
+    code: impl AsRef<[u8]>,
+    lang: SourceLang,
+    base_dir: impl AsRef<Path>,
+    options: &LibdenoOptions,
+  ) -> Result<RunOutput, LibdenoError>
 }
 
 pub fn run_with(
@@ -175,6 +262,22 @@ pub fn run_with(
 pub fn run_with_output(
   runtime: &LibdenoRuntime,
   entry: impl AsRef<Path>,
+  options: &LibdenoOptions,
+) -> Result<RunOutput, LibdenoError>
+
+pub fn run_with_source(
+  runtime: &LibdenoRuntime,
+  code: impl AsRef<[u8]>,
+  lang: SourceLang,
+  base_dir: impl AsRef<Path>,
+  options: &LibdenoOptions,
+) -> Result<i32, LibdenoError>
+
+pub fn run_with_output_source(
+  runtime: &LibdenoRuntime,
+  code: impl AsRef<[u8]>,
+  lang: SourceLang,
+  base_dir: impl AsRef<Path>,
   options: &LibdenoOptions,
 ) -> Result<RunOutput, LibdenoError>
 ```
@@ -204,9 +307,12 @@ builds the permission-free half of that stack once and `run_with` /
   omitted by default; when provided it must match the runtime's directory
   (canonicalize-aware comparison), otherwise a mismatched `cwd` is **rejected** with
   `LibdenoError::Configuration` — the stack is scoped to the runtime's
-  directory, so a different base would silently resolve elsewhere. Permissions come from
-  `options` per run: the permission-bound file fetcher / graph loader / graph
-  are rebuilt each call, so one run's grants never leak into another.
+  directory, so a different base would silently resolve elsewhere. A relative
+  `base_dir` passed to the `run_with_source` family resolves against the
+  runtime's directory — the same base a relative entry path resolves against
+  here. Permissions come from `options` per run: the permission-bound file
+  fetcher / graph loader / graph are rebuilt each call, so one run's grants
+  never leak into another.
 - `run_with` **rejects** `capture_stdout` / `capture_stderr` with
   `LibdenoError::Configuration` (it returns only the exit code). Use
   `libdeno::runtime::run_with_output(&runtime, ...)` for capture on the reusable stack;

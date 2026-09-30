@@ -54,7 +54,7 @@ run_source("console.log('hi')", SourceLang::JavaScript, "./my-app", &options).un
 run_source("const x: number = 1 + 2; console.log(x)", SourceLang::TypeScript, "./my-app", &options).unwrap();
 ```
 
-源码会注册到 `base_dir` 下一个唯一的虚拟 `file:` URL（例如 `<base_dir>/__libdeno_virtual_3.ts`），然后走**完整的**正常管线——模块图构建、TypeScript 转译、CJS、JSON、npm/远程导入——与磁盘上的文件完全一致。由此带来的行为：
+源码会注册到 `base_dir` 下一个唯一的虚拟 `file:` URL（例如 `<base_dir>/__libdeno_virtual_9f2c1ab4d7e5f001.ts`），然后走**完整的**正常管线——模块图构建、TypeScript 转译、CJS、JSON、npm/远程导入——与磁盘上的文件完全一致。由此带来的行为：
 
 - 相对导入按 `base_dir` 解析（会从磁盘加载虚拟入口旁边的真实文件）。
 - `import.meta.url` / `Deno.mainModule` 显示的是虚拟说明符，而不是调用方指定的名字；URL 每次调用唯一。
