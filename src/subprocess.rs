@@ -250,7 +250,7 @@ fn spawn_child_request(
     stderr: std::process::Stdio,
 ) -> Result<(Vec<u8>, std::process::Child), LibdenoError> {
     let token = child_token()?;
-    let cwd = options.cwd.clone().unwrap_or(std::env::current_dir()?);
+    let cwd = crate::effective_cwd(options)?;
     let request = ChildRunRequest {
         entry: entry.to_path_buf(),
         permissions: options.permissions.clone(),
@@ -2157,22 +2157,14 @@ pub(crate) fn run_supervised_subprocess_with_executable_observed_and_started(
         ));
     }
 
-    let cwd =
-        options
-            .cwd
-            .clone()
-            .unwrap_or(
-                std::env::current_dir()
-                    .map_err(LibdenoError::Io)
-                    .map_err(|error| {
-                        SupervisedSubprocessError::with_metadata_and_partial(
-                            error,
-                            capture_requested.then(SupervisorPartialOutput::empty),
-                            None,
-                            None,
-                        )
-                    })?,
-            );
+    let cwd = crate::effective_cwd(options).map_err(|error| {
+        SupervisedSubprocessError::with_metadata_and_partial(
+            error,
+            capture_requested.then(SupervisorPartialOutput::empty),
+            None,
+            None,
+        )
+    })?;
     let request = supervisor_request(entry, options, cwd.clone()).map_err(|error| {
         SupervisedSubprocessError::with_metadata_and_partial(
             error,
@@ -2469,52 +2461,60 @@ fn start_supervisor_child_control(
     std::thread::Builder::new()
         .name("libdeno-supervisor-child-control".to_string())
         .spawn(move || {
-            stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-            loop {
-                if stop_rx.try_recv().is_ok() {
-                    return Ok(());
-                }
-                match read_frame(
-                    &mut stream,
-                    FrameDirection::ParentToChild,
-                    Instant::now() + Duration::from_millis(100),
-                ) {
-                    Ok(frame) => {
-                        if frame.kind != FrameKind::Cancel || frame.request_id != request_id {
-                            cancellation.request(CancelReason::User);
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "invalid supervisor control frame after START",
-                            ));
-                        }
-                        let reason: CancelReason = match decode_payload(&frame.payload) {
-                            Ok(reason) => reason,
-                            Err(error) => {
-                                cancellation.request(CancelReason::User);
-                                return Err(error);
-                            }
-                        };
-                        let previous = cancellation.reason();
-                        if cancellation.is_requested() && previous != reason {
-                            cancellation.request(CancelReason::User);
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "conflicting supervisor cancellation reason",
-                            ));
-                        }
-                        cancellation.request(reason);
+            let result = (|| {
+                stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        return Ok(());
                     }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) => {}
-                    Err(error) => {
-                        cancellation.request(CancelReason::User);
-                        return Err(error);
+                    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+                    let mut first_byte = [0u8; 1];
+                    match stream.peek(&mut first_byte) {
+                        Ok(0) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "supervisor control stream closed",
+                            ))
+                        }
+                        Ok(_) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            continue
+                        }
+                        Err(error) => return Err(error),
                     }
+                    let frame = read_frame_after_first_byte(
+                        &mut stream,
+                        FrameDirection::ParentToChild,
+                        None,
+                        None,
+                        None,
+                    )?;
+                    if frame.kind != FrameKind::Cancel || frame.request_id != request_id {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid supervisor control frame after START",
+                        ));
+                    }
+                    let reason: CancelReason = decode_payload(&frame.payload)?;
+                    let previous = cancellation.reason();
+                    if cancellation.is_requested() && previous != reason {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "conflicting supervisor cancellation reason",
+                        ));
+                    }
+                    cancellation.request(reason);
                 }
+            })();
+            if result.is_err() {
+                cancellation.request(CancelReason::User);
             }
+            result
         })
         .map_err(LibdenoError::Io)
 }
@@ -2754,7 +2754,10 @@ mod tests {
         SupervisorTerminal,
     };
     #[cfg(feature = "execution-control")]
-    use super::{read_supervisor_terminal, SupervisorCancellation, SupervisorParentSession};
+    use super::{
+        read_supervisor_terminal, start_supervisor_child_control, SupervisorCancellation,
+        SupervisorParentSession,
+    };
     #[cfg(feature = "execution-control")]
     use crate::supervisor::{
         read_frame, write_frame, CancelReason, FrameDirection, FrameKind,
@@ -3584,6 +3587,143 @@ mod tests {
         );
         assert_eq!(result.terminal.outcome, SupervisorOutcome::Deadline);
         peer.join().unwrap();
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn child_control_preserves_cancel_reason_after_delayed_frame_remainder() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (receiver, _) = listener.accept().unwrap();
+        let request_id = 73;
+        let cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::User,
+        );
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let control =
+            start_supervisor_child_control(&receiver, request_id, cancellation.clone(), stop_rx)
+                .unwrap();
+
+        let frame = SupervisorFrame::new(
+            FrameKind::Cancel,
+            request_id,
+            encode_payload(&CancelReason::Deadline).unwrap(),
+        )
+        .unwrap();
+        // Serialize through the existing TCP codec, then split its exact bytes.
+        let mut codec_sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut codec_receiver, _) = listener.accept().unwrap();
+        codec_receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_frame(&mut codec_sender, &frame).unwrap();
+        codec_sender.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut encoded = Vec::new();
+        codec_receiver.read_to_end(&mut encoded).unwrap();
+        sender.write_all(&encoded[..1]).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        sender.write_all(&encoded[1..]).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cancellation.is_requested() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(cancellation.is_requested(), "CANCEL was not received");
+        assert_eq!(cancellation.reason(), CancelReason::Deadline);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if receiver
+                .read_timeout()
+                .unwrap()
+                .is_some_and(|timeout| timeout <= Duration::from_millis(100))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child control socket did not return to the idle poll timeout"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        stop_tx.send(()).unwrap();
+        control.join().unwrap().unwrap();
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn child_control_peer_eof_requests_cancellation() {
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (receiver, _) = listener.accept().unwrap();
+        let cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::User,
+        );
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let control =
+            start_supervisor_child_control(&receiver, 73, cancellation.clone(), stop_rx).unwrap();
+        drop(peer);
+
+        assert!(control.join().unwrap().is_err());
+        assert!(cancellation.is_requested());
+        assert_eq!(cancellation.reason(), CancelReason::User);
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn child_control_peer_loss_preserves_prior_deadline_reason() {
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (receiver, _) = listener.accept().unwrap();
+        let cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::User,
+        );
+        cancellation.request(CancelReason::Deadline);
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let control =
+            start_supervisor_child_control(&receiver, 73, cancellation.clone(), stop_rx).unwrap();
+        drop(peer);
+
+        assert!(control.join().unwrap().is_err());
+        assert!(cancellation.is_requested());
+        assert_eq!(cancellation.reason(), CancelReason::Deadline);
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn child_control_explicit_stop_does_not_cancel() {
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (receiver, _) = listener.accept().unwrap();
+        let cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::User,
+        );
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let control =
+            start_supervisor_child_control(&receiver, 73, cancellation.clone(), stop_rx).unwrap();
+        stop_tx.send(()).unwrap();
+
+        control.join().unwrap().unwrap();
+        assert!(!cancellation.is_requested());
     }
 
     #[test]

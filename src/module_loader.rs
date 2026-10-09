@@ -33,6 +33,7 @@ use deno_error::JsErrorBox;
 use deno_graph::BuildOptions;
 use deno_graph::CheckJsOption;
 use deno_graph::GraphKind;
+use deno_graph::ModuleEntryRef;
 use deno_graph::ModuleGraph;
 use deno_graph::WalkOptions;
 use deno_media_type::MediaType;
@@ -75,10 +76,37 @@ impl deno_graph::source::JsrUrlProvider for RuntimeJsrUrlProvider<'_> {
 }
 
 impl GraphModuleLoader {
+    fn normalize_node_builtin(url: ModuleSpecifier) -> Result<ModuleSpecifier, JsErrorBox> {
+        use node_resolver::IsBuiltInNodeModuleChecker;
+        if !deno_resolver::DenoIsBuiltInNodeModuleChecker.is_builtin_node_module(url.path()) {
+            return Err(JsErrorBox::generic(format!("Unknown node builtin: {url}")));
+        }
+        let mut canonical = url;
+        canonical.set_query(None);
+        canonical.set_fragment(None);
+        Ok(canonical)
+    }
+
+    fn validate_node_builtin_identity(url: &ModuleSpecifier) -> Result<(), JsErrorBox> {
+        let canonical = Self::normalize_node_builtin(url.clone())?;
+        if &canonical != url {
+            return Err(JsErrorBox::generic(format!(
+                "Non-canonical node builtin identity: {url}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn new(runtime: Arc<RuntimeServices>, permissions: PermissionsContainer) -> Self {
         let graph_loader = runtime.graph_loader.clone();
         let graph = runtime.graph.clone();
-        Self::with_graph_loader_and_graph(runtime, permissions, graph_loader, graph)
+        Self::with_graph_loader_and_graph(
+            runtime.clone(),
+            permissions,
+            runtime.file_fetcher.clone(),
+            graph_loader,
+            graph,
+        )
     }
 
     /// Like [`new`], but binds graph builds to `graph_loader` instead of the
@@ -92,17 +120,19 @@ impl GraphModuleLoader {
     pub fn with_graph_loader(
         runtime: Arc<RuntimeServices>,
         permissions: PermissionsContainer,
+        file_fetcher: Arc<RealFileFetcher>,
         graph_loader: Arc<RealGraphLoader>,
     ) -> Self {
         let graph = Arc::new(tokio::sync::Mutex::new(ModuleGraph::new(
             GraphKind::CodeOnly,
         )));
-        Self::with_graph_loader_and_graph(runtime, permissions, graph_loader, graph)
+        Self::with_graph_loader_and_graph(runtime, permissions, file_fetcher, graph_loader, graph)
     }
 
     fn with_graph_loader_and_graph(
         runtime: Arc<RuntimeServices>,
         permissions: PermissionsContainer,
+        file_fetcher: Arc<RealFileFetcher>,
         graph_loader: Arc<RealGraphLoader>,
         graph: Arc<tokio::sync::Mutex<ModuleGraph>>,
     ) -> Self {
@@ -114,7 +144,7 @@ impl GraphModuleLoader {
             .clone();
         Self {
             shared: runtime.shared.clone(),
-            file_fetcher: runtime.file_fetcher.clone(),
+            file_fetcher,
             graph_loader,
             graph,
             cwd,
@@ -124,7 +154,8 @@ impl GraphModuleLoader {
     }
 
     fn resolve_referrer(referrer: &str, cwd: &Path) -> Result<ModuleSpecifier, JsErrorBox> {
-        if referrer.is_empty() {
+        // deno_core synchronous side-loads use "." instead of a referrer URL.
+        if matches!(referrer, "" | ".") {
             return ModuleSpecifier::from_directory_path(cwd)
                 .map_err(|_| JsErrorBox::generic("Invalid cwd for module resolution"));
         }
@@ -139,14 +170,20 @@ impl GraphModuleLoader {
         kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, JsErrorBox> {
         if matches!(kind, ResolutionKind::MainModule) {
-            return ModuleSpecifier::parse(specifier)
-                .map_err(|e| JsErrorBox::generic(format!("Invalid main module URL: {e}")));
+            let url = ModuleSpecifier::parse(specifier)
+                .map_err(|e| JsErrorBox::generic(format!("Invalid main module URL: {e}")))?;
+            return if url.scheme() == "node" {
+                Self::normalize_node_builtin(url)
+            } else {
+                Ok(url)
+            };
         }
 
-        // Already absolute: file:, node:, data:.
+        // node: is resolved by deno_core's builtin module map. Other absolute
+        // URLs go through the shared resolver so import maps apply consistently.
         if let Ok(url) = ModuleSpecifier::parse(specifier) {
-            if matches!(url.scheme(), "file" | "node" | "data") {
-                return Ok(url);
+            if url.scheme() == "node" {
+                return Self::normalize_node_builtin(url);
             }
         }
 
@@ -160,7 +197,8 @@ impl GraphModuleLoader {
 
         let mode = ResolutionMode::Import;
 
-        self.shared
+        let resolved = self
+            .shared
             .graph_resolver
             .resolve(
                 specifier,
@@ -168,7 +206,12 @@ impl GraphModuleLoader {
                 mode,
                 NodeResolutionKind::Execution,
             )
-            .map_err(|e| JsErrorBox::generic(format!("Cannot resolve \"{specifier}\": {e}")))
+            .map_err(|e| JsErrorBox::generic(format!("Cannot resolve \"{specifier}\": {e}")))?;
+        if resolved.scheme() == "node" {
+            Self::normalize_node_builtin(resolved)
+        } else {
+            Ok(resolved)
+        }
     }
 }
 
@@ -196,7 +239,7 @@ impl ModuleLoader for GraphModuleLoader {
         let timing = self.timing.clone();
         Box::pin(async move {
             if matches!(specifier.scheme(), "node") {
-                // node: builtins come from the extension module map; nothing to load.
+                Self::validate_node_builtin_identity(&specifier)?;
                 return Ok(());
             }
             build_graph(&services, &graph_loader, &graph, &specifier, &timing).await
@@ -210,6 +253,9 @@ impl ModuleLoader for GraphModuleLoader {
         options: ModuleLoadOptions,
     ) -> deno_core::ModuleLoadResponse {
         if module_specifier.scheme() == "node" {
+            if let Err(error) = Self::validate_node_builtin_identity(module_specifier) {
+                return deno_core::ModuleLoadResponse::Sync(Err(error));
+            }
             // Empty JavaScript fallback; the real node builtin sources come from
             // the deno_node extension module map (snapshot).
             return deno_core::ModuleLoadResponse::Sync(Ok(ModuleSource::new(
@@ -375,6 +421,13 @@ async fn build_graph(
     // serializes concurrent builds of *other* roots; revisit only if deno_graph
     // gains a lock-free incremental build API.
     let mut graph = graph.lock().await;
+    let lockfile = shared.lockfile.as_ref();
+    if let Some(lockfile) = lockfile {
+        lockfile.fill_graph(&mut graph);
+        lockfile
+            .error_if_changed()
+            .map_err(|error| JsErrorBox::generic(error.to_string()))?;
+    }
 
     // Already loaded successfully by a previous prepare_load (e.g. an earlier
     // root built the whole transitive graph). Avoid rebuilding the tree — but
@@ -386,47 +439,84 @@ async fn build_graph(
     if graph.get(specifier).is_some() {
         let failed = graph.module_errors().any(|e| e.specifier() == specifier);
         if !failed && validate_root(&graph, specifier).is_ok() {
+            if let Some(lockfile) = lockfile {
+                lockfile
+                    .error_if_changed()
+                    .map_err(|error| JsErrorBox::generic(error.to_string()))?;
+            }
             return Ok(());
         }
     }
 
-    graph
-        .build(
-            vec![specifier.clone()],
-            vec![],
-            graph_loader,
-            BuildOptions {
-                is_dynamic: false,
-                skip_dynamic_deps: false,
-                unstable_bytes_imports: false,
-                unstable_text_imports: false,
-                unstable_css_imports: false,
-                unstable_config_imports: false,
-                executor: Default::default(),
-                locker: None,
-                file_system: &shared.sys,
-                jsr_url_provider: &jsr_url_provider,
-                jsr_version_resolver: Cow::Borrowed(&**jsr_version_resolver),
-                passthrough_jsr_specifiers: false,
-                // The shared cross-run analysis cache (see analysis_cache.rs):
-                // parse + analyze results are reused when (specifier, source
-                // hash) is unchanged, so warm runs skip re-analysis of the
-                // whole transitive graph. Same object for both seams.
-                module_analyzer: &*shared.module_info_cache,
-                module_info_cacher: &*shared.module_info_cache,
-                npm_resolver: Some(&*graph_resolver),
-                reporter: None,
-                resolver: Some(&*graph_resolver),
-                jsr_metadata_store: None,
-            },
-        )
-        .await;
+    let mut locker = lockfile.map(|lockfile| lockfile.as_deno_graph_locker());
+    let options = BuildOptions {
+        is_dynamic: false,
+        skip_dynamic_deps: false,
+        unstable_bytes_imports: false,
+        unstable_text_imports: false,
+        unstable_css_imports: false,
+        unstable_config_imports: false,
+        executor: Default::default(),
+        locker: locker
+            .as_mut()
+            .map(|locker| locker as &mut dyn deno_graph::source::Locker),
+        file_system: &shared.sys,
+        jsr_url_provider: &jsr_url_provider,
+        jsr_version_resolver: Cow::Borrowed(&**jsr_version_resolver),
+        passthrough_jsr_specifiers: false,
+        module_analyzer: &*shared.module_info_cache,
+        module_info_cacher: &*shared.module_info_cache,
+        npm_resolver: Some(&*graph_resolver),
+        reporter: None,
+        resolver: Some(&*graph_resolver),
+        jsr_metadata_store: None,
+    };
+    let mut retry = vec![specifier.clone()];
+    retry.extend(
+        graph
+            .walk(
+                std::iter::once(specifier),
+                WalkOptions {
+                    check_js: CheckJsOption::True,
+                    kind: GraphKind::CodeOnly,
+                    follow_dynamic: false,
+                    prefer_fast_check_graph: false,
+                },
+            )
+            .filter(|(_, entry)| matches!(entry, ModuleEntryRef::Err(_)))
+            .map(|(url, _)| url.clone()),
+    );
+    if graph.get(specifier).is_none() {
+        retry.extend(
+            graph
+                .module_errors()
+                .map(|e| e.specifier().clone())
+                .filter(|url| url == specifier),
+        );
+    }
+    retry.sort();
+    retry.dedup();
+    if retry
+        .iter()
+        .any(|url| graph.get(url).is_some() || graph.module_errors().any(|e| e.specifier() == url))
+    {
+        graph.reload(retry, graph_loader, options).await;
+    } else {
+        graph
+            .build(vec![specifier.clone()], vec![], graph_loader, options)
+            .await;
+    }
 
     // ModuleGraph::build records load and resolution failures in the graph
     // instead of returning a Result. Validate only this root so unrelated
     // graph roots do not poison this prepare_load call. Keep the graph error
     // as the source error.
     validate_root(&graph, specifier)?;
+    if let Some(lockfile) = lockfile {
+        lockfile
+            .error_if_changed()
+            .map_err(|error| JsErrorBox::generic(error.to_string()))?;
+    }
     Ok(())
 }
 
@@ -549,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_referrer_uses_runtime_cwd() {
+    fn empty_and_side_load_referrers_use_runtime_cwd() {
         let runtime_cwd = std::env::temp_dir().join("libdeno-runtime-cwd");
         let host_cwd = std::env::temp_dir().join("libdeno-host-cwd");
         let runtime_referrer = GraphModuleLoader::resolve_referrer("", &runtime_cwd).unwrap();
@@ -557,12 +647,32 @@ mod tests {
 
         assert_eq!(runtime_referrer.to_file_path().unwrap(), runtime_cwd);
         assert_ne!(runtime_referrer, host_referrer);
+        assert_eq!(
+            GraphModuleLoader::resolve_referrer(".", &runtime_cwd).unwrap(),
+            runtime_referrer
+        );
+        assert!(GraphModuleLoader::resolve_referrer("invalid-relative", &runtime_cwd).is_err());
 
         let explicit = ModuleSpecifier::parse("file:///explicit/referrer.js").unwrap();
         assert_eq!(
             GraphModuleLoader::resolve_referrer(explicit.as_str(), &host_cwd).unwrap(),
             explicit
         );
+    }
+
+    #[test]
+    fn node_builtin_urls_normalize_to_canonical_identity() {
+        for input in ["node:path", "node:path?probe", "node:path#probe"] {
+            let url = ModuleSpecifier::parse(input).unwrap();
+            let canonical = GraphModuleLoader::normalize_node_builtin(url).unwrap();
+            assert_eq!(canonical.as_str(), "node:path");
+            GraphModuleLoader::validate_node_builtin_identity(&canonical).unwrap();
+        }
+
+        let suffixed = ModuleSpecifier::parse("node:path?probe").unwrap();
+        assert!(GraphModuleLoader::validate_node_builtin_identity(&suffixed).is_err());
+        let unknown = ModuleSpecifier::parse("node:not-a-real-builtin?probe").unwrap();
+        assert!(GraphModuleLoader::normalize_node_builtin(unknown).is_err());
     }
 
     #[test]

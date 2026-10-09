@@ -42,15 +42,19 @@ Caveats:
 
 ## npm modes
 
-`node_modules_dir` is `Auto` (the CLI default):
+The configured `nodeModulesDir` mode is respected: `manual` uses the local
+`node_modules` tree, `auto` uses managed npm resolution, and `none` disables
+`node_modules` handling. JSON `null` means no mode was configured; it is not a
+mode value. Merely having a `node_modules` directory does not
+select BYONM. When no mode is configured, libdeno preserves its managed `Auto`
+default; the first run of `examples/demo-app/index.js` installs `chalk` into
+`examples/demo-app/node_modules`.
 
-- **BYONM** — if a `node_modules` directory exists at the project root, it is
-  used as-is. No install happens; bare imports resolve against the existing
-  tree.
-- **Managed** — otherwise, packages are installed into `node_modules` on
-  demand (lazy caching, npm cache enabled). This is what you observe when
-  running the demo: the first run of `examples/demo-app/index.js` installs
-  `chalk` into `examples/demo-app/node_modules`.
+When building without the `npm` Cargo feature, configure
+`deno.json` as `{"nodeModulesDir":"manual"}` to use an existing local
+dependency tree. A missing package is a local resolution error; there is no
+automatic installer. Unconfigured projects remain in managed `auto` mode, and
+declared npm dependencies require the `npm` feature.
 
 npm lifecycle scripts (`preinstall`/`install`/`postinstall`) do **not** run
 by default, matching the deno CLI 2.x default: installing a dependency must
@@ -61,6 +65,11 @@ box.
 The npm resolution snapshot is initialized before the module graph starts
 requesting packages
 (`initialize_npm_resolution_if_managed`).
+
+When present, `deno.lock` is read as resolver input. Available checksums and
+integrity data are checked, and frozen-lockfile settings reject changes.
+Without frozen mode, a lockfile change is not necessarily an error. libdeno
+always skips lockfile writes and never persists updates.
 
 ## Bare imports vs `npm:` specifiers
 
@@ -99,10 +108,18 @@ a runtime (`node`, `node-gyp`, ...) must be available on `PATH`.
 
 ## `child_process.fork`
 
-The npm process state (resolution snapshot or BYONM marker, plus the
-`node_modules` path) is serialized and handed to the child via
-`NODE_CHANNEL_FD` (+ serialization mode), mirroring the CLI's `node_ipc_init`.
-The forked child restores the npm resolution snapshot from that state.
+The npm process-state provider serializes the current resolution snapshot (or
+BYONM marker and `node_modules` path) for deno_process's private inherited state
+file descriptor/handle, exposed through
+`DENO_DONT_USE_INTERNAL_NODE_COMPAT_STATE_FD`. This is separate from Node's
+`NODE_CHANNEL_FD` IPC channel. This release has no trusted child-startup
+receiver that adopts and restores the inherited state, so automatic npm
+snapshot restoration in forked children is unsupported. libdeno does not read,
+seek, adopt, or close an unknown inherited state descriptor/handle. A fork
+child may still resolve packages from its local `node_modules` or lockfile;
+that is ordinary resolution, not proof that the inherited snapshot was
+restored. Supporting restoration requires an explicit host-owned startup
+handoff contract.
 
 ## Module graph
 
@@ -114,6 +131,10 @@ The forked child restores the npm resolution snapshot from that state.
   fetcher).
 - Remote modules are fetched into the HTTP cache; redirects are handled by
   the file fetcher (the HTTP client does not follow redirects).
+- Dynamic Blob imports use the run's Blob store. Blob-backed workers receive
+  their captured root Blob locally, so that root can finish loading after URL
+  revocation; revoked dependencies are not restored and the root is not
+  reintroduced into the shared Blob store for that run.
 
 ## JSON imports
 

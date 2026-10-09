@@ -128,6 +128,8 @@ struct DirectoryProbe {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EnvironmentProbe {
+    deno_dir: Option<std::ffi::OsString>,
+    no_package_json: bool,
     jsr_url: Option<String>,
     jsr_url_has_auth: bool,
     registry: Option<String>,
@@ -671,6 +673,9 @@ fn environment_probe(
     };
     referenced_npmrc_vars.sort_by(|left, right| left.name.cmp(&right.name));
     EnvironmentProbe {
+        deno_dir: std::env::var_os("DENO_DIR"),
+        no_package_json: std::env::var_os("DENO_NO_PACKAGE_JSON").as_deref()
+            == Some(std::ffi::OsStr::new("1")),
         jsr_url: env_url_identity(&["JSR_URL"]),
         jsr_url_has_auth: env_url_has_userinfo(&["JSR_URL"]),
         registry: env_url_identity(&["NPM_CONFIG_REGISTRY", "npm_config_registry"]),
@@ -688,6 +693,9 @@ fn environment_probe(
 
 fn current_environment_probe(baseline: &EnvironmentProbe) -> EnvironmentProbe {
     EnvironmentProbe {
+        deno_dir: std::env::var_os("DENO_DIR"),
+        no_package_json: std::env::var_os("DENO_NO_PACKAGE_JSON").as_deref()
+            == Some(std::ffi::OsStr::new("1")),
         jsr_url: env_url_identity(&["JSR_URL"]),
         jsr_url_has_auth: env_url_has_userinfo(&["JSR_URL"]),
         registry: env_url_identity(&["NPM_CONFIG_REGISTRY", "npm_config_registry"]),
@@ -1011,7 +1019,6 @@ mod tests {
     use super::*;
     use crate::deno_resolver_adapter::new_resolver_factory;
     use crate::deno_resolver_adapter::new_workspace_factory;
-    use crate::deno_resolver_adapter::new_workspace_factory_with_node_modules_dir;
     use deno_npmrc::NpmRc;
     use deno_npmrc::NpmRegistryUrl;
 
@@ -1078,6 +1085,8 @@ mod tests {
                 byonm_node_modules: vec![],
                 npmrc_has_auth: false,
                 environment: EnvironmentProbe {
+                    deno_dir: None,
+                    no_package_json: false,
                     jsr_url: None,
                     jsr_url_has_auth: false,
                     registry: None,
@@ -1156,11 +1165,8 @@ mod tests {
         )
         .unwrap();
 
-        let factory = new_workspace_factory_with_node_modules_dir(
-            dir.clone(),
-            vec![dir.clone()],
-            Some(deno_config::deno_json::NodeModulesDirMode::Manual),
-        );
+        std::fs::write(dir.join("deno.json"), r#"{"nodeModulesDir":"manual"}"#).unwrap();
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
         let resolver = new_resolver_factory(
             factory.clone(),
             crate::analysis_cache::node_analysis_cache(),
@@ -1313,6 +1319,33 @@ mod tests {
     }
 
     #[test]
+    fn environment_probe_invalidates_on_deno_dir_and_no_package_json_changes() {
+        let _semantic_lock = semantic_probe_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env_lock = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = TestEnvGuard::new(&["DENO_DIR", "DENO_NO_PACKAGE_JSON"]);
+        std::env::set_var("DENO_DIR", "/tmp/deno-cache-a");
+        std::env::remove_var("DENO_NO_PACKAGE_JSON");
+
+        let baseline = environment_probe(&[], false, global_npmrc_path());
+        assert_eq!(current_environment_probe(&baseline), baseline);
+
+        std::env::set_var("DENO_DIR", "/tmp/deno-cache-b");
+        assert_ne!(current_environment_probe(&baseline), baseline);
+        std::env::set_var("DENO_DIR", "/tmp/deno-cache-a");
+        assert_eq!(current_environment_probe(&baseline), baseline);
+
+        std::env::set_var("DENO_NO_PACKAGE_JSON", "true");
+        assert_eq!(current_environment_probe(&baseline), baseline);
+        std::env::set_var("DENO_NO_PACKAGE_JSON", "1");
+        assert_ne!(current_environment_probe(&baseline), baseline);
+    }
+
+    #[test]
     fn env_replace_registry_host_identity_distinguishes_non_url_hostnames() {
         let _guard = ENV_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -1364,7 +1397,7 @@ mod tests {
         assert_eq!(first.len(), second.len());
         std::fs::write(&package, first).unwrap();
 
-        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]);
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
         factory.workspace_directory().unwrap();
         factory.npmrc_with_path().unwrap();
         let resolver = new_resolver_factory(
@@ -1379,7 +1412,7 @@ mod tests {
         assert!(!manifest.is_current().unwrap());
         assert_eq!(managed_snapshot_key(&manifest), Some(key));
 
-        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]);
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
         let resolver = new_resolver_factory(
             factory.clone(),
             crate::analysis_cache::node_analysis_cache(),
@@ -1427,7 +1460,7 @@ mod tests {
         std::env::remove_var("NPM_CONFIG_REGISTRY");
         std::env::remove_var("NPM_CONFIG_REPLACE_REGISTRY_HOST");
 
-        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]);
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
         factory.workspace_directory().unwrap();
         factory.npmrc_with_path().unwrap();
         let resolver = new_resolver_factory(
@@ -1523,14 +1556,11 @@ mod tests {
             r#"{"name":"node-modules-transition","dependencies":{}}"#,
         )
         .unwrap();
+        std::fs::write(dir.join("deno.json"), r#"{"nodeModulesDir":"manual"}"#).unwrap();
         std::os::unix::fs::symlink(&node_modules_a, &node_modules).unwrap();
         std::env::set_var("HOME", &home);
 
-        let factory = new_workspace_factory_with_node_modules_dir(
-            dir.clone(),
-            vec![dir.clone()],
-            Some(deno_config::deno_json::NodeModulesDirMode::Manual),
-        );
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
         let resolver = new_resolver_factory(
             factory.clone(),
             crate::analysis_cache::node_analysis_cache(),
@@ -1619,7 +1649,7 @@ mod tests {
         std::env::remove_var("NPM_CONFIG_REGISTRY");
         std::env::remove_var("NPM_CONFIG_REPLACE_REGISTRY_HOST");
 
-        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]);
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
         factory.workspace_directory().unwrap();
         factory.npmrc_with_path().unwrap();
         let resolver = new_resolver_factory(
@@ -1686,7 +1716,7 @@ mod tests {
         std::env::set_var("HOME", &home);
         std::env::set_var("LIBDENO_TEST_REGISTRY", "https://registry-a.example/");
 
-        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]);
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
         factory.workspace_directory().unwrap();
         factory.npmrc_with_path().unwrap();
         let resolver = new_resolver_factory(
@@ -1731,7 +1761,7 @@ mod tests {
         std::env::set_var("HOME", &home);
         std::env::set_var("JSR_URL", "https://jsr-a.example/");
 
-        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]);
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
         factory.workspace_directory().unwrap();
         factory.npmrc_with_path().unwrap();
         let resolver = new_resolver_factory(
@@ -1817,7 +1847,7 @@ mod tests {
         std::env::set_var("HOME", &home_a);
         std::env::set_var("USERPROFILE", &home_a);
 
-        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]);
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
         factory.workspace_directory().unwrap();
         factory.npmrc_with_path().unwrap();
         let resolver = new_resolver_factory(
@@ -1834,7 +1864,7 @@ mod tests {
         assert!(!old_manifest.is_current().unwrap());
         assert!(!old_manifest.is_reusable().unwrap());
 
-        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]);
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
         factory.workspace_directory().unwrap();
         factory.npmrc_with_path().unwrap();
         let resolver = new_resolver_factory(
@@ -1875,7 +1905,7 @@ mod tests {
         let old_home = std::env::var_os("HOME");
         std::env::set_var("HOME", &home);
 
-        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]);
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
         let resolver = new_resolver_factory(
             factory.clone(),
             crate::analysis_cache::node_analysis_cache(),

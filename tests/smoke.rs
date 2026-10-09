@@ -1006,6 +1006,34 @@ fn subprocess_child_uses_options_cwd() {
 }
 
 #[test]
+fn subprocess_relative_cwd_is_resolved_once() {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let relative_dir = PathBuf::from("target").join(format!("libdeno-relative-cwd-{suffix}"));
+    let dir = std::env::current_dir().unwrap().join(&relative_dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("marker.txt"), "relative-cwd-ok").unwrap();
+    fs::write(
+        dir.join("main.js"),
+        "if (Deno.readTextFileSync('./marker.txt') !== 'relative-cwd-ok') \
+         throw new Error('cwd mismatch');",
+    )
+    .unwrap();
+
+    let _host_exe = set_host_exe(env!("CARGO_BIN_EXE_child_host"));
+    let options = LibdenoOptions {
+        cwd: Some(relative_dir),
+        permissions: vec!["--allow-read=.".to_string()],
+        ..Default::default()
+    };
+    let code = libdeno::run_in_subprocess(std::path::Path::new("main.js"), &options).unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn execution_deadline_terminates_infinite_loop() {
     // P1: a short execution_deadline must force-terminate a busy JS loop
     // (V8 terminate_execution from the deadline thread) and report Timeout

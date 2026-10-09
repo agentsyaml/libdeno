@@ -537,11 +537,12 @@ pub fn run_in_subprocess(
 
 Runs `entry` in a **child process** and returns the child's exit code.
 
-Why: the embedded `run()` shares the host process, so a script calling
-`Deno.exit(n)` — or a hard runtime failure — terminates the host process
-itself (`deno_os::exit` → `std::process::exit`). Subprocess mode contains
-that: `Deno.exit(n)` kills only the child, and the host keeps running and
-observes `n` as the return value.
+Why: the embedded `run()` shares the host process. Before executing the user
+module, it installs an exit watcher; `Deno.exit(n)` ends the run and returns
+`n` to the host rather than terminating the host process. The Python wrappers
+use the same flow. Subprocess mode is useful when process-level failures must
+be contained: FFI/native code, V8 out-of-memory failures, or aborts can still
+kill the host, and embedded execution is not a sandbox for untrusted code.
 
 Requirements:
 
@@ -714,3 +715,10 @@ demo [permission flags...] <entry> [script args...]
 It also understands the translated argument style used by
 `child_process.fork` (`demo run -A --unstable-... script.js`): the `run`
 subcommand and flags are skipped when picking the entry.
+
+Node's `NODE_CHANNEL_FD` IPC is separate from deno_process's private inherited
+npm-state file descriptor/handle. The library currently has no trusted
+child-startup receiver for that state, so it does not automatically restore
+inherited npm snapshots. A fork child may still resolve local packages or use
+its lockfile; that is ordinary resolver behavior. See
+[npm support](npm-support.md#child_processfork) for the current boundary.

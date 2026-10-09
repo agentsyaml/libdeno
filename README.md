@@ -15,9 +15,11 @@ libdeno is a Rust crate that embeds a full Deno runtime (V8 + the official modul
 ## Features
 
 - **Official module graph pipeline**: `npm:`, `jsr:`, remote `https://`, `node:`, local files, JSON, WASM, import maps (from `deno.json`), and TypeScript transpilation are all handled by `deno_graph` + `deno_resolver`. Remote (`https:`/`jsr:`) imports require `--allow-import` (or `allow_all_permissions`/`prompt`) — there is no `--allow-net` fallback for module loading, matching `deno run`.
-- **npm integration**: automatically discovers and uses an existing `node_modules` (BYONM); installs on demand otherwise (managed mode). Supports CJS packages and `.node` native addons. npm lifecycle scripts do not run by default (matching deno CLI 2.x).
-- **`child_process.fork` support**: the npm resolution snapshot propagates to child processes.
-- **Web Workers**: `new Worker(...)` nested workers reuse the same module loader and snapshot.
+- **npm integration**: respects `nodeModulesDir` in `deno.json` (`manual`, `auto`, or `none`); an existing `node_modules` directory does not itself select BYONM. Unconfigured projects retain libdeno's managed `auto` default. Supports CJS packages and `.node` native addons. npm lifecycle scripts do not run by default (matching deno CLI 2.x).
+- **`child_process.fork`**: Node IPC is separate from deno_process's private inherited npm-state file descriptor/handle. This release does not automatically restore snapshots from that resource; local package/lockfile resolution may still work independently.
+- **Web Workers**: each `new Worker(...)` has its own module graph and permission-bound loader; workers share resolver/cache state and the V8 startup snapshot.
+- **Blob modules**: dynamic Blob imports and Blob-backed workers are supported. A worker can use its captured root Blob after revocation; this does not restore revoked dependency URLs or make the root available to other loaders.
+- **Read-only lockfiles**: `deno.lock` participates in npm resolution and is checked for consistency, but libdeno does not write it.
 - **Permission model**: CLI-style `--allow-*` capability strings; permissions are opt-in — an empty list is a construction error unless `allow_all_permissions` is set.
 - **Unstable APIs enabled out of the box**: `Deno.openKv`, cron, FFI, WebGPU, etc. (an "everything enabled" stance, like `deno run --unstable`).
 - **Prebuilt V8 snapshot**: runtime extensions are compiled into a snapshot at build time for faster cold start.
@@ -231,6 +233,12 @@ output capture): [`examples/npm-plugin.md`](examples/npm-plugin.md).
 `npm` is in the default feature set (`default = ["snapshot", "npm"]`). Building with `--no-default-features --features snapshot` removes the npm installer (`deno_npm_installer`) and npm-cache (`deno_npm_cache`) machinery, including the npm lifecycle-script executor. In such a build, `npm:` imports fail with a clear "npm support is disabled in this build (enable the `npm` feature)" error.
 
 Honest caveat: `deno_resolver`/`node_resolver` depend unconditionally on `deno_npm` and `deno_npmrc`, so those crates stay in the build; disabling `npm` removes bare `npm:` specifier install support but leaves `node_modules`/BYONM resolution working. It is a dependency/API-surface and compile-time reduction — **not** a meaningful binary-size win (the statically linked V8 runtime dominates binary size).
+
+With the `npm` feature disabled, projects that need an existing local
+dependency tree should explicitly configure `deno.json` with
+`{"nodeModulesDir":"manual"}`. A missing package is a local resolution error;
+libdeno does not automatically install it. Unconfigured projects remain in
+managed `auto` mode, and declared npm dependencies require the `npm` feature.
 
 ---
 

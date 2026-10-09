@@ -24,31 +24,39 @@ use sys_traits::impls::RealSys;
 pub(crate) fn new_workspace_factory(
     initial_cwd: PathBuf,
     config_start_paths: Vec<PathBuf>,
-) -> Arc<WorkspaceFactory<RealSys>> {
-    new_workspace_factory_with_node_modules_dir(
-        initial_cwd,
-        config_start_paths,
-        Some(NodeModulesDirMode::Auto),
-    )
-}
-
-pub(crate) fn new_workspace_factory_with_node_modules_dir(
-    initial_cwd: PathBuf,
-    config_start_paths: Vec<PathBuf>,
-    node_modules_dir: Option<NodeModulesDirMode>,
-) -> Arc<WorkspaceFactory<RealSys>> {
+) -> deno_core::anyhow::Result<Arc<WorkspaceFactory<RealSys>>> {
     node_resolver::PackageJsonThreadLocalCache::clear();
-    Arc::new(WorkspaceFactory::new(
+    let discovery = Arc::new(WorkspaceFactory::new(
+        RealSys,
+        initial_cwd.clone(),
+        WorkspaceFactoryOptions {
+            config_discovery: ConfigDiscoveryOption::Discover {
+                start_paths: config_start_paths.clone(),
+            },
+            node_modules_dir: None,
+            lockfile_skip_write: true,
+            ..Default::default()
+        },
+    ));
+    let workspace = discovery.workspace_directory()?;
+    let mode = workspace
+        .workspace
+        .node_modules_dir()?
+        .unwrap_or(NodeModulesDirMode::Auto);
+    let mut factory = WorkspaceFactory::new(
         RealSys,
         initial_cwd,
         WorkspaceFactoryOptions {
             config_discovery: ConfigDiscoveryOption::Discover {
                 start_paths: config_start_paths,
             },
-            node_modules_dir,
+            node_modules_dir: Some(mode),
+            lockfile_skip_write: true,
             ..Default::default()
         },
-    ))
+    );
+    factory.set_workspace_directory(workspace.clone());
+    Ok(Arc::new(factory))
 }
 
 pub(crate) fn new_authoritative_workspace_factory(
@@ -56,11 +64,8 @@ pub(crate) fn new_authoritative_workspace_factory(
     config_start_paths: Vec<PathBuf>,
     original: &WorkspaceFactory<RealSys>,
 ) -> deno_core::anyhow::Result<Arc<WorkspaceFactory<RealSys>>> {
-    Ok(new_workspace_factory_with_node_modules_dir(
-        initial_cwd,
-        config_start_paths,
-        Some(original.node_modules_dir_mode()?),
-    ))
+    let _ = original;
+    new_workspace_factory(initial_cwd, config_start_paths)
 }
 
 /// Constructs the resolver with the exact option set shared by normal stack

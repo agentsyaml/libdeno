@@ -6,7 +6,6 @@ use deno_core::ModuleSpecifier;
 use deno_runtime::deno_fs::FileSystem;
 use deno_runtime::deno_inspector_server::MainInspectorSessionChannel;
 use deno_runtime::deno_node::NodeExtInitServices;
-use deno_runtime::deno_web::BlobStore;
 use deno_runtime::deno_web::InMemoryBroadcastChannel;
 use deno_runtime::worker::MainWorker;
 use deno_runtime::worker::WorkerOptions;
@@ -65,7 +64,7 @@ pub(crate) fn build_main_worker(
         sys: node_sys.clone(),
     });
 
-    let blob_store = BlobStore::default_arc();
+    let blob_store = services.blob_store.clone();
     let broadcast_channel = InMemoryBroadcastChannel::default();
     // Default: "everything enabled" like `deno run --unstable` — an embedded
     // runtime has no flag surface unless the host opts in via

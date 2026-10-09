@@ -77,13 +77,30 @@ impl OutputCapture {
         capture_stderr: bool,
         max_bytes: Option<usize>,
     ) -> Result<Self, std::io::Error> {
+        // Validate targets on Unix; all internal descriptors are kept >= 3.
+        #[cfg(unix)]
+        for (enabled, fd) in [(capture_stdout, 1), (capture_stderr, 2)] {
+            if enabled && unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        let saved_stdout = if capture_stdout {
+            Some(SavedFd::duplicate(1)?)
+        } else {
+            None
+        };
+        let saved_stderr = if capture_stderr {
+            Some(SavedFd::duplicate(2)?)
+        } else {
+            None
+        };
         let stdout = if capture_stdout {
-            Some(StreamCapture::new(1, max_bytes)?)
+            Some(StreamCapture::new(1, max_bytes, saved_stdout.unwrap())?)
         } else {
             None
         };
         let stderr = if capture_stderr {
-            Some(StreamCapture::new(2, max_bytes)?)
+            Some(StreamCapture::new(2, max_bytes, saved_stderr.unwrap())?)
         } else {
             None
         };
@@ -141,9 +158,43 @@ struct StreamCapture {
     overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+struct SavedFd(libc::c_int);
+
+impl SavedFd {
+    fn duplicate(fd: libc::c_int) -> Result<Self, std::io::Error> {
+        #[cfg(unix)]
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        #[cfg(windows)]
+        let duplicate = unsafe { libc::dup(fd) };
+        if duplicate < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(Self(duplicate))
+        }
+    }
+    fn into_raw(self) -> libc::c_int {
+        let fd = self.0;
+        std::mem::forget(self);
+        fd
+    }
+}
+
+impl Drop for SavedFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.0);
+        }
+    }
+}
+
 impl StreamCapture {
-    fn new(fd: libc::c_int, max_bytes: Option<usize>) -> Result<Self, std::io::Error> {
+    fn new(
+        fd: libc::c_int,
+        max_bytes: Option<usize>,
+        dup_fd: SavedFd,
+    ) -> Result<Self, std::io::Error> {
         let reader_budget = reserve_capture_reader()?;
+        let dup_fd = dup_fd.into_raw();
         let mut fds = [0; 2];
         let rc = unsafe {
             #[cfg(unix)]
@@ -157,7 +208,29 @@ impl StreamCapture {
             }
         };
         if rc != 0 {
+            unsafe {
+                libc::close(dup_fd);
+            }
             return Err(std::io::Error::last_os_error());
+        }
+        #[cfg(unix)]
+        for slot in 0..2 {
+            if fds[slot] < 3 {
+                let relocated = unsafe { libc::fcntl(fds[slot], libc::F_DUPFD_CLOEXEC, 3) };
+                if relocated < 0 {
+                    let error = std::io::Error::last_os_error();
+                    unsafe {
+                        libc::close(fds[0]);
+                        libc::close(fds[1]);
+                        libc::close(dup_fd);
+                    }
+                    return Err(error);
+                }
+                unsafe {
+                    libc::close(fds[slot]);
+                }
+                fds[slot] = relocated;
+            }
         }
         let (read_fd, write_fd) = (fds[0], fds[1]);
         // Mark both pipe ends close-on-exec: without it, a child the script
@@ -179,19 +252,6 @@ impl StreamCapture {
         {
             set_cloexec(read_fd);
             set_cloexec(write_fd);
-        }
-        // Keep a copy of the original fd so it can be restored on finish.
-        // dup() may fail (e.g. a daemonized host that closed its stdio and
-        // let pipe() reuse fd 1): surface a clean error instead of corrupting
-        // the bookkeeping.
-        let dup_fd = unsafe { libc::dup(fd) };
-        if dup_fd < 0 {
-            let err = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(read_fd);
-                libc::close(write_fd);
-            }
-            return Err(err);
         }
         let saved = Some(dup_fd);
         if unsafe { libc::dup2(write_fd, fd) } < 0 {
@@ -371,11 +431,23 @@ fn collect_blocks(
     rx: &std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
     overflow: &std::sync::atomic::AtomicBool,
 ) -> Result<(Vec<u8>, bool), std::io::Error> {
-    // The budget only fires when a spawned child holds the write end open; on
-    // every normal run EOF arrives right after the fd restore.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    collect_blocks_until(
+        rx,
+        overflow,
+        std::time::Instant::now() + std::time::Duration::from_millis(500),
+    )
+}
+
+fn collect_blocks_until(
+    rx: &std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+    overflow: &std::sync::atomic::AtomicBool,
+    deadline: std::time::Instant,
+) -> Result<(Vec<u8>, bool), std::io::Error> {
     let mut out = Vec::new();
     loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         match rx.recv_timeout(remaining) {
             Ok(Ok(block)) => out.extend_from_slice(&block),
@@ -410,6 +482,7 @@ impl Drop for StreamCapture {
 mod tests {
     use super::active_capture_readers;
     use super::collect_blocks;
+    use super::collect_blocks_until;
     use super::reserve_capture_reader;
     use super::MAX_ACTIVE_CAPTURE_READERS;
 
@@ -427,6 +500,18 @@ mod tests {
         let error = collect_blocks(&rx, &overflow).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         assert_eq!(error.to_string(), "synthetic capture read failure");
+    }
+
+    #[test]
+    fn expired_collection_deadline_leaves_queued_data_pending() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(b"pending".to_vec())).unwrap();
+        let overflow = std::sync::atomic::AtomicBool::new(false);
+        let (bytes, truncated) =
+            collect_blocks_until(&rx, &overflow, std::time::Instant::now()).unwrap();
+        assert!(bytes.is_empty());
+        assert!(!truncated);
+        assert_eq!(rx.try_recv().unwrap().unwrap(), b"pending");
     }
 
     #[test]
@@ -454,6 +539,64 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn active_capture_preserves_closed_unselected_stdio() {
+        const CHILD: &str = "LIBDENO_CLOSED_STDIO_CHILD";
+        if let Some(selection) = std::env::var_os(CHILD) {
+            let selection = selection.to_str().unwrap();
+            let (closed, capture_stdout, target) = match selection {
+                "closed0-stdout" => (0, true, 1),
+                "closed1-stderr" => (1, false, 2),
+                "closed2-stdout" => (2, true, 1),
+                other => panic!("unknown child selection: {other}"),
+            };
+            eprintln!("LIBDENO_CLOSED_STDIO_CHILD_STARTED:{selection}");
+            unsafe {
+                libc::close(closed);
+            }
+            let capture = super::OutputCapture::new(capture_stdout, !capture_stdout, None).unwrap();
+            assert!(unsafe { libc::fcntl(closed, libc::F_GETFD) } < 0);
+            let probe = b"capture";
+            assert_eq!(
+                unsafe { libc::write(target, probe.as_ptr().cast(), probe.len()) },
+                probe.len() as isize
+            );
+            let (stdout, stderr, _) = capture.finish().unwrap();
+            assert_eq!(if capture_stdout { stdout } else { stderr }, probe);
+            assert!(unsafe { libc::fcntl(closed, libc::F_GETFD) } < 0);
+            if closed == 1 {
+                std::process::exit(0);
+            }
+            return;
+        }
+        for selection in ["closed0-stdout", "closed1-stderr", "closed2-stdout"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "output::tests::active_capture_preserves_closed_unselected_stdio",
+                    "--nocapture",
+                ])
+                .env(CHILD, selection)
+                .output()
+                .unwrap();
+            let marker = format!("LIBDENO_CLOSED_STDIO_CHILD_STARTED:{selection}");
+            let diagnostics = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                diagnostics.contains(&marker),
+                "missing child marker {marker:?}: {diagnostics}"
+            );
+            assert!(
+                output.status.success(),
+                "isolated capture child failed for {selection}: {diagnostics}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn reader_budget_releases_after_normal_eof() {
         use std::os::fd::AsRawFd;
 
@@ -466,7 +609,12 @@ mod tests {
             .open("/dev/null")
             .unwrap();
         let baseline = active_capture_readers();
-        let capture = super::StreamCapture::new(target.as_raw_fd(), None).unwrap();
+        let capture = super::StreamCapture::new(
+            target.as_raw_fd(),
+            None,
+            super::SavedFd::duplicate(target.as_raw_fd()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(active_capture_readers(), baseline + 1);
 
         let message = b"normal eof";

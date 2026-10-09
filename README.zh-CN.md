@@ -11,9 +11,11 @@ English: [README.md](README.md)
 ## 特性
 
 - **官方模块图管线**：`npm:`、`jsr:`、远程 `https://`、`node:`、本地文件、JSON、WASM、import map（来自 `deno.json`）、TypeScript 转译，全部由 `deno_graph` + `deno_resolver` 处理。远程（`https:`/`jsr:`）导入需要 `--allow-import`（或 `allow_all_permissions`/`prompt`）——模块加载没有 `--allow-net` 兜底，与 `deno run` 一致。
-- **npm 集成**：自动发现并使用 `node_modules`（BYONM）；没有时按需安装（managed mode）。支持 CJS 包、`.node` 原生插件。npm 生命周期脚本默认不执行（与 deno CLI 2.x 一致）。
-- **`child_process.fork` 支持**：npm 解析快照随子进程传播。
-- **Web Worker**：`new Worker(...)` 嵌套 worker 复用同一模块加载器与快照。
+- **npm 集成**：遵循 `deno.json` 中显式配置的 `nodeModulesDir`（`manual`、`auto` 或 `none`）；仅有 `node_modules` 目录不会自动选择 BYONM。未配置时保留 libdeno 的 managed `auto` 默认模式。支持 CJS 包、`.node` 原生插件。npm 生命周期脚本默认不执行（与 deno CLI 2.x 一致）。
+- **`child_process.fork`**：Node IPC 与 deno_process 私有继承 npm 状态文件描述符/句柄是分开的。本版本不会自动从该资源恢复快照；本地包/lockfile 解析仍可能独立工作。
+- **Web Worker**：每个 `new Worker(...)` 拥有独立模块图和受权限约束的 loader；worker 共享 resolver/cache 状态及 V8 启动快照。
+- **Blob 模块**：支持动态导入 Blob 模块及 Blob-backed worker。worker 可在 URL 撤销后继续使用已捕获的根 Blob；这不会恢复已撤销的依赖 URL，也不会让其他 loader 获得该根模块。
+- **只读 lockfile**：`deno.lock` 参与 npm 解析并进行一致性检查，但 libdeno 不会写入它。
 - **权限模型**：与 CLI 一致的 `--allow-*` 能力字符串；权限为显式选择——空列表是构造错误，除非设置 `allow_all_permissions`。
 - **开箱即用的 unstable API**：`Deno.openKv`、cron、FFI、WebGPU 等默认启用（匹配 `deno run --unstable` 的"全开"立场）。
 - **预构建 V8 快照**：构建时把运行时扩展编译进快照，冷启动更快。
@@ -175,6 +177,10 @@ println!("exit={} stdout={:?}", out.exit_code, out.stdout);
 `npm` 在默认 feature 集中（`default = ["snapshot", "npm"]`）。使用 `--no-default-features --features snapshot` 构建会移除 npm 安装器（`deno_npm_installer`）与 npm-cache（`deno_npm_cache`）机制，包括 npm 生命周期脚本执行器。在这样的构建中，`npm:` 导入会以明确的 "npm support is disabled in this build (enable the `npm` feature)" 错误失败。
 
 需要说明的实话：`deno_resolver`/`node_resolver` 无条件依赖 `deno_npm` 与 `deno_npmrc`，这些 crate 无法从构建中移除；关闭 `npm` 只会去掉裸 `npm:` 说明符的安装支持，`node_modules`/BYONM 解析仍然可用。它是依赖/API 表面与编译时间的缩减——**不是**有意义的二进制体积收益（静态链接的 V8 运行时主导二进制大小）。
+
+关闭 `npm` feature 时，若要使用现有本地依赖树，请在 `deno.json` 中显式配置
+`{"nodeModulesDir":"manual"}`。缺少的包会产生本地解析错误，不会自动安装。
+未配置的项目仍使用 managed `auto` 模式；声明的 npm 依赖需要启用 `npm` feature。
 
 ---
 

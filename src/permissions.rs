@@ -120,10 +120,31 @@ pub fn build_permissions(
                 })
                 .collect()
         };
+        let run_paths = |specs: Vec<String>| -> Vec<String> {
+            specs
+                .into_iter()
+                .map(|s| {
+                    let path = Path::new(&s);
+                    if !is_run_path(&s) {
+                        s
+                    } else {
+                        cwd.join(path).to_string_lossy().into_owned()
+                    }
+                })
+                .collect()
+        };
         // Repeated flags accumulate (union), like the CLI: `--allow-read=./a
         // --allow-read=./b` grants both, not just the last.
         let extend = |slot: &mut Option<Vec<String>>, specs: Vec<String>| {
-            slot.get_or_insert_with(Vec::new).extend(specs);
+            if specs.is_empty() {
+                *slot = Some(Vec::new());
+            } else if let Some(existing) = slot {
+                if !existing.is_empty() {
+                    existing.extend(specs);
+                }
+            } else {
+                *slot = Some(specs);
+            }
         };
         match flag {
             "--allow-read" => {
@@ -144,7 +165,7 @@ pub fn build_permissions(
             }
             "--allow-run" => {
                 has_allow = true;
-                extend(&mut opts.allow_run, specs);
+                extend(&mut opts.allow_run, run_paths(specs));
             }
             "--allow-ffi" => {
                 has_allow = true;
@@ -190,6 +211,15 @@ pub fn build_permissions(
     let perms = Permissions::from_options(&*parser, &opts)
         .map_err(|e| LibdenoError::Permission(e.to_string()))?;
     Ok(PermissionsContainer::new(parser, perms))
+}
+
+fn is_run_path(spec: &str) -> bool {
+    let path = Path::new(spec);
+    path.is_absolute()
+        || spec == "."
+        || spec == ".."
+        || spec.contains('/')
+        || cfg!(windows) && spec.contains('\\')
 }
 
 #[cfg(test)]
@@ -487,5 +517,56 @@ mod tests {
             p.query_read(Some("./other/x")).unwrap(),
             PermissionState::Prompt
         );
+    }
+
+    #[test]
+    fn global_read_grant_dominates_scoped_grant_in_both_orders() {
+        for args in [
+            ["--allow-read", "--allow-read=./one"],
+            ["--allow-read=./one", "--allow-read"],
+        ] {
+            let p = perms(&args, false, false);
+            assert_eq!(
+                p.query_read(Some("/unrelated/path")).unwrap(),
+                PermissionState::Granted
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_read_grants_still_union() {
+        let p = perms(&["--allow-read=./one", "--allow-read=./two"], false, false);
+        assert_eq!(
+            p.query_read(Some("./one/a")).unwrap(),
+            PermissionState::Granted
+        );
+        assert_eq!(
+            p.query_read(Some("./two/a")).unwrap(),
+            PermissionState::Granted
+        );
+        assert_eq!(
+            p.query_read(Some("./three/a")).unwrap(),
+            PermissionState::Prompt
+        );
+    }
+
+    #[test]
+    fn run_path_detection_preserves_path_names_and_bare_commands() {
+        let cwd = Path::new("/options/cwd");
+        let resolve = |s: &str| {
+            if is_run_path(s) {
+                cwd.join(s).to_string_lossy().into_owned()
+            } else {
+                s.to_string()
+            }
+        };
+        assert_eq!(Path::new(&resolve("./tool")), &cwd.join("./tool"));
+        assert_eq!(Path::new(&resolve("tool/")), &cwd.join("tool/"));
+        assert_eq!(resolve("tool"), "tool");
+        assert_eq!(resolve(".tool"), ".tool");
+        #[cfg(unix)]
+        {
+            assert_eq!(resolve("tool\\name"), "tool\\name");
+        }
     }
 }

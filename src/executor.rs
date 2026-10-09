@@ -3096,7 +3096,7 @@ mod tests {
         let scheduler =
             AdmissionScheduler::new(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 1));
         let blocker = Arc::new(TaskControl::new(
-            1,
+            u64::MAX,
             ExecutionBackend::InProcess,
             Instant::now(),
             None,
@@ -3110,7 +3110,7 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner())
             .active
             .insert(blocker.id, blocker);
-        let blocker_permit = ActivePermit::new(scheduler.clone(), 1);
+        let blocker_permit = ActivePermit::new(scheduler.clone(), u64::MAX);
 
         let handle = scheduler
             .submit(
@@ -3118,9 +3118,15 @@ mod tests {
                     project_dir: PathBuf::new(),
                     backend: ExecutionBackend::Subprocess,
                     state: ExecutorBackend::Subprocess(PathBuf::new()),
-                    panic_on_execute: true,
+                    panic_on_execute: false,
                 },
-                ExecutionRequest::new(".", LibdenoOptions::default()),
+                ExecutionRequest::new(
+                    ".",
+                    LibdenoOptions {
+                        execution_deadline: Some(Duration::MAX),
+                        ..Default::default()
+                    },
+                ),
                 SubmissionOptions::default(),
             )
             .unwrap();
@@ -3152,10 +3158,14 @@ mod tests {
                     .expect("queued submission did not reach a terminal state")
             });
         let failure = result.unwrap_err();
-        assert!(matches!(
-            failure.error(),
-            ExecutionError::Internal(message) if message.contains("panicked")
-        ));
+        assert!(
+            matches!(
+                failure.error(),
+                ExecutionError::Libdeno(LibdenoError::Configuration(_))
+            ),
+            "unexpected post-promotion failure: {:?}",
+            failure.error()
+        );
         assert!(failure.report().phase_timing().queue_wait > Duration::ZERO);
     }
 

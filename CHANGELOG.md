@@ -7,6 +7,28 @@ breaking changes are highlighted per release with migration notes.
 
 ## Unreleased
 
+### Correctness and documented limits
+
+- **Execution and permission boundaries**: tightened bounded child/output/control
+  failure handling, preserved host stdio and process cwd, and kept worker module
+  reads bound to each worker's live permissions. `LibdenoOptions.cwd` remains a
+  resolution base for in-process runs, not a process-wide chdir.
+- **Resolver and lockfile correctness**: resolver stability retries are bounded
+  and stage-observable in tests; incomplete CJS analyses are not cached, failed
+  module graphs retry their failed entries, and node builtin URLs (including
+  import-map aliases) normalize to the canonical builtin identity. `deno.lock`
+  is read and checked, never written by libdeno.
+- **Blob modules**: dynamic Blob modules and Blob-backed workers use the run's
+  Blob store; a worker's captured root can finish loading after revocation
+  without restoring revoked dependencies or exposing that root to other loaders.
+- **Resolver environment invalidation**: `DENO_DIR` and the exact
+  `DENO_NO_PACKAGE_JSON=1` setting participate in resolver-input stability.
+- **Fork npm-state limitation**: serialized npm state uses deno_process's
+  private inherited state-file descriptor/handle, not Node's `NODE_CHANNEL_FD`.
+  This release has no trusted child-startup receiver to restore inherited
+  snapshots; local package/lockfile resolution is separate. See
+  [npm support](docs/npm-support.md#child_processfork).
+
 ### Added
 
 - **In-memory source API**: `run_source` / `run_source_with_output` (plus async
@@ -45,6 +67,10 @@ breaking changes are highlighted per release with migration notes.
 
 ### Changed
 
+- **npm mode selection**: respect an explicitly configured `nodeModulesDir`
+  (`manual`, `auto`, or `none`) instead of selecting BYONM merely because a
+  `node_modules` directory exists. Unconfigured projects retain libdeno's
+  managed `Auto` default.
 - **In-memory `base_dir` resolution**: a relative `base_dir` now resolves
   against the same effective cwd the path-based entry points use — `options.cwd`
   when set, otherwise the process cwd, canonicalized the same way — instead of

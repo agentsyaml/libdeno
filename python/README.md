@@ -67,21 +67,22 @@ Use a virtual environment rather than installing build tools globally:
 ```bash
 cd python
 python -m venv .venv
-.venv/bin/python -m pip install "maturin>=1.11,<2"
+. .venv/bin/activate
+python -m pip install "maturin>=1.11,<2"
 ./build-wheel.sh
-.venv/bin/python -m pip install target/wheels/*.whl
+python -m pip install target/wheels/*.whl
+cd ..
+python -m unittest discover -s python/tests -p 'test_*.py'
 ```
 
 The wheel uses the Python 3.9 stable ABI and targets Python 3.9+. The build
 script clears `RUSTC_WRAPPER`, resolves the active compiler dynamically, and
-uses Cargo's locked dependency resolution.
+uses Cargo's locked dependency resolution. The activation command above uses
+POSIX shell syntax; this build script requires Bash.
 
-Run the stdlib test suite after installing the wheel (from the repository
-root, so the source package does not shadow the installed package):
-
-```bash
-python -m unittest discover -s python/tests -p 'test_*.py'
-```
+Run the stdlib test suite after installing the wheel from the repository root,
+so the source package does not shadow the installed package. Keep the same
+virtual environment activated so `python` refers to its interpreter.
 
 ## Not supported yet
 

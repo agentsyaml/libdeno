@@ -1141,6 +1141,7 @@ pub(crate) const LIBDENO_SPAWNED_IPC: &str = "LIBDENO_SPAWNED_IPC";
 /// inherit), so a live read would make a regular host adopt a stray/foreign
 /// `NODE_CHANNEL_FD` as its IPC pipe.
 static NODE_IPC_MARKER: OnceLock<bool> = OnceLock::new();
+static NODE_IPC_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Captures the original [`LIBDENO_SPAWNED_IPC`] marker at process entry,
 /// then writes it into our own environment so `child_process.fork` children
@@ -1176,11 +1177,30 @@ pub(crate) fn node_ipc_init() -> Option<(i64, ChildIpcSerialization)> {
     if !NODE_IPC_MARKER.get().copied().unwrap_or(false) {
         return None;
     }
-    let fd = parse_node_channel_fd(&std::env::var("NODE_CHANNEL_FD").ok()?)?;
-    let serialization = match std::env::var("NODE_CHANNEL_SERIALIZATION_MODE").as_deref() {
-        Ok("advanced") => ChildIpcSerialization::Advanced,
-        _ => ChildIpcSerialization::Json,
+    let fd = std::env::var("NODE_CHANNEL_FD").ok()?;
+    let mode = std::env::var("NODE_CHANNEL_SERIALIZATION_MODE").ok();
+    claim_node_ipc(&NODE_IPC_CLAIMED, &fd, mode.as_deref())
+}
+
+fn claim_node_ipc(
+    claimed: &std::sync::atomic::AtomicBool,
+    raw_fd: &str,
+    mode: Option<&str>,
+) -> Option<(i64, ChildIpcSerialization)> {
+    let fd = parse_node_channel_fd(raw_fd)?;
+    let serialization = if mode == Some("advanced") {
+        ChildIpcSerialization::Advanced
+    } else {
+        ChildIpcSerialization::Json
     };
+    claimed
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .ok()?;
     Some((fd, serialization))
 }
 
@@ -2137,30 +2157,47 @@ mod tests {
 
     #[test]
     fn node_ipc_requires_paired_spawn_marker() {
-        // P2 security: NODE_CHANNEL_FD alone must NOT enable IPC — only the
-        // LIBDENO_SPAWNED_IPC marker captured at process entry does. Env vars
-        // are process-global, but no other unit test in this binary touches
-        // these names or the marker, so the sequencing below is race-free.
-        std::env::set_var("NODE_CHANNEL_FD", "10");
-        // Marker not yet captured: a stray FD from some other spawner is ignored.
-        assert!(node_ipc_init().is_none());
-        // The spawned side captures the marker; the same FD is now honored.
-        std::env::set_var("LIBDENO_SPAWNED_IPC", "1");
-        capture_spawned_ipc_marker();
-        assert_eq!(node_ipc_init().map(|(fd, _)| fd), Some(10));
-        assert!(matches!(
-            node_ipc_init(),
+        let claimed = std::sync::atomic::AtomicBool::new(false);
+        // Unmarked callers do not invoke claim_node_ipc; invalid paired input
+        // is rejected without consuming the one-time ownership transfer.
+        assert!(claim_node_ipc(&claimed, "not-a-fd", None).is_none());
+        assert!(!claimed.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            claim_node_ipc(&claimed, "10", None),
             Some((10, ChildIpcSerialization::Json))
-        ));
-        // Advanced serialization mode is propagated.
-        std::env::set_var("NODE_CHANNEL_SERIALIZATION_MODE", "advanced");
-        assert!(matches!(
-            node_ipc_init(),
+        );
+        assert!(claim_node_ipc(&claimed, "10", None).is_none());
+    }
+
+    #[test]
+    fn node_ipc_claim_validates_before_consuming_and_propagates_serialization() {
+        let claimed = std::sync::atomic::AtomicBool::new(false);
+        assert!(claim_node_ipc(&claimed, "bad", None).is_none());
+        assert!(!claimed.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            claim_node_ipc(&claimed, "10", Some("advanced")),
             Some((10, ChildIpcSerialization::Advanced))
-        ));
-        // A non-numeric FD is rejected, never adopted.
-        std::env::set_var("NODE_CHANNEL_FD", "not-a-fd");
-        assert!(node_ipc_init().is_none());
+        );
+        assert!(claim_node_ipc(&claimed, "11", None).is_none());
+    }
+
+    #[test]
+    fn node_ipc_claim_is_concurrent_once_only() {
+        let claimed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let claimed = claimed.clone();
+                std::thread::spawn(move || claim_node_ipc(&claimed, "10", None).is_some())
+            })
+            .collect();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|won| *won)
+                .count(),
+            1
+        );
     }
 
     #[test]

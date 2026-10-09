@@ -154,8 +154,13 @@ fn build_web_worker_factory(
         // at hand, so this stays infallible. `with_graph_loader` also allocates
         // a fresh CodeOnly ModuleGraph, keeping already-loaded main/parent
         // modules from bypassing this worker's graph-loader permission check.
+        let worker_file_fetcher = runtime.worker_file_fetcher(
+            args.maybe_main_module_blob
+                .clone()
+                .map(|blob| (args.main_module.clone(), blob)),
+        );
         let worker_graph_loader = Arc::new(deno_resolver::file_fetcher::DenoGraphLoader::new(
-            runtime.file_fetcher.clone(),
+            worker_file_fetcher.clone(),
             runtime.shared.global_http_cache.clone(),
             in_npm_pkg_checker.clone(),
             runtime.shared.sys.clone(),
@@ -171,6 +176,7 @@ fn build_web_worker_factory(
             Rc::new(GraphModuleLoader::with_graph_loader(
                 runtime.clone(),
                 worker_permissions.clone(),
+                worker_file_fetcher,
                 worker_graph_loader,
             ));
         let node_require_loader: deno_runtime::deno_node::NodeRequireLoaderRc = Rc::new(
@@ -236,7 +242,7 @@ fn build_web_worker_factory(
                 trace_ops: None,
                 close_on_idle: args.close_on_idle,
                 maybe_worker_metadata: args.maybe_worker_metadata,
-                maybe_main_module_blob: None,
+                maybe_main_module_blob: args.maybe_main_module_blob,
                 maybe_coverage_dir: None,
                 maybe_cpu_prof_config: None,
                 enable_raw_imports: false,

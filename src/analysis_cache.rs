@@ -212,6 +212,12 @@ impl deno_resolver::cjs::analyzer::NodeAnalysisCache for MemoryNodeAnalysisCache
         source_hash: NodeAnalysisCacheSourceHash,
         analysis: &DenoCjsAnalysis,
     ) {
+        // `Esm` is produced by SourceOnly mode and lacks exports. The cache
+        // trait has no mode key, so retaining it could poison a later richer
+        // SourceImportsAndExports analysis for the same source.
+        if matches!(analysis, DenoCjsAnalysis::Esm) {
+            return;
+        }
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if entries.len() >= cache_capacity() {
             entries.clear();
@@ -222,3 +228,46 @@ impl deno_resolver::cjs::analyzer::NodeAnalysisCache for MemoryNodeAnalysisCache
 
 use deno_resolver::cjs::analyzer::DenoCjsAnalysis;
 use deno_resolver::cjs::analyzer::NodeAnalysisCacheSourceHash;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deno_resolver::cjs::analyzer::ModuleExportsAndReExports;
+    use deno_resolver::cjs::analyzer::NodeAnalysisCache;
+
+    #[test]
+    fn does_not_cache_incomplete_esm_analysis() {
+        let cache = MemoryNodeAnalysisCache::new();
+        let specifier = ModuleSpecifier::parse("file:///mod.js").unwrap();
+        let source = "export const value = 1;";
+        let hash = cache.compute_source_hash(source);
+
+        cache.set_cjs_analysis(&specifier, hash, &DenoCjsAnalysis::Esm);
+
+        assert!(cache.get_cjs_analysis(&specifier, hash).is_none());
+    }
+
+    #[test]
+    fn caches_complete_analyses_with_the_original_hash() {
+        let cache = MemoryNodeAnalysisCache::new();
+        let specifier = ModuleSpecifier::parse("file:///mod.js").unwrap();
+        let source = "export const value = 1;";
+        let hash = cache.compute_source_hash(source);
+        let analysis = ModuleExportsAndReExports {
+            exports: vec!["value".to_string()],
+            reexports: vec!["./other.js".to_string()],
+            member_reexports: vec![],
+        };
+
+        for expected in [
+            DenoCjsAnalysis::Cjs(analysis.clone()),
+            DenoCjsAnalysis::EsmAnalysis(analysis.clone()),
+        ] {
+            cache.set_cjs_analysis(&specifier, hash, &expected);
+            assert_eq!(cache.get_cjs_analysis(&specifier, hash), Some(expected));
+        }
+        assert!(cache
+            .get_cjs_analysis(&specifier, cache.compute_source_hash("changed"))
+            .is_none());
+    }
+}

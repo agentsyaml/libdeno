@@ -218,7 +218,11 @@ impl EntrySource {
 /// per run — set `options.cwd` to pin the base explicitly if the host changes
 /// the process cwd concurrently.
 pub(crate) fn effective_cwd(options: &LibdenoOptions) -> Result<PathBuf, LibdenoError> {
-    let raw = options.cwd.clone().unwrap_or(std::env::current_dir()?);
+    let raw = match options.cwd.as_deref() {
+        Some(cwd) if cwd.is_absolute() => cwd.to_path_buf(),
+        Some(cwd) => std::env::current_dir()?.join(cwd),
+        None => std::env::current_dir()?,
+    };
     Ok(std::fs::canonicalize(&raw).unwrap_or(raw))
 }
 
@@ -1329,6 +1333,53 @@ mod tests {
             std::env::temp_dir().join(format!("libdeno-test-{}-{}", std::process::id(), name));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_options_cwd_works_after_host_cwd_is_deleted() {
+        const CHILD_ROOT_ENV: &str = "LIBDENO_TEST_ABSOLUTE_CWD_CHILD_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT_ENV).map(PathBuf::from) else {
+            let root = temp_dir(&format!("absolute-cwd-child-{}", std::process::id()));
+            let valid = root.join("valid");
+            let removed = root.join("removed");
+            std::fs::create_dir_all(&valid).unwrap();
+            std::fs::create_dir_all(&removed).unwrap();
+            let root = std::fs::canonicalize(&root).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::absolute_options_cwd_works_after_host_cwd_is_deleted",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ROOT_ENV, &root)
+                .output();
+            let _ = std::fs::remove_dir_all(&root);
+            let output = result.expect("could not launch isolated cwd test");
+            assert!(
+                output.status.success(),
+                "isolated cwd test failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("1 passed"),
+                "child test did not run: {stdout}"
+            );
+            return;
+        };
+
+        let removed = root.join("removed");
+        std::env::set_current_dir(&removed).unwrap();
+        std::fs::remove_dir(&removed).unwrap();
+        assert!(std::env::current_dir().is_err());
+        let valid = std::fs::canonicalize(root.join("valid")).unwrap();
+        let options = LibdenoOptions {
+            cwd: Some(valid.clone()),
+            ..Default::default()
+        };
+        assert_eq!(effective_cwd(&options).unwrap(), valid);
     }
 
     #[test]
