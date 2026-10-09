@@ -242,7 +242,14 @@ impl ModuleLoader for GraphModuleLoader {
                 Self::validate_node_builtin_identity(&specifier)?;
                 return Ok(());
             }
-            build_graph(&services, &graph_loader, &graph, &specifier, &timing).await
+            build_graph(
+                &services,
+                graph_loader.as_ref(),
+                &graph,
+                &specifier,
+                &timing,
+            )
+            .await
         })
     }
 
@@ -398,7 +405,7 @@ impl ModuleLoader for GraphModuleLoader {
 /// Builds (or extends) the per-run module graph rooted at `specifier`.
 async fn build_graph(
     shared: &SharedServices,
-    graph_loader: &RealGraphLoader,
+    graph_loader: &dyn deno_graph::source::Loader,
     graph: &tokio::sync::Mutex<ModuleGraph>,
     specifier: &ModuleSpecifier,
     timing: &ExecutionTiming,
@@ -494,6 +501,10 @@ async fn build_graph(
                 .filter(|url| url == specifier),
         );
     }
+    retry = retry
+        .into_iter()
+        .map(|url| graph.resolve(&url).clone())
+        .collect();
     retry.sort();
     retry.dedup();
     if retry
@@ -566,6 +577,122 @@ fn module_type_from_media_and_requested_type(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deno_graph::source::{LoadError, LoadFuture, LoadOptions, LoadResponse, Loader};
+    use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    struct TestDir(std::path::PathBuf);
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    struct CountingLoader {
+        a: ModuleSpecifier,
+        b: ModuleSpecifier,
+        sibling: ModuleSpecifier,
+        requests: RefCell<Vec<ModuleSpecifier>>,
+        b_calls: Cell<usize>,
+    }
+    impl Loader for CountingLoader {
+        fn load(&self, specifier: &ModuleSpecifier, _options: LoadOptions) -> LoadFuture {
+            self.requests.borrow_mut().push(specifier.clone());
+            if specifier == &self.a {
+                return Box::pin(std::future::ready(Ok(Some(LoadResponse::Redirect {
+                    specifier: self.b.clone(),
+                }))));
+            }
+            let content = if specifier == &self.b {
+                self.b_calls.set(self.b_calls.get() + 1);
+                if self.b_calls.get() == 1 {
+                    return Box::pin(std::future::ready(Err(LoadError::Other(Arc::new(
+                        JsErrorBox::generic("controlled first failure"),
+                    )))));
+                }
+                b"export const retryValue = 42;".as_slice()
+            } else if specifier == &self.sibling {
+                b"export const sibling = 1;".as_slice()
+            } else {
+                return Box::pin(std::future::ready(Err(LoadError::Other(Arc::new(
+                    JsErrorBox::generic(format!("unexpected loader request: {specifier}")),
+                )))));
+            };
+            Box::pin(std::future::ready(Ok(Some(LoadResponse::Module {
+                content: Arc::from(content),
+                mtime: None,
+                maybe_headers: None,
+                specifier: specifier.clone(),
+            }))))
+        }
+    }
+
+    #[test]
+    fn retry_reload_resolves_redirect_before_deduplicating_and_preserves_sibling() {
+        let _semantic = crate::npm_cache::semantic_probe_test_lock().lock().unwrap();
+        let _resolver_env = crate::npm_cache::resolver_env_test_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "libdeno-retry-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("deno.json"), r#"{"lock":false}"#).unwrap();
+        let dir = TestDir(path);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cwd = dir.0.clone();
+        let shared = runtime
+            .block_on(crate::services::SharedServices::new(cwd.clone(), vec![cwd]))
+            .unwrap();
+        assert!(shared.lockfile.is_none());
+        let [sibling, a, b] = ["s.js", "a.js", "b.js"]
+            .map(|path| ModuleSpecifier::parse(&format!("http://127.0.0.1/{path}")).unwrap());
+        let loader = CountingLoader {
+            a: a.clone(),
+            b: b.clone(),
+            sibling: sibling.clone(),
+            requests: RefCell::new(Vec::new()),
+            b_calls: Cell::new(0),
+        };
+        let g = tokio::sync::Mutex::new(ModuleGraph::new(GraphKind::CodeOnly));
+        let t = ExecutionTiming::disabled();
+        runtime
+            .block_on(build_graph(&shared, &loader, &g, &sibling, &t))
+            .unwrap();
+        assert!(runtime
+            .block_on(build_graph(&shared, &loader, &g, &a, &t))
+            .is_err());
+        runtime.block_on(async {
+            let graph = g.lock().await;
+            assert_eq!(graph.resolve(&a), &b);
+            assert!(graph
+                .walk(
+                    std::iter::once(&a),
+                    WalkOptions {
+                        check_js: CheckJsOption::True,
+                        kind: GraphKind::CodeOnly,
+                        follow_dynamic: false,
+                        prefer_fast_check_graph: false
+                    }
+                )
+                .any(|(_, entry)| matches!(entry, ModuleEntryRef::Err(_))));
+        });
+        runtime
+            .block_on(build_graph(&shared, &loader, &g, &a, &t))
+            .unwrap();
+        runtime.block_on(async {
+            let graph = g.lock().await;
+            assert!(graph.get(&a).is_some() && graph.get(&b).is_some());
+            validate_root(&graph, &a).unwrap();
+            assert!(graph.get(&sibling).is_some());
+            assert_eq!(loader.requests.into_inner(), vec![sibling, a, b.clone(), b]);
+        });
+    }
 
     #[test]
     fn module_type_maps_media_and_requested_type() {

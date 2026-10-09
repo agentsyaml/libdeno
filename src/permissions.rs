@@ -107,28 +107,36 @@ pub fn build_permissions(
         };
         // read/write/ffi take filesystem paths; resolve relative ones against
         // `cwd` so the permission scope tracks LibdenoOptions.cwd, not process cwd.
-        let paths = |specs: Vec<String>| -> Vec<String> {
+        let paths = |specs: Vec<String>| -> Result<Vec<String>, LibdenoError> {
             specs
                 .into_iter()
                 .map(|s| {
                     let p = Path::new(&s);
                     if p.is_absolute() {
-                        s
+                        Ok(s)
                     } else {
-                        cwd.join(p).to_string_lossy().into_owned()
+                        cwd.join(p).into_os_string().into_string().map_err(|_| {
+                            LibdenoError::Permission(
+                                "filesystem permission path is not valid UTF-8".to_string(),
+                            )
+                        })
                     }
                 })
                 .collect()
         };
-        let run_paths = |specs: Vec<String>| -> Vec<String> {
+        let run_paths = |specs: Vec<String>| -> Result<Vec<String>, LibdenoError> {
             specs
                 .into_iter()
                 .map(|s| {
                     let path = Path::new(&s);
                     if !is_run_path(&s) {
-                        s
+                        Ok(s)
                     } else {
-                        cwd.join(path).to_string_lossy().into_owned()
+                        cwd.join(path).into_os_string().into_string().map_err(|_| {
+                            LibdenoError::Permission(
+                                "run permission path is not valid UTF-8".to_string(),
+                            )
+                        })
                     }
                 })
                 .collect()
@@ -149,11 +157,11 @@ pub fn build_permissions(
         match flag {
             "--allow-read" => {
                 has_allow = true;
-                extend(&mut opts.allow_read, paths(specs));
+                extend(&mut opts.allow_read, paths(specs)?);
             }
             "--allow-write" => {
                 has_allow = true;
-                extend(&mut opts.allow_write, paths(specs));
+                extend(&mut opts.allow_write, paths(specs)?);
             }
             "--allow-env" => {
                 has_allow = true;
@@ -165,11 +173,11 @@ pub fn build_permissions(
             }
             "--allow-run" => {
                 has_allow = true;
-                extend(&mut opts.allow_run, run_paths(specs));
+                extend(&mut opts.allow_run, run_paths(specs)?);
             }
             "--allow-ffi" => {
                 has_allow = true;
-                extend(&mut opts.allow_ffi, paths(specs));
+                extend(&mut opts.allow_ffi, paths(specs)?);
             }
             "--allow-sys" => {
                 has_allow = true;
@@ -567,6 +575,27 @@ mod tests {
         #[cfg(unix)]
         {
             assert_eq!(resolve("tool\\name"), "tool\\name");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_cwd_rejects_relative_path_grants() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let cwd = Path::new("/options").join(std::ffi::OsString::from_vec(vec![0xff]));
+        for flag in [
+            "--allow-run=./tool",
+            "--allow-read=./tool",
+            "--allow-write=./tool",
+            "--allow-ffi=./tool",
+        ] {
+            let args = vec![flag.to_string()];
+            let err = build_permissions(&args, false, false, parser(), &cwd).unwrap_err();
+            assert!(
+                matches!(err, LibdenoError::Permission(_)),
+                "expected permission error for {flag}, got {err:?}"
+            );
         }
     }
 }

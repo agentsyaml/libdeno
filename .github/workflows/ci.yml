@@ -65,5 +65,18 @@ jobs:
       - name: Check npm-disabled + execution-control feature set
         run: cargo check --all-targets --no-default-features --features snapshot,execution-control,phase-diagnostics --locked
 
+      # ponytail: reclaim this crate's accumulated feature artifacts and serialize
+      # large links to reduce cumulative artifact/concurrent-link pressure.
+      - name: Prepare npm-disabled feature test
+        run: |
+          df -h .
+          df -i .
+          free -h
+          cargo clean -p libdeno
+          df -h .
+          df -i .
+
       - name: Test npm-disabled feature set
         run: cargo test --no-default-features --features snapshot --lib --test smoke --test runtime --test async_api --locked
+        env:
+          CARGO_BUILD_JOBS: 1

@@ -54,6 +54,11 @@ pub struct RunOutput {
 }
 ```
 
+If in-process capture does not observe EOF or reader disconnection within its
+500ms collection budget, the run returns `LibdenoError::Io` with
+`std::io::ErrorKind::TimedOut` and an `output capture incomplete` message rather
+than returning partial output as a success.
+
 Like `run`, but captures the script's stdout/stderr into `RunOutput` when
 `LibdenoOptions.capture_stdout` / `capture_stderr` are set. The capture is
 fd-level (deno_core's print op has no injectable writer), so `console.log`,

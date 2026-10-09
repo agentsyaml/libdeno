@@ -387,7 +387,7 @@ impl StreamCapture {
     /// loop) may hold the pipe write end open after the run, and EOF would
     /// never arrive — a daemonized child would hang the host forever. Linux
     /// closes the pipe in the exec'd child via CLOEXEC; macOS needs the
-    /// timeout, which returns whatever was captured so far. The budget is
+    /// timeout, which reports an incomplete capture. The budget is
     /// total, not per-block: a child that *keeps writing* (a logging daemon)
     /// would otherwise reset the idle timer on every block and stall the
     /// caller forever. A child that never exits also leaves the detached
@@ -446,17 +446,26 @@ fn collect_blocks_until(
     let mut out = Vec::new();
     loop {
         if std::time::Instant::now() >= deadline {
-            break;
+            return Err(capture_incomplete_error());
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         match rx.recv_timeout(remaining) {
             Ok(Ok(block)) => out.extend_from_slice(&block),
             Ok(Err(error)) => return Err(error),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(capture_incomplete_error());
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     Ok((out, overflow.load(std::sync::atomic::Ordering::Relaxed)))
+}
+
+fn capture_incomplete_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "output capture incomplete: collection deadline expired before EOF",
+    )
 }
 
 impl Drop for StreamCapture {
@@ -503,15 +512,56 @@ mod tests {
     }
 
     #[test]
-    fn expired_collection_deadline_leaves_queued_data_pending() {
+    fn expired_collection_deadline_with_queued_data_is_timed_out() {
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Ok(b"pending".to_vec())).unwrap();
         let overflow = std::sync::atomic::AtomicBool::new(false);
-        let (bytes, truncated) =
-            collect_blocks_until(&rx, &overflow, std::time::Instant::now()).unwrap();
+        let error = collect_blocks_until(&rx, &overflow, std::time::Instant::now()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("output capture incomplete"));
+        assert_eq!(rx.try_recv().unwrap().unwrap(), b"pending");
+    }
+
+    #[test]
+    fn empty_reader_times_out_before_eof() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let overflow = std::sync::atomic::AtomicBool::new(false);
+        let error = collect_blocks_until(
+            &rx,
+            &overflow,
+            std::time::Instant::now() + std::time::Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        drop(tx);
+    }
+
+    #[test]
+    fn reader_error_propagates_even_when_queued() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "synthetic capture read failure",
+        )))
+        .unwrap();
+        let overflow = std::sync::atomic::AtomicBool::new(false);
+        let error = collect_blocks_until(
+            &rx,
+            &overflow,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn disconnected_reader_completes_normally() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        let overflow = std::sync::atomic::AtomicBool::new(false);
+        let (bytes, truncated) = collect_blocks(&rx, &overflow).unwrap();
         assert!(bytes.is_empty());
         assert!(!truncated);
-        assert_eq!(rx.try_recv().unwrap().unwrap(), b"pending");
     }
 
     #[test]
