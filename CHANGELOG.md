@@ -7,6 +7,8 @@ breaking changes are highlighted per release with migration notes.
 
 ## Unreleased
 
+## 0.3.3
+
 ### Correctness and documented limits
 
 - **Execution and permission boundaries**: tightened bounded child/output/control
@@ -101,6 +103,21 @@ breaking changes are highlighted per release with migration notes.
   building with `default-features = false` must now add `"npm"` to their
   feature list to keep `npm:` install support; without it, `npm:` imports
   fail with a clear error at graph build time.
+
+### Fixed
+
+- Relative filesystem permission grants now fail closed if resolving them
+  against a non-UTF-8 working directory cannot produce a valid UTF-8 path.
+- Output capture returns a timed-out I/O error rather than reporting success
+  with partial bytes when its collection budget expires before EOF.
+- Module-graph retries canonicalize redirected specifiers before
+  deduplication, preserving successful sibling modules while retrying failures.
+
+### CI
+
+- The npm-disabled CI test cleans this crate's accumulated build artifacts and
+  runs with one Cargo build job to reduce disk and concurrent-link pressure;
+  this mitigation does not guarantee against resource-related linker failures.
 
 ## 0.3.2
 
