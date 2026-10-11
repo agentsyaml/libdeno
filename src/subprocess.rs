@@ -2474,11 +2474,31 @@ fn start_supervisor_child_control(
     cancellation: SupervisorCancellation,
     stop_rx: mpsc::Receiver<()>,
 ) -> Result<std::thread::JoinHandle<std::io::Result<()>>, LibdenoError> {
+    #[cfg(test)]
+    {
+        start_supervisor_child_control_inner(stream, request_id, cancellation, stop_rx, None)
+    }
+    #[cfg(not(test))]
+    {
+        start_supervisor_child_control_inner(stream, request_id, cancellation, stop_rx)
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn start_supervisor_child_control_inner(
+    stream: &TcpStream,
+    request_id: u64,
+    cancellation: SupervisorCancellation,
+    stop_rx: mpsc::Receiver<()>,
+    #[cfg(test)] idle_event: Option<mpsc::Sender<()>>,
+) -> Result<std::thread::JoinHandle<std::io::Result<()>>, LibdenoError> {
     let mut stream = stream.try_clone().map_err(LibdenoError::Io)?;
     std::thread::Builder::new()
         .name("libdeno-supervisor-child-control".to_string())
         .spawn(move || {
             let result = (|| {
+                #[cfg(test)]
+                let mut idle_event_pending = false;
                 #[cfg(not(target_vendor = "apple"))]
                 stream.set_read_timeout(Some(Duration::from_millis(100)))?;
                 loop {
@@ -2492,11 +2512,17 @@ fn start_supervisor_child_control(
                         None,
                     ) {
                         Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                            #[cfg(test)]
+                            notify_supervisor_child_idle(&idle_event, &mut idle_event_pending);
+                            continue;
+                        }
                         Err(error) => return Err(error),
                     }
                     #[cfg(not(target_vendor = "apple"))]
                     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+                    #[cfg(test)]
+                    notify_supervisor_child_idle(&idle_event, &mut idle_event_pending);
                     let mut first_byte = [0u8; 1];
                     match stream.peek(&mut first_byte) {
                         Ok(0) => {
@@ -2538,6 +2564,10 @@ fn start_supervisor_child_control(
                         ));
                     }
                     cancellation.request(reason);
+                    #[cfg(test)]
+                    {
+                        idle_event_pending = idle_event.is_some();
+                    }
                 }
             })();
             if result.is_err() {
@@ -2546,6 +2576,33 @@ fn start_supervisor_child_control(
             result
         })
         .map_err(LibdenoError::Io)
+}
+
+#[cfg(all(test, feature = "execution-control"))]
+fn notify_supervisor_child_idle(idle_event: &Option<mpsc::Sender<()>>, pending: &mut bool) {
+    if *pending {
+        if let Some(event) = idle_event {
+            let _ = event.send(());
+        }
+        *pending = false;
+    }
+}
+
+#[cfg(all(test, feature = "execution-control"))]
+fn start_supervisor_child_control_observed(
+    stream: &TcpStream,
+    request_id: u64,
+    cancellation: SupervisorCancellation,
+    stop_rx: mpsc::Receiver<()>,
+    idle_event: mpsc::Sender<()>,
+) -> Result<std::thread::JoinHandle<std::io::Result<()>>, LibdenoError> {
+    start_supervisor_child_control_inner(
+        stream,
+        request_id,
+        cancellation,
+        stop_rx,
+        Some(idle_event),
+    )
 }
 
 #[cfg(feature = "execution-control")]
@@ -2793,8 +2850,9 @@ mod tests {
     };
     #[cfg(feature = "execution-control")]
     use super::{
-        read_supervisor_terminal, start_supervisor_child_control, SupervisorCancellation,
-        SupervisorParentSession, SupervisorTerminalReadContext,
+        read_supervisor_terminal, start_supervisor_child_control,
+        start_supervisor_child_control_observed, SupervisorCancellation, SupervisorParentSession,
+        SupervisorTerminalReadContext,
     };
     #[cfg(feature = "execution-control")]
     use crate::supervisor::{
@@ -3652,9 +3710,15 @@ mod tests {
             CancelReason::User,
         );
         let (stop_tx, stop_rx) = mpsc::channel();
-        let control =
-            start_supervisor_child_control(&receiver, request_id, cancellation.clone(), stop_rx)
-                .unwrap();
+        let (idle_tx, idle_rx) = mpsc::channel();
+        let control = start_supervisor_child_control_observed(
+            &receiver,
+            request_id,
+            cancellation.clone(),
+            stop_rx,
+            idle_tx,
+        )
+        .unwrap();
 
         let frame = SupervisorFrame::new(
             FrameKind::Cancel,
@@ -3683,24 +3747,9 @@ mod tests {
         }
         assert!(cancellation.is_requested(), "CANCEL was not received");
         assert_eq!(cancellation.reason(), CancelReason::Deadline);
-
-        #[cfg(not(target_vendor = "apple"))]
-        let deadline = Instant::now() + Duration::from_secs(1);
-        #[cfg(not(target_vendor = "apple"))]
-        loop {
-            if receiver
-                .read_timeout()
-                .unwrap()
-                .is_some_and(|timeout| timeout <= Duration::from_millis(100))
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "child control socket did not return to the idle poll timeout"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        idle_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("child control did not enter its idle-read state after CANCEL");
 
         let stopped_at = Instant::now();
         stop_tx.send(()).unwrap();

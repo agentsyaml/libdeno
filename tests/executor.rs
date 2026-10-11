@@ -921,18 +921,39 @@ mod execution_control {
         let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = temp_dir("control-supervised-request-timeout-capture");
         let entry = dir.join("main.js");
-        let started = dir.join("started");
+        let holding = dir.join("holding");
+        let descendant_pid = dir.join("descendant.pid");
+        let _ = fs::remove_file(&holding);
+        let _ = fs::remove_file(&descendant_pid);
         fs::write(
             &entry,
             format!(
-                "Deno.writeTextFileSync({started:?}, 'started');\n\
-                 await new Promise((resolve) => setTimeout(resolve, 700));\n\
-                 console.log('request-timeout-prefix');\n\
-                 new Deno.Command('/bin/sh', {{ args: ['-c', 'sleep 1 &'], stdout: 'inherit', stderr: 'null' }}).outputSync();\n\
-                 Deno.exit(0);"
+                r#"console.log('request-timeout-prefix');
+                   new Deno.Command('/bin/sh', {{ args: ['-c', 'sleep 30 & echo $! > "$1"', 'sh', {descendant_pid:?}], stdout: 'inherit', stderr: 'null' }}).outputSync();
+                   Deno.writeTextFileSync({holding:?}, 'holding');
+                   await new Promise((resolve) => setTimeout(resolve, 30000));
+                   Deno.exit(0);"#
             ),
         )
         .unwrap();
+        struct DescendantCleanup(PathBuf);
+        impl Drop for DescendantCleanup {
+            fn drop(&mut self) {
+                if let Ok(pid) = fs::read_to_string(&self.0) {
+                    if let Ok(pid) = pid.trim().parse::<u32>() {
+                        if pid > 1 && pid != std::process::id() {
+                            let _ = Command::new("/bin/kill")
+                                .arg("-TERM")
+                                .arg(pid.to_string())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .status();
+                        }
+                    }
+                }
+            }
+        }
+        let descendant_cleanup = DescendantCleanup(descendant_pid.clone());
         let executor = build(
             Executor::builder(&dir)
                 .backend(ExecutionBackend::Subprocess)
@@ -948,10 +969,20 @@ mod execution_control {
                         ..allow_all()
                     },
                 ),
-                SubmissionOptions::new(Some(Duration::from_millis(1200))),
+                SubmissionOptions::new(Some(Duration::from_secs(5))),
             )
             .unwrap();
-        wait_for(&started);
+        // The marker proves the prefix was written and the descendant is
+        // holding the inherited pipe while a referenced JS timer keeps the
+        // main isolate alive until the request deadline.
+        wait_for(&holding);
+        let pid = fs::read_to_string(&descendant_pid).unwrap();
+        assert!(
+            pid.trim()
+                .parse::<u32>()
+                .is_ok_and(|pid| pid > 1 && pid != std::process::id()),
+            "invalid descendant PID: {pid}"
+        );
 
         let failure = runtime().block_on(handle.result()).unwrap_err();
         assert!(matches!(
@@ -969,6 +1000,7 @@ mod execution_control {
             failure.report().transport_status(),
             Some(ExecutionTransportStatus::Failed)
         );
+        drop(descendant_cleanup);
         let _ = fs::remove_dir_all(dir);
     }
 
