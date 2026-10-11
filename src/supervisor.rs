@@ -5,6 +5,8 @@ use std::fmt;
 use std::io::{self, Read};
 use std::net::TcpStream;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -295,13 +297,59 @@ fn check_write_conditions(
             "supervisor cancellation requested",
         ));
     }
-    if deadline.is_some_and(|at| at <= Instant::now()) {
+    if deadline.is_some_and(|at| at <= frame_write_now()) {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "supervisor frame deadline exceeded",
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+const NO_FRAME_WRITE_CLOCK_ADVANCE: u64 = u64::MAX;
+
+#[cfg(test)]
+struct FrameWriteTestClock {
+    origin: Instant,
+    elapsed_ms: AtomicU64,
+    advance_after_next_payload_send_to_ms: AtomicU64,
+}
+
+#[cfg(test)]
+impl FrameWriteTestClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            elapsed_ms: AtomicU64::new(0),
+            advance_after_next_payload_send_to_ms: AtomicU64::new(NO_FRAME_WRITE_CLOCK_ADVANCE),
+        }
+    }
+
+    fn now(&self) -> Instant {
+        self.origin + Duration::from_millis(self.elapsed_ms.load(Ordering::SeqCst))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FRAME_WRITE_TEST_CLOCK: std::cell::RefCell<Option<Arc<FrameWriteTestClock>>> = const { std::cell::RefCell::new(None) };
+    static FRAME_WRITE_TEST_WOULDBLOCK_GATE: std::cell::RefCell<Option<std::sync::mpsc::Receiver<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn frame_write_now() -> Instant {
+    FRAME_WRITE_TEST_CLOCK.with(|clock| {
+        clock
+            .borrow()
+            .as_ref()
+            .map_or_else(Instant::now, |clock| clock.now())
+    })
+}
+
+#[cfg(not(test))]
+fn frame_write_now() -> Instant {
+    Instant::now()
 }
 
 #[cfg(test)]
@@ -337,6 +385,25 @@ fn observe_frame_write(event: FrameWriteTestEvent) {
             let _ = sender.send(event);
         }
     });
+    if matches!(event, FrameWriteTestEvent::PayloadSend { .. }) {
+        FRAME_WRITE_TEST_CLOCK.with(|clock| {
+            if let Some(clock) = clock.borrow().as_ref() {
+                let advance = clock
+                    .advance_after_next_payload_send_to_ms
+                    .swap(NO_FRAME_WRITE_CLOCK_ADVANCE, Ordering::SeqCst);
+                if advance != NO_FRAME_WRITE_CLOCK_ADVANCE {
+                    clock.elapsed_ms.store(advance, Ordering::SeqCst);
+                }
+            }
+        });
+    }
+    if matches!(event, FrameWriteTestEvent::WouldBlock { .. }) {
+        FRAME_WRITE_TEST_WOULDBLOCK_GATE.with(|gate| {
+            if let Some(gate) = gate.borrow().as_ref() {
+                let _ = gate.recv_timeout(Duration::from_secs(5));
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -397,7 +464,7 @@ fn write_until(
                 observe_frame_write(FrameWriteTestEvent::PayloadSend {
                     offset,
                     count: sent,
-                    at: Instant::now(),
+                    at: frame_write_now(),
                 });
             }
             offset += sent;
@@ -419,7 +486,7 @@ fn write_until(
             if payload {
                 observe_frame_write(FrameWriteTestEvent::WouldBlock {
                     offset,
-                    at: Instant::now(),
+                    at: frame_write_now(),
                 });
             }
             poll_writable(stream, deadline, cancellation)?;
@@ -444,7 +511,7 @@ fn poll_writable(
 
     loop {
         check_write_conditions(deadline, cancellation)?;
-        let remaining = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+        let remaining = deadline.map(|at| at.saturating_duration_since(frame_write_now()));
         let wait = match (remaining, cancellation.is_some()) {
             (Some(remaining), true) => Some(remaining.min(Duration::from_millis(10))),
             (Some(remaining), false) => Some(remaining),
@@ -561,7 +628,7 @@ fn write_until(
                 if payload {
                     observe_frame_write(FrameWriteTestEvent::WouldBlock {
                         offset,
-                        at: Instant::now(),
+                        at: frame_write_now(),
                     });
                 }
             } else {
@@ -574,7 +641,7 @@ fn write_until(
                     if payload {
                         observe_frame_write(FrameWriteTestEvent::WouldBlock {
                             offset,
-                            at: Instant::now(),
+                            at: frame_write_now(),
                         });
                     }
                     poll_socket_writable(socket, deadline, cancellation)?;
@@ -592,7 +659,7 @@ fn write_until(
                 break None;
             }
             let timeout = match (
-                deadline.map(|at| at.saturating_duration_since(Instant::now())),
+                deadline.map(|at| at.saturating_duration_since(frame_write_now())),
                 cancellation.is_some(),
             ) {
                 (Some(remaining), true) => Some(remaining.min(Duration::from_millis(10))),
@@ -645,7 +712,7 @@ fn write_until(
             observe_frame_write(FrameWriteTestEvent::PayloadSend {
                 offset: offset - transferred,
                 count: transferred,
-                at: Instant::now(),
+                at: frame_write_now(),
             });
         }
         check_write_conditions(deadline, cancellation)?;
@@ -706,7 +773,7 @@ fn poll_socket_writable(
 
     loop {
         check_write_conditions(deadline, cancellation)?;
-        let remaining = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+        let remaining = deadline.map(|at| at.saturating_duration_since(frame_write_now()));
         let timeout = match (remaining, cancellation.is_some()) {
             (Some(remaining), true) => Some(remaining.min(Duration::from_millis(10))),
             (Some(remaining), false) => Some(remaining),
@@ -1603,6 +1670,30 @@ mod tests {
         FRAME_WRITE_TEST_EVENTS.with(|events| events.borrow_mut().take().unwrap_or_default())
     }
 
+    fn with_frame_write_test_clock<T>(
+        clock: Arc<FrameWriteTestClock>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        let previous = FRAME_WRITE_TEST_CLOCK.with(|current| current.replace(Some(clock)));
+        let result = run();
+        FRAME_WRITE_TEST_CLOCK.with(|current| {
+            current.replace(previous);
+        });
+        result
+    }
+
+    fn with_frame_write_wouldblock_gate<T>(
+        gate: std::sync::mpsc::Receiver<()>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        let previous = FRAME_WRITE_TEST_WOULDBLOCK_GATE.with(|current| current.replace(Some(gate)));
+        let result = run();
+        FRAME_WRITE_TEST_WOULDBLOCK_GATE.with(|current| {
+            current.replace(previous);
+        });
+        result
+    }
+
     fn connect_test_stream(address: std::net::SocketAddr) -> io::Result<TcpStream> {
         #[cfg(unix)]
         {
@@ -2105,31 +2196,62 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn slow_drain_partial_writes_share_one_absolute_deadline() {
+        use std::io::Read;
         use std::net::TcpListener;
+
+        enum PeerCommand {
+            Drain(usize),
+            Stop,
+        }
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         prepare_test_listener(&listener);
         let address = listener.local_addr().unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (drain_tx, drain_rx) = std::sync::mpsc::channel();
-        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
-        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel::<Result<usize, io::ErrorKind>>();
         let peer = std::thread::spawn(move || {
             let (mut stream, _) = accept_test_stream(&listener).unwrap();
             shrink_socket_buffer(&stream, libc::SO_RCVBUF);
             ready_tx.send(()).unwrap();
             let mut buf = [0; 4096];
             let mut drains = 0;
-            while drains < 2 {
-                if drain_rx.recv_timeout(Duration::from_secs(2)).is_err() {
-                    break;
+            while let Ok(command) = drain_rx.recv_timeout(Duration::from_secs(4)) {
+                match command {
+                    PeerCommand::Stop => break,
+                    PeerCommand::Drain(quota) => {
+                        let mut remaining = quota;
+                        let mut count = 0;
+                        while remaining > 0 {
+                            if let Err(error) =
+                                wait_test_readable(&stream, Instant::now() + Duration::from_secs(1))
+                            {
+                                let _ = drained_tx.send(Err(error.kind()));
+                                return drains;
+                            }
+                            let limit = remaining.min(buf.len());
+                            match stream.read(&mut buf[..limit]) {
+                                Ok(0) => {
+                                    let _ = drained_tx.send(Err(io::ErrorKind::UnexpectedEof));
+                                    return drains;
+                                }
+                                Ok(read) => {
+                                    count += read;
+                                    remaining -= read;
+                                }
+                                Err(error) => {
+                                    let _ = drained_tx.send(Err(error.kind()));
+                                    return drains;
+                                }
+                            }
+                        }
+                        drains += 1;
+                        if drained_tx.send(Ok(count)).is_err() {
+                            return drains;
+                        }
+                    }
                 }
-                wait_test_readable(&stream, Instant::now() + Duration::from_secs(1)).unwrap();
-                let count = stream.read(&mut buf).unwrap_or(0);
-                drained_tx.send(count).unwrap();
-                drains += 1;
             }
-            let _ = finish_rx.recv_timeout(Duration::from_secs(2));
             loop {
                 if wait_test_readable(&stream, Instant::now() + Duration::from_secs(1)).is_err() {
                     break;
@@ -2152,27 +2274,36 @@ mod tests {
         .unwrap();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let (live_tx, live_rx) = std::sync::mpsc::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let clock = Arc::new(FrameWriteTestClock::new());
+        let writer_clock = Arc::clone(&clock);
         let writer = std::thread::spawn(move || {
-            begin_write_observation(live_tx);
-            let started = Instant::now();
-            let result = write_frame_until(
-                &mut stream,
-                &frame,
-                Some(started + Duration::from_millis(250)),
-                None,
-            );
-            result_tx
-                .send((
-                    result.map_err(|error| error.kind()),
-                    started.elapsed(),
-                    take_write_observation(),
-                ))
-                .unwrap();
+            with_frame_write_test_clock(writer_clock, || {
+                with_frame_write_wouldblock_gate(gate_rx, || {
+                    begin_write_observation(live_tx);
+                    let started = frame_write_now();
+                    let real_started = Instant::now();
+                    let result = write_frame_until(
+                        &mut stream,
+                        &frame,
+                        Some(started + Duration::from_millis(250)),
+                        None,
+                    );
+                    result_tx
+                        .send((
+                            result.map_err(|error| error.kind()),
+                            frame_write_now().duration_since(started),
+                            real_started.elapsed(),
+                            take_write_observation(),
+                        ))
+                        .unwrap();
+                });
+            });
         });
-        let event_deadline = Instant::now() + Duration::from_secs(1);
+        let event_deadline = Instant::now() + Duration::from_secs(2);
         let mut trace = Vec::new();
+        let mut first_block = None;
         let mut payload_sends = Vec::new();
-        let mut last_block = None;
         while ready.is_ok() && Instant::now() < event_deadline {
             match live_rx.recv_timeout(event_deadline.saturating_duration_since(Instant::now())) {
                 Ok(event @ FrameWriteTestEvent::PayloadSend { offset, count, at }) => {
@@ -2182,66 +2313,128 @@ mod tests {
                 Ok(event @ FrameWriteTestEvent::WouldBlock { offset, .. }) => {
                     trace.push(event);
                     if !payload_sends.is_empty() && offset < MAX_SUPERVISOR_FRAME_PAYLOAD {
-                        last_block = Some(offset);
+                        first_block = Some(offset);
                         break;
                     }
                 }
                 Err(_) => break,
             }
         }
-        let first_block_seen = last_block.is_some();
         let mut drain_counts = Vec::new();
+        let mut drain_errors = Vec::new();
+        let mut next_block = None;
         let mut sends_after_first_block = 0;
-        if let Some(mut blocked_at) = last_block {
-            for _ in 0..2 {
-                // Drain only after observed backpressure; the 75ms hold shapes
-                // progress without making the readiness decision timing-based.
-                std::thread::sleep(Duration::from_millis(75));
-                let _ = drain_tx.send(());
-                if let Ok(count) = drained_rx.recv_timeout(Duration::from_millis(100)) {
+        let mut consumed = 0usize;
+        if let Some(blocked_at) = first_block {
+            // Advance logical time only after observing backpressure; the
+            // socket send/read/poll operations remain real.
+            clock.elapsed_ms.store(75, Ordering::SeqCst);
+            let quota = SUPERVISOR_HEADER_LEN + blocked_at - consumed;
+            let _ = drain_tx.send(PeerCommand::Drain(quota));
+            match drained_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(Ok(count)) => {
                     drain_counts.push(count);
-                }
-                let mut progressed = false;
-                let progress_deadline = Instant::now() + Duration::from_millis(100);
-                while Instant::now() < progress_deadline {
-                    match live_rx
-                        .recv_timeout(progress_deadline.saturating_duration_since(Instant::now()))
-                    {
-                        Ok(event @ FrameWriteTestEvent::PayloadSend { offset, count, at }) => {
-                            if offset >= blocked_at {
-                                progressed = true;
-                                sends_after_first_block += 1;
-                                payload_sends.push((offset, count, at));
+                    consumed += count;
+                    let _ = gate_tx.send(());
+                    let progress_deadline = Instant::now() + Duration::from_secs(1);
+                    let mut progressed = false;
+                    while Instant::now() < progress_deadline {
+                        match live_rx.recv_timeout(
+                            progress_deadline.saturating_duration_since(Instant::now()),
+                        ) {
+                            Ok(event @ FrameWriteTestEvent::PayloadSend { offset, count, at }) => {
+                                if offset >= blocked_at {
+                                    progressed = true;
+                                    sends_after_first_block += 1;
+                                    payload_sends.push((offset, count, at));
+                                }
+                                trace.push(event);
                             }
-                            trace.push(event);
-                        }
-                        Ok(event @ FrameWriteTestEvent::WouldBlock { offset, .. }) => {
-                            trace.push(event);
-                            if progressed && offset > blocked_at {
-                                blocked_at = offset;
-                                break;
+                            Ok(event @ FrameWriteTestEvent::WouldBlock { offset, .. }) => {
+                                trace.push(event);
+                                if progressed && offset > blocked_at {
+                                    next_block = Some(offset);
+                                    break;
+                                }
                             }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
                 }
-                if !progressed {
-                    break;
+                Ok(Err(kind)) => {
+                    drain_errors.push(format!("peer read failed: {kind:?}"));
+                    let _ = gate_tx.send(());
+                }
+                Err(error) => {
+                    drain_errors.push(format!("peer acknowledgement failed: {error:?}"));
+                    let _ = gate_tx.send(());
                 }
             }
         }
-        let result = result_rx.recv_timeout(Duration::from_secs(1));
-        let _ = finish_tx.send(());
+        if let Some(blocked_at) = next_block {
+            clock.elapsed_ms.store(150, Ordering::SeqCst);
+            clock
+                .advance_after_next_payload_send_to_ms
+                .store(251, Ordering::SeqCst);
+            let quota = SUPERVISOR_HEADER_LEN + blocked_at - consumed;
+            let _ = drain_tx.send(PeerCommand::Drain(quota));
+            match drained_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(Ok(count)) => {
+                    drain_counts.push(count);
+                    let _ = gate_tx.send(());
+                    let progress_deadline = Instant::now() + Duration::from_secs(1);
+                    while Instant::now() < progress_deadline {
+                        match live_rx.recv_timeout(
+                            progress_deadline.saturating_duration_since(Instant::now()),
+                        ) {
+                            Ok(event @ FrameWriteTestEvent::PayloadSend { offset, count, at }) => {
+                                if offset >= blocked_at {
+                                    sends_after_first_block += 1;
+                                    payload_sends.push((offset, count, at));
+                                    trace.push(event);
+                                    break;
+                                }
+                                trace.push(event);
+                            }
+                            Ok(event) => trace.push(event),
+                            Err(_) => break,
+                        }
+                    }
+                }
+                Ok(Err(kind)) => {
+                    drain_errors.push(format!("peer read failed: {kind:?}"));
+                    let _ = gate_tx.send(());
+                }
+                Err(error) => {
+                    drain_errors.push(format!("peer acknowledgement failed: {error:?}"));
+                    let _ = gate_tx.send(());
+                }
+            }
+        }
+        let result = result_rx.recv_timeout(Duration::from_secs(3));
+        drop(gate_tx);
+        let _ = drain_tx.send(PeerCommand::Stop);
         let _ = watchdog_stream.shutdown(std::net::Shutdown::Both);
         let writer_join = writer.join();
         let drains = peer.join().unwrap();
         assert!(ready.is_ok(), "peer did not reach the drain barrier");
         assert!(
-            first_block_seen,
+            first_block.is_some(),
             "no incomplete-payload WouldBlock: {trace:?}"
         );
-        assert_eq!(drains, 2, "expected exactly two peer drains");
-        assert_eq!(drain_counts.len(), 2, "drains: {drain_counts:?}");
+        assert_eq!(
+            drains, 2,
+            "expected two complete peer drains: counts={drain_counts:?}, errors={drain_errors:?}, trace={trace:?}"
+        );
+        assert_eq!(
+            drain_counts.len(),
+            2,
+            "drains: {drain_counts:?}; errors={drain_errors:?}; trace={trace:?}"
+        );
+        assert!(
+            drain_counts.iter().all(|count| *count > 0),
+            "peer reported an empty drain: {drain_counts:?}; trace={trace:?}"
+        );
         assert!(
             sends_after_first_block >= 2,
             "insufficient progress after the initial WouldBlock: {trace:?}"
@@ -2255,11 +2448,12 @@ mod tests {
             result.is_ok(),
             "writer watchdog expired; late result after cleanup: {late_result:?}; trace={trace:?}; join={writer_join:?}"
         );
-        let (write_result, elapsed, events) = result.expect("writer watchdog expired");
+        let (write_result, logical_elapsed, real_elapsed, events) =
+            result.expect("writer watchdog expired");
         assert_eq!(write_result, Err(io::ErrorKind::TimedOut));
         assert!(
             payload_sends.len() >= 3,
-            "insufficient live partial sends: {trace:?}"
+            "insufficient live partial sends: {trace:?}; events={events:?}"
         );
         let would_blocks: Vec<_> = events
             .iter()
@@ -2276,16 +2470,25 @@ mod tests {
             payload_sends
                 .windows(2)
                 .all(|pair| pair[1].0 >= pair[0].0 + pair[0].1),
-            "payload offsets did not advance: {payload_sends:?}"
-        );
-        let progressed_at = payload_sends.last().unwrap().2;
-        assert!(
-            progressed_at.duration_since(payload_sends[0].2) < Duration::from_millis(230),
-            "drain progress did not occur during the shared deadline: {payload_sends:?}"
+            "payload offsets did not advance: {payload_sends:?}; trace={trace:?}"
         );
         assert!(
-            (Duration::from_millis(200)..Duration::from_millis(350)).contains(&elapsed),
-            "write did not share the 250ms deadline: {elapsed:?}; writer={writer_join:?}"
+            payload_sends.iter().any(|(_, _, at)| {
+                *at == clock.origin + Duration::from_millis(75)
+            }) && payload_sends.iter().any(|(_, _, at)| {
+                *at == clock.origin + Duration::from_millis(150)
+            }),
+            "native payload progress missed logical 75/150ms stages: {payload_sends:?}; trace={trace:?}"
+        );
+        assert!(
+            payload_sends.last().unwrap().0 + payload_sends.last().unwrap().1
+                < MAX_SUPERVISOR_FRAME_PAYLOAD,
+            "frame unexpectedly completed before deadline: {payload_sends:?}"
+        );
+        assert_eq!(logical_elapsed, Duration::from_millis(251));
+        assert!(
+            real_elapsed < Duration::from_secs(3),
+            "writer watchdog window exceeded: {real_elapsed:?}; writer={writer_join:?}"
         );
     }
 

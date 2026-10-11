@@ -193,8 +193,11 @@ fn legacy_output_capture_rejects_descendant_held_pipe_after_child_exit() {
         ),
     )
     .unwrap();
-    let started = Instant::now();
-    let result = with_child_host(|| run_in_subprocess_with_output(&entry, &allow_all()));
+    let (result, elapsed) = with_child_host(|| {
+        let started = Instant::now();
+        let result = run_in_subprocess_with_output(&entry, &allow_all());
+        (result, started.elapsed())
+    });
     let pid = fs::read_to_string(&descendant_pid).ok();
     if let Some(pid) = pid
         .as_deref()
@@ -208,7 +211,7 @@ fn legacy_output_capture_rejects_descendant_held_pipe_after_child_exit() {
     assert!(
         matches!(error, LibdenoError::Io(ref error) if error.kind() == std::io::ErrorKind::TimedOut)
     );
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(elapsed < Duration::from_secs(5));
 }
 
 #[test]
