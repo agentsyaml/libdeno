@@ -33,7 +33,7 @@ jobs:
     name: locked test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         os: [macos-15, macos-15-intel, windows-latest]
     steps:
