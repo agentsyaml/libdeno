@@ -2,11 +2,27 @@ name: Python wheels
 
 on:
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Immutable source commit SHA
+        required: true
+        type: string
+      release_tag:
+        description: Validated release tag
+        required: true
+        type: string
   workflow_call:
+    inputs:
+      source_sha:
+        required: true
+        type: string
+      release_tag:
+        required: true
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: python-${{ inputs.release_tag || github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -29,6 +45,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+
+      - name: Verify source checkout
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
 
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
@@ -119,6 +142,18 @@ jobs:
           path: python/target/wheels-final/*.whl
           if-no-files-found: error
 
+      - name: Record source provenance
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: printf '%s\n' "$EXPECTED_SOURCE_SHA" > source-sha-macos-arm64.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libdeno-source-macos-arm64
+          path: source-sha-macos-arm64.txt
+          if-no-files-found: error
+
   macos-x86_64:
     name: wheel / macOS x86_64
     runs-on: macos-15-intel
@@ -126,6 +161,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+
+      - name: Verify source checkout
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
 
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
@@ -230,6 +272,18 @@ jobs:
           path: python/target/wheels-final/*.whl
           if-no-files-found: error
 
+      - name: Record source provenance
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: printf '%s\n' "$EXPECTED_SOURCE_SHA" > source-sha-macos-x86_64.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libdeno-source-macos-x86_64
+          path: source-sha-macos-x86_64.txt
+          if-no-files-found: error
+
   windows-x86_64:
     name: wheel / Windows x86_64
     runs-on: windows-latest
@@ -237,6 +291,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+
+      - name: Verify source checkout
+        shell: pwsh
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          $actual = git rev-parse HEAD
+          if ($actual -ne $env:EXPECTED_SOURCE_SHA) { throw "source checkout $actual does not match expected SHA" }
 
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
@@ -351,6 +414,18 @@ jobs:
           path: python/target/wheels-final/*.whl
           if-no-files-found: error
 
+      - name: Record source provenance
+        shell: pwsh
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: Set-Content -Path source-sha-windows-x86_64.txt -Value $env:EXPECTED_SOURCE_SHA -NoNewline
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libdeno-source-windows-x86_64
+          path: source-sha-windows-x86_64.txt
+          if-no-files-found: error
+
   linux-x86_64:
     name: wheel / Linux x86_64 manylinux_2_28
     runs-on: ubuntu-latest
@@ -358,6 +433,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+
+      - name: Verify source checkout
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
 
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
@@ -419,6 +501,18 @@ jobs:
           path: python/target/wheels/*.whl
           if-no-files-found: error
 
+      - name: Record source provenance
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: printf '%s\n' "$EXPECTED_SOURCE_SHA" > source-sha-linux-x86_64.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libdeno-source-linux-x86_64
+          path: source-sha-linux-x86_64.txt
+          if-no-files-found: error
+
   linux-aarch64:
     name: wheel / Linux aarch64 manylinux_2_28
     runs-on: ubuntu-24.04-arm
@@ -426,6 +520,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+
+      - name: Verify source checkout
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
 
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
@@ -486,6 +587,18 @@ jobs:
           path: python/target/wheels/*.whl
           if-no-files-found: error
 
+      - name: Record source provenance
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: printf '%s\n' "$EXPECTED_SOURCE_SHA" > source-sha-linux-aarch64.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libdeno-source-linux-aarch64
+          path: source-sha-linux-aarch64.txt
+          if-no-files-found: error
+
   wheel-metadata:
     name: validate wheel metadata
     needs: [macos-arm64, macos-x86_64, windows-x86_64, linux-x86_64, linux-aarch64]
@@ -501,6 +614,29 @@ jobs:
           pattern: libdeno-wheel-*
           path: artifacts
           merge-multiple: true
+
+      - name: Download source provenance artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: libdeno-source-*
+          path: provenance
+          merge-multiple: true
+
+      - name: Verify wheel source provenance
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sidecars=(provenance/*.txt)
+          test "${#sidecars[@]}" -eq 5
+          for sidecar in "${sidecars[@]}"; do
+            actual="$(tr -d '\r\n' < "$sidecar")"
+            test "$actual" = "$EXPECTED_SOURCE_SHA" || {
+              echo "$sidecar records source $actual, expected $EXPECTED_SOURCE_SHA"; exit 1;
+            }
+          done
 
       - name: Check wheel metadata with twine
         shell: bash
@@ -524,6 +660,33 @@ jobs:
               *) echo "expected a cp39-abi3 wheel, got $(basename "$wheel")"; exit 1 ;;
             esac
           done
+
+      - name: Verify wheel versions match release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          expected="${RELEASE_TAG#v}"
+          EXPECTED_VERSION="$expected" python - <<'PY'
+          import os
+          from email.parser import Parser
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          expected = os.environ["EXPECTED_VERSION"]
+          wheels = sorted(Path("artifacts").glob("*.whl"))
+          if len(wheels) != 5:
+              raise SystemExit(f"expected exactly five wheel artifacts, found {len(wheels)}")
+          for wheel in wheels:
+              with ZipFile(wheel) as archive:
+                  metadata = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+                  if len(metadata) != 1:
+                      raise SystemExit(f"{wheel.name}: expected one METADATA file")
+                  versions = Parser().parsestr(archive.read(metadata[0]).decode()).get_all("Version") or []
+                  if versions != [expected]:
+                      raise SystemExit(f"{wheel.name}: expected version {expected}, got {versions}")
+          PY
 
       - name: Check typing metadata is packaged
         shell: bash
