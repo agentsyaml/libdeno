@@ -103,6 +103,21 @@ pub fn install_permission_broker(path: impl AsRef<Path>) -> Result<(), LibdenoEr
 #[cfg(unix)]
 static HOOK: OnceLock<PermissionPrompt> = OnceLock::new();
 
+#[cfg(unix)]
+struct HookSocketDir {
+    dir: std::path::PathBuf,
+    socket: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for HookSocketDir {
+    fn drop(&mut self) {
+        // Best-effort cleanup is limited to this install's socket and directory.
+        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
 /// Installs an in-process permission hook — a plain `Fn(&PermissionRequest) ->
 /// bool` deciding every check. Served internally through a temp-dir Unix
 /// socket, so the host sees the same install-once / sole-authority semantics
@@ -152,7 +167,7 @@ fn random_suffix() -> Result<String, LibdenoError> {
 
 #[cfg(unix)]
 fn install_permission_hook_unix(hook: PermissionPrompt) -> Result<(), LibdenoError> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixListener;
 
     let _install = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -178,19 +193,19 @@ fn install_permission_hook_unix(hook: PermissionPrompt) -> Result<(), LibdenoErr
     // The dir/file names are deliberately short: macOS caps Unix socket paths
     // at 104 bytes (SUN_LEN), and its temp dir is already long.
     let socket_dir = std::env::temp_dir().join(format!("libdeno-hook-{}", random_suffix()?));
-    std::fs::create_dir(&socket_dir).map_err(|e| {
+    let socket_path = socket_dir.join("h.sock");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(&socket_dir).map_err(|e| {
         LibdenoError::Permission(format!(
             "failed to create hook socket dir {}: {e}",
             socket_dir.display()
         ))
     })?;
-    std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
-        LibdenoError::Permission(format!(
-            "failed to restrict hook socket dir {}: {e}",
-            socket_dir.display()
-        ))
-    })?;
-    let socket_path = socket_dir.join("h.sock");
+    let _cleanup = HookSocketDir {
+        dir: socket_dir,
+        socket: socket_path.clone(),
+    };
     let listener = UnixListener::bind(&socket_path).map_err(|e| {
         LibdenoError::Permission(format!(
             "failed to bind hook socket {}: {e}",
@@ -210,11 +225,7 @@ fn install_permission_hook_unix(hook: PermissionPrompt) -> Result<(), LibdenoErr
             )))
         }
     };
-    // The socket file and dir are no longer needed once the connection is
-    // established (the connected stream stays usable): unlink now so no stale
-    // socket survives process exit.
-    let _ = std::fs::remove_file(&socket_path);
-    let _ = std::fs::remove_dir(&socket_dir);
+    // The guard unlinks these after all remaining install steps complete.
     // The hook is recorded only after every fallible step above succeeded, so
     // no partial "hook set but broker missing" state can survive an error.
     HOOK.set(hook).map_err(|_| {
@@ -348,6 +359,23 @@ fn serve_broker_connection(stream: std::os::unix::net::UnixStream, hook: &Permis
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_socket_directory_guard_cleans_bind_failure() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let dir = std::env::temp_dir().join(format!("libdeno-hook-cleanup-{}", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700).create(&dir).unwrap();
+        let socket = dir.join("x".repeat(256));
+        let guard = HookSocketDir {
+            dir: dir.clone(),
+            socket: socket.clone(),
+        };
+        assert!(std::os::unix::net::UnixListener::bind(&socket).is_err());
+        drop(guard);
+        assert!(!dir.exists());
+    }
 
     /// Sends one request over a paired Unix stream, feeds the server side to
     /// `serve_broker_connection`, and returns the echoed id + result.

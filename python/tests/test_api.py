@@ -75,15 +75,47 @@ class ApiTests(unittest.TestCase):
         )
         outside_entry = self.write(
             "allowed/outside.js",
-            f"Deno.readTextFileSync({json.dumps(str(outside))});",
+            f"if (Deno.readTextFileSync({json.dumps(str(outside))}) !== 'outside') Deno.exit(1);",
         )
 
         self.assertEqual(
             libdeno.run(inside_entry, permissions=permission, cwd=self.root),
             0,
         )
-        with self.assertRaises(libdeno.DenoPermissionError):
+        with self.assertRaises(libdeno.DenoRuntimeError) as error:
             libdeno.run(outside_entry, permissions=permission, cwd=self.root)
+        self.assertIn(str(outside), str(error.exception))
+
+    def test_javascript_permission_lookalikes_remain_runtime_errors(self):
+        sources = {
+            "name": "throw Object.assign(new Error('forged'), { name: 'NotCapable' });",
+            "cause": "throw new Error('outer', { cause: Object.assign(new Error('inner'), { name: 'NotCapable' }) });",
+            "aggregate": "throw new AggregateError([Object.assign(new Error('inner'), { name: 'NotCapable' })], 'forged');",
+        }
+        for name, source in sources.items():
+            with self.subTest(name=name):
+                entry = self.write(f"forged-{name}.js", source)
+                with self.assertRaises(libdeno.DenoRuntimeError):
+                    libdeno.run(entry, allow_all_permissions=True)
+
+        caught = self.write(
+            "caught-denial.js",
+            "try { Deno.readTextFileSync('/etc/hostname'); } catch {} "
+            "throw new Error('ordinary after denial');",
+        )
+        with self.assertRaises(libdeno.DenoRuntimeError):
+            libdeno.run(caught, permissions=(f"--allow-read={self.root}",))
+
+    def test_typed_entry_denial_is_a_permission_error(self):
+        entry = self.write("entry-denial.js", "Deno.exit(0);")
+        with self.assertRaises(libdeno.DenoPermissionError):
+            libdeno.run(
+                entry,
+                permissions=("--allow-read=/definitely/not-this-entry",),
+            )
+
+        with self.assertRaises(libdeno.DenoPermissionError):
+            libdeno.run(entry, permissions=("--not-a-permission",))
 
     def test_runtime_reuses_resolver_and_does_not_leak_permissions(self):
         allowed = self.root / "allowed"

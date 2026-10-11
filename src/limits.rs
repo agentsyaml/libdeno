@@ -1,5 +1,5 @@
-//! Resource limits: V8 heap constraints, execution deadlines, child-mode IPC
-//! gating, and the in-process V8 code cache.
+//! Resource limits, execution deadlines, Node IPC startup handoff, and the
+//! in-process V8 code cache.
 
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -15,8 +15,33 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_WATCHDOG_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(unix)]
+    static FAIL_NEXT_NODE_IPC_FCNTL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(windows)]
+    static FAIL_NEXT_NODE_IPC_CLONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+#[cfg(feature = "execution-control")]
+fn fail_next_watchdog_spawn() {
+    FAIL_NEXT_WATCHDOG_SPAWN.with(|flag| flag.set(true));
+}
+
+fn watchdog_spawn<T>(spawn: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    #[cfg(test)]
+    if FAIL_NEXT_WATCHDOG_SPAWN.with(|flag| flag.replace(false)) {
+        return Err(std::io::Error::other("injected watchdog spawn failure"));
+    }
+    spawn()
+}
+
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
 
 use deno_core::v8;
 use deno_core::v8::IsolateHandle;
@@ -137,44 +162,42 @@ impl AbsoluteDeadlineGuard {
     pub(crate) fn new(
         deadline: Option<Instant>,
         cancellation: Option<CancellationContext>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let Some(deadline) = deadline else {
-            return Self {
+            return Ok(Self {
                 stop: None,
                 join: None,
-            };
+            });
         };
         let Some(cancellation) = cancellation else {
-            return Self {
+            return Ok(Self {
                 stop: None,
                 join: None,
-            };
+            });
         };
         if deadline <= Instant::now() {
             cancellation.request_with_reason(CancellationReason::Deadline);
-            return Self {
+            return Ok(Self {
                 stop: None,
                 join: None,
-            };
+            });
         }
         let (stop, receiver) = std::sync::mpsc::channel();
         let cancellation_for_thread = cancellation.clone();
-        let join = std::thread::Builder::new()
-            .name("libdeno-submission-deadline".to_string())
-            .spawn(move || {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if receiver.recv_timeout(remaining).is_err() {
-                    cancellation_for_thread.request_with_reason(CancellationReason::Deadline);
-                }
-            })
-            .ok();
-        if join.is_none() {
-            cancellation.request_with_reason(CancellationReason::Deadline);
-        }
-        Self {
+        let join = watchdog_spawn(|| {
+            std::thread::Builder::new()
+                .name("libdeno-submission-deadline".to_string())
+                .spawn(move || {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if receiver.recv_timeout(remaining).is_err() {
+                        cancellation_for_thread.request_with_reason(CancellationReason::Deadline);
+                    }
+                })
+        })?;
+        Ok(Self {
             stop: Some(stop),
-            join,
-        }
+            join: Some(join),
+        })
     }
 }
 
@@ -926,10 +949,11 @@ pub(crate) fn in_process_code_cache() -> Arc<dyn CodeCache> {
 /// only when the syscall itself returns — the run may exceed the deadline by
 /// the syscall's duration. This is a V8/runtime boundary, not fixable in the
 /// embedder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum ExecutionTermination {
     Deadline(Duration),
     Cancelled,
+    Infrastructure(std::io::Error),
 }
 
 /// Rejects a finite deadline that cannot be represented by the host clock.
@@ -955,13 +979,25 @@ pub(crate) async fn run_with_deadline_cancellable<F, T, E>(
 where
     F: Future<Output = Result<T, E>>,
 {
+    run_with_termination(fut, deadline, Some(isolate_handle), cancellation).await
+}
+
+async fn run_with_termination<F, T, E>(
+    fut: F,
+    deadline: Option<Duration>,
+    isolate_handle: Option<IsolateHandle>,
+    cancellation: Option<CancellationContext>,
+) -> Result<Result<T, E>, ExecutionTermination>
+where
+    F: Future<Output = Result<T, E>>,
+{
     const GRACE: Duration = Duration::from_secs(2);
 
     if deadline.is_none() && cancellation.is_none() {
         return Ok(fut.await);
     }
 
-    if let Some(cancellation) = &cancellation {
+    if let (Some(cancellation), Some(isolate_handle)) = (&cancellation, &isolate_handle) {
         cancellation.register(isolate_handle.clone());
     }
 
@@ -971,39 +1007,57 @@ where
     // instead of leaving it asleep for the rest of the deadline).
     let deadline_fired = Arc::new(AtomicBool::new(false));
     let cancellation_fired = Arc::new(AtomicBool::new(false));
+    let cancellation_cleanup = cancellation.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let terminator = {
         let deadline_fired = deadline_fired.clone();
         let cancellation_fired = cancellation_fired.clone();
-        let cancellation = cancellation.clone();
+        let cancellation_for_thread = cancellation.clone();
+        let isolate_for_thread = isolate_handle.clone();
         let deadline_at = deadline.and_then(|duration| Instant::now().checked_add(duration));
-        std::thread::spawn(move || loop {
-            if cancellation
-                .as_ref()
-                .is_some_and(CancellationContext::is_requested)
-            {
-                cancellation_fired.store(true, Ordering::SeqCst);
-                isolate_handle.terminate_execution();
-                break;
-            }
-            let wait = deadline_at
-                .map(|deadline| {
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(Duration::from_millis(10))
-                })
-                .unwrap_or_else(|| Duration::from_millis(10));
-            match done_rx.recv_timeout(wait) {
-                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if deadline_at.is_some_and(|deadline| deadline <= Instant::now()) {
-                        deadline_fired.store(true, Ordering::SeqCst);
-                        isolate_handle.terminate_execution();
+        match watchdog_spawn(|| {
+            std::thread::Builder::new()
+                .name("libdeno-execution-deadline".into())
+                .spawn(move || loop {
+                    if cancellation_for_thread
+                        .as_ref()
+                        .is_some_and(CancellationContext::is_requested)
+                    {
+                        cancellation_fired.store(true, Ordering::SeqCst);
+                        if let Some(isolate) = &isolate_for_thread {
+                            isolate.terminate_execution();
+                        }
                         break;
                     }
+                    let wait = deadline_at
+                        .map(|deadline| {
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(10))
+                        })
+                        .unwrap_or_else(|| Duration::from_millis(10));
+                    match done_rx.recv_timeout(wait) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if deadline_at.is_some_and(|deadline| deadline <= Instant::now()) {
+                                deadline_fired.store(true, Ordering::SeqCst);
+                                if let Some(isolate) = &isolate_for_thread {
+                                    isolate.terminate_execution();
+                                }
+                                break;
+                            }
+                        }
+                    }
+                })
+        }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                if let Some(cancellation) = &cancellation_cleanup {
+                    cancellation.clear();
                 }
+                return Err(ExecutionTermination::Infrastructure(error));
             }
-        })
+        }
     };
 
     tokio::pin!(fut);
@@ -1128,80 +1182,224 @@ pub(crate) async fn run_worker_cancellable(
     result
 }
 
-/// Environment marker pairing an IPC child with its spawner: set on the
-/// subprocess child by [`crate::run_in_subprocess`]; for `child_process.fork`
-/// children it is written into this process's own env (see
-/// [`capture_spawned_ipc_marker`]) so the fork child inherits it.
-pub(crate) const LIBDENO_SPAWNED_IPC: &str = "LIBDENO_SPAWNED_IPC";
+#[cfg(unix)]
+type OwnedIpc = OwnedFd;
+#[cfg(windows)]
+type OwnedIpc = OwnedHandle;
+type NodeIpcChannel = (OwnedIpc, ChildIpcSerialization);
+type NodeIpcState = Option<Option<NodeIpcChannel>>;
 
-/// The marker value present at process entry, captured once on the first
-/// [`crate::run`] call: true for a subprocess/fork child, false for a regular
-/// host. `node_ipc_init` reads this, never the live env — the live env always
-/// carries the marker after capture (we write it back for fork children to
-/// inherit), so a live read would make a regular host adopt a stray/foreign
-/// `NODE_CHANNEL_FD` as its IPC pipe.
-static NODE_IPC_MARKER: OnceLock<bool> = OnceLock::new();
-static NODE_IPC_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Outer None means no attempt has occurred; every attempt records Some(None)
+// before reading the environment, so even a failed attempt is terminal.
+static NODE_IPC: OnceLock<Mutex<NodeIpcState>> = OnceLock::new();
 
-/// Captures the original [`LIBDENO_SPAWNED_IPC`] marker at process entry,
-/// then writes it into our own environment so `child_process.fork` children
-/// (which inherit the env and carry deno_node's `NODE_CHANNEL_FD`) honor their
-/// IPC channel. Called from [`crate::run`] with the run lease held.
-/// The env write (edition 2021: `set_var` is safe; runs are concurrent but
-/// the written value is the constant captured at process entry, and `set_var`
-/// is internally synchronized on the target platforms).
-///
-/// Known tradeoff: the write also means ordinary subprocesses the host spawns
-/// afterwards inherit LIBDENO_SPAWNED_IPC=1; the entry-time capture (never a
-/// live read) still blocks the mainstream misuse of a foreign NODE_CHANNEL_FD.
-pub(crate) fn capture_spawned_ipc_marker() {
-    NODE_IPC_MARKER.get_or_init(|| {
-        let spawned = std::env::var(LIBDENO_SPAWNED_IPC).as_deref() == Ok("1");
-        std::env::set_var(LIBDENO_SPAWNED_IPC, "1");
-        spawned
-    });
-}
-
-/// Node IPC pipe for `child_process.fork`/`spawn(stdio: ["ipc"])`, gated on
-/// the spawning side's marker.
-///
-/// `NODE_CHANNEL_FD` is only honored when the spawning side (subprocess.rs,
-/// the libdeno child-mode lane, or a `child_process.fork` spawn) set
-/// `LIBDENO_SPAWNED_IPC=1`. Node itself sets `NODE_CHANNEL_FD` when *it*
-/// spawns children, and adopting a stray/foreign FD as our IPC pipe could
-/// connect the runtime to an unrelated process. Without the paired marker the
-/// variable is ignored entirely.
-pub(crate) fn node_ipc_init() -> Option<(i64, ChildIpcSerialization)> {
-    // The entry-time capture, NOT a live env read: after capture the env
-    // always says 1, so a live read would defeat the gating above.
-    if !NODE_IPC_MARKER.get().copied().unwrap_or(false) {
-        return None;
-    }
-    let fd = std::env::var("NODE_CHANNEL_FD").ok()?;
-    let mode = std::env::var("NODE_CHANNEL_SERIALIZATION_MODE").ok();
-    claim_node_ipc(&NODE_IPC_CLAIMED, &fd, mode.as_deref())
-}
-
-fn claim_node_ipc(
-    claimed: &std::sync::atomic::AtomicBool,
-    raw_fd: &str,
-    mode: Option<&str>,
-) -> Option<(i64, ChildIpcSerialization)> {
-    let fd = parse_node_channel_fd(raw_fd)?;
-    let serialization = if mode == Some("advanced") {
-        ChildIpcSerialization::Advanced
+fn begin_node_ipc_attempt(state: &mut NodeIpcState) -> bool {
+    if state.is_some() {
+        false
     } else {
-        ChildIpcSerialization::Json
+        *state = Some(None);
+        true
+    }
+}
+
+/// Explicit startup handoff for a trusted launcher-provided Node IPC channel.
+/// The launcher must provide a valid raw OS handle with unique ownership, not
+/// already claimed by another library. Ordinary hosts should call this too:
+/// absent NODE_CHANNEL_FD records an initialized no-IPC state.
+/// Initialization is one-attempt even when it returns an error. A parseable
+/// raw handle is claimed before mode/object/flag validation; later failures
+/// close it, so callers must not retry or reclaim it. An unparseable value has
+/// no identifiable OS object to claim, but still consumes the one attempt.
+///
+/// # Safety
+/// When NODE_CHANNEL_FD is present, the caller guarantees it names a valid IPC
+/// endpoint with unique ownership, transferred exclusively to libdeno.
+pub unsafe fn initialize_node_ipc_from_env() -> Result<(), crate::LibdenoError> {
+    let state = NODE_IPC.get_or_init(|| Mutex::new(None));
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    if !begin_node_ipc_attempt(&mut state) {
+        return Err(crate::LibdenoError::Configuration(
+            "Node IPC initialization may only be performed once".into(),
+        ));
+    }
+    let raw = match std::env::var("NODE_CHANNEL_FD") {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(()),
+        Err(error) => {
+            return Err(crate::LibdenoError::Configuration(format!(
+                "invalid NODE_CHANNEL_FD: {error}"
+            )))
+        }
     };
-    claimed
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .ok()?;
-    Some((fd, serialization))
+    // Claim a parseable raw handle before any subsequent fallible validation.
+    // Its Owned* guard closes it if mode/object/flag checks fail.
+    let owned = claim_node_ipc(&raw)?;
+    let mode = match std::env::var("NODE_CHANNEL_SERIALIZATION_MODE") {
+        Ok(mode) => Some(mode),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => {
+            return Err(crate::LibdenoError::Configuration(format!(
+                "invalid NODE_CHANNEL_SERIALIZATION_MODE: {error}"
+            )))
+        }
+    };
+    let serialization = match mode.as_deref() {
+        None | Some("json") => ChildIpcSerialization::Json,
+        Some("advanced") => ChildIpcSerialization::Advanced,
+        Some(other) => {
+            return Err(crate::LibdenoError::Configuration(format!(
+                "invalid NODE_CHANNEL_SERIALIZATION_MODE: {other}"
+            )))
+        }
+    };
+    *state = Some(Some((owned, serialization)));
+    Ok(())
+}
+
+/// Consumes the startup channel once; runs never inspect the process environment.
+pub(crate) fn node_ipc_init() -> Option<(i64, ChildIpcSerialization)> {
+    let mut state = NODE_IPC
+        .get()?
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    take_node_ipc(&mut state)
+}
+
+fn take_node_ipc(state: &mut NodeIpcState) -> Option<(i64, ChildIpcSerialization)> {
+    state.as_mut()?.take().map(|(handle, serialization)| {
+        #[cfg(unix)]
+        let raw = handle.into_raw_fd() as i64;
+        #[cfg(windows)]
+        let raw = handle.into_raw_handle() as usize as i64;
+        (raw, serialization)
+    })
+}
+
+fn claim_node_ipc(raw: &str) -> Result<OwnedIpc, crate::LibdenoError> {
+    let fd = parse_node_channel_fd(raw)
+        .ok_or_else(|| crate::LibdenoError::Configuration("invalid NODE_CHANNEL_FD".into()))?;
+    #[cfg(unix)]
+    {
+        // SAFETY: the public initializer's contract transfers a valid unique descriptor.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+        let socket_type = unsafe {
+            let mut value: libc::c_int = 0;
+            let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+            if libc::getsockopt(
+                owned.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                &mut value as *mut _ as *mut _,
+                &mut len,
+            ) != 0
+            {
+                return Err(crate::LibdenoError::Io(std::io::Error::last_os_error()));
+            }
+            value
+        };
+        if socket_type != libc::SOCK_STREAM {
+            return Err(crate::LibdenoError::Configuration(
+                "NODE_CHANNEL_FD must be a stream socket".into(),
+            ));
+        }
+        let domain = unsafe {
+            let mut address: libc::sockaddr_storage = std::mem::zeroed();
+            let mut len = std::mem::size_of_val(&address) as libc::socklen_t;
+            if libc::getsockname(
+                owned.as_raw_fd(),
+                &mut address as *mut _ as *mut _,
+                &mut len,
+            ) != 0
+            {
+                return Err(crate::LibdenoError::Io(std::io::Error::last_os_error()));
+            }
+            address.ss_family as libc::c_int
+        };
+        if domain != libc::AF_UNIX {
+            return Err(crate::LibdenoError::Configuration(
+                "NODE_CHANNEL_FD must be a local Unix socket".into(),
+            ));
+        }
+        unsafe {
+            let mut peer: libc::sockaddr_storage = std::mem::zeroed();
+            let mut len = std::mem::size_of_val(&peer) as libc::socklen_t;
+            if libc::getpeername(owned.as_raw_fd(), &mut peer as *mut _ as *mut _, &mut len) != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENOTCONN) {
+                    return Err(crate::LibdenoError::Configuration(
+                        "NODE_CHANNEL_FD must be a connected local Unix socket".into(),
+                    ));
+                }
+                return Err(crate::LibdenoError::Io(error));
+            }
+            if peer.ss_family as libc::c_int != libc::AF_UNIX {
+                return Err(crate::LibdenoError::Configuration(
+                    "NODE_CHANNEL_FD peer must be a local Unix socket".into(),
+                ));
+            }
+        }
+        set_node_ipc_cloexec(owned.as_raw_fd())?;
+        Ok(owned)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: ownership is exclusively transferred per the initializer contract.
+        let original = unsafe { OwnedHandle::from_raw_handle(fd as usize as *mut _) };
+        let duplicate =
+            duplicate_and_close_node_handle(original).map_err(crate::LibdenoError::Io)?;
+        if unsafe { windows_node_ipc::is_pipe(duplicate.as_raw_handle()) } {
+            Ok(duplicate)
+        } else {
+            Err(crate::LibdenoError::Configuration(
+                "NODE_CHANNEL_FD must be a pipe handle".into(),
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn duplicate_and_close_node_handle(original: OwnedHandle) -> std::io::Result<OwnedHandle> {
+    #[cfg(test)]
+    if FAIL_NEXT_NODE_IPC_CLONE.with(|flag| flag.replace(false)) {
+        return Err(std::io::Error::other(
+            "injected Node IPC handle clone failure",
+        ));
+    }
+    let duplicate = original.try_clone()?;
+    drop(original);
+    Ok(duplicate)
+}
+
+#[cfg(unix)]
+fn set_node_ipc_cloexec(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_NODE_IPC_FCNTL.with(|flag| flag.replace(false)) {
+        return Err(std::io::Error::other("injected Node IPC fcntl failure"));
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+mod windows_node_ipc {
+    use std::ffi::c_void;
+    use std::os::windows::io::RawHandle;
+
+    const FILE_TYPE_PIPE: u32 = 0x0003;
+    #[link(name = "kernel32")]
+    extern "system" {
+        #[link_name = "GetFileType"]
+        fn get_file_type(handle: *mut c_void) -> u32;
+    }
+
+    pub(super) unsafe fn is_pipe(handle: RawHandle) -> bool {
+        // SAFETY: caller owns a duplicated handle and checks it before transfer.
+        unsafe { get_file_type(handle) == FILE_TYPE_PIPE }
+    }
 }
 
 /// Parses the inherited Node IPC descriptor without allowing a malformed or
@@ -1268,9 +1466,315 @@ mod tests {
         let _guard = AbsoluteDeadlineGuard::new(
             Some(Instant::now() - Duration::from_millis(1)),
             Some(cancellation.clone()),
-        );
+        )
+        .unwrap();
         assert!(cancellation.is_requested());
         assert_eq!(cancellation.reason(), Some(CancellationReason::Deadline));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claimed_node_ipc_socket_is_cloexec() {
+        const FD_ENV: &str = "LIBDENO_NODE_IPC_CLOEXEC_TEST_FD";
+        if let Ok(raw) = std::env::var(FD_ENV) {
+            use std::os::fd::IntoRawFd;
+            let fd: i32 = raw.parse().unwrap();
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            let owned = claim_node_ipc(&raw).unwrap();
+            assert_ne!(
+                unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            let raw = owned.into_raw_fd();
+            // SAFETY: raw is the uniquely-owned descriptor returned by into_raw_fd.
+            drop(unsafe { OwnedFd::from_raw_fd(raw) });
+            return;
+        }
+
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = socket.as_raw_fd();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "limits::tests::claimed_node_ipc_socket_is_cloexec",
+                "--nocapture",
+            ])
+            .env(FD_ENV, "0")
+            .env("NODE_CHANNEL_SERIALIZATION_MODE", "json")
+            .stdin(std::process::Stdio::null())
+            .process_group(0);
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let inherited_flags = libc::fcntl(fd, libc::F_GETFD);
+                if inherited_flags < 0
+                    || libc::fcntl(fd, libc::F_SETFD, inherited_flags | libc::FD_CLOEXEC) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let stdio_flags = libc::fcntl(0, libc::F_GETFD);
+                if stdio_flags < 0
+                    || libc::fcntl(0, libc::F_SETFD, stdio_flags & !libc::FD_CLOEXEC) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let _ = child.wait();
+                panic!("CLOEXEC child test timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_ipc_owned_channel_is_taken_once() {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let owned = claim_node_ipc(&socket.into_raw_fd().to_string()).unwrap();
+        let mut state = Some(Some((owned, ChildIpcSerialization::Json)));
+        let (raw, _mode) = take_node_ipc(&mut state).unwrap();
+        // SAFETY: the tuple transfers unique ownership to the receiver.
+        drop(unsafe { OwnedFd::from_raw_fd(raw as i32) });
+        assert!(take_node_ipc(&mut state).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_node_ipc_owned_channel_is_taken_once_and_reclaimed() {
+        use std::ffi::c_void;
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreatePipe(
+                read_pipe: *mut *mut c_void,
+                write_pipe: *mut *mut c_void,
+                attrs: *mut c_void,
+                size: u32,
+            ) -> i32;
+        }
+
+        let mut read = std::ptr::null_mut();
+        let mut write = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { CreatePipe(&mut read, &mut write, std::ptr::null_mut(), 0) },
+            0
+        );
+        let mut state = Some(Some((
+            unsafe { OwnedHandle::from_raw_handle(read) },
+            ChildIpcSerialization::Json,
+        )));
+        let (raw, _mode) = take_node_ipc(&mut state).unwrap();
+        drop(unsafe { OwnedHandle::from_raw_handle(raw as usize as *mut _) });
+        assert!(take_node_ipc(&mut state).is_none());
+        drop(unsafe { OwnedHandle::from_raw_handle(write) });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_ipc_rejects_unconnected_listener_and_closes_it() {
+        use std::os::fd::IntoRawFd;
+        let path =
+            std::env::temp_dir().join(format!("libdeno-ipc-listener-{}", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let fd = listener.into_raw_fd();
+        assert!(claim_node_ipc(&fd.to_string()).is_err());
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_ipc_failed_attempt_cannot_claim_reused_descriptor() {
+        const MODE: &str = "LIBDENO_NODE_IPC_FAILURE_TEST";
+        let selected_mode = std::env::var(MODE).unwrap_or_default();
+        if selected_mode == "invalid-mode" || selected_mode == "fcntl-failure" {
+            let fd: i32 = std::env::var("NODE_CHANNEL_FD").unwrap().parse().unwrap();
+            if selected_mode == "fcntl-failure" {
+                FAIL_NEXT_NODE_IPC_FCNTL.with(|flag| flag.set(true));
+            }
+            assert!(unsafe { initialize_node_ipc_from_env() }.is_err());
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+            let mut fillers = Vec::new();
+            let replacement = loop {
+                let file = File::open("/dev/null").unwrap();
+                let opened = file.as_raw_fd();
+                if opened == fd {
+                    break file;
+                }
+                assert!(opened < fd, "descriptor allocation passed the closed slot");
+                fillers.push(file);
+            };
+            assert_eq!(
+                replacement.as_raw_fd(),
+                fd,
+                "failed claim should close its raw fd"
+            );
+            assert!(unsafe { initialize_node_ipc_from_env() }.is_err());
+            assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+            return;
+        }
+
+        use std::os::unix::process::CommandExt;
+        for (mode, serialization) in [("invalid-mode", "not-json"), ("fcntl-failure", "json")] {
+            let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let fd = socket.as_raw_fd();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "limits::tests::node_ipc_failed_attempt_cannot_claim_reused_descriptor",
+                    "--nocapture",
+                ])
+                .env(MODE, mode)
+                .env("NODE_CHANNEL_FD", fd.to_string())
+                .env("NODE_CHANNEL_SERIALIZATION_MODE", serialization)
+                .process_group(0);
+            unsafe {
+                command.pre_exec(move || {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "mode {mode}: {status}");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                    let _ = child.wait();
+                    panic!("Node IPC failure test mode {mode} timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_node_ipc_clone_failure_closes_claimed_handle() {
+        use std::ffi::c_void;
+        use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreatePipe(
+                read_pipe: *mut *mut c_void,
+                write_pipe: *mut *mut c_void,
+                attrs: *mut c_void,
+                size: u32,
+            ) -> i32;
+            fn GetHandleInformation(handle: *mut c_void, flags: *mut u32) -> i32;
+        }
+
+        let mut read = std::ptr::null_mut();
+        let mut write = std::ptr::null_mut();
+        let mut attempt = None;
+        assert!(begin_node_ipc_attempt(&mut attempt));
+        assert_ne!(
+            unsafe { CreatePipe(&mut read, &mut write, std::ptr::null_mut(), 0) },
+            0
+        );
+        let owned = unsafe { OwnedHandle::from_raw_handle(read) };
+        let raw = owned.into_raw_handle();
+        FAIL_NEXT_NODE_IPC_CLONE.with(|flag| flag.set(true));
+        assert!(
+            duplicate_and_close_node_handle(unsafe { OwnedHandle::from_raw_handle(raw) }).is_err()
+        );
+        let mut flags = 0;
+        assert_eq!(unsafe { GetHandleInformation(raw, &mut flags) }, 0);
+        // Close the peer handle created by CreatePipe.
+        drop(unsafe { OwnedHandle::from_raw_handle(write) });
+
+        let mut replacement = std::ptr::null_mut();
+        let mut replacement_peer = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                CreatePipe(
+                    &mut replacement,
+                    &mut replacement_peer,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            0
+        );
+        // A failed clone cannot reset the process-attempt state. Later input
+        // must not be wrapped or closed, even if Windows reuses the handle value.
+        assert!(!begin_node_ipc_attempt(&mut attempt));
+        let mut replacement_flags = 0;
+        assert_ne!(
+            unsafe { GetHandleInformation(replacement, &mut replacement_flags) },
+            0
+        );
+        drop(unsafe { OwnedHandle::from_raw_handle(replacement) });
+        drop(unsafe { OwnedHandle::from_raw_handle(replacement_peer) });
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn absolute_deadline_guard_spawn_failure_is_io_error() {
+        fail_next_watchdog_spawn();
+        let cancellation = CancellationContext::new();
+        let result = AbsoluteDeadlineGuard::new(
+            Some(Instant::now() + Duration::from_secs(60)),
+            Some(cancellation.clone()),
+        );
+        assert!(result.is_err());
+        assert!(!cancellation.is_requested());
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn termination_watchdog_spawn_failure_is_infrastructure_before_poll() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let polled_by_future = polled.clone();
+        let future = std::future::poll_fn(move |_| {
+            polled_by_future.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok::<(), std::io::Error>(()))
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        fail_next_watchdog_spawn();
+        let result = runtime.block_on(run_with_termination(
+            future,
+            Some(Duration::from_secs(60)),
+            None,
+            None,
+        ));
+        assert!(matches!(
+            result,
+            Err(ExecutionTermination::Infrastructure(_))
+        ));
+        assert!(!polled.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -2153,82 +2657,5 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&namespace, permissions).unwrap();
         disk_test_cleanup(root);
-    }
-
-    #[test]
-    fn node_ipc_requires_paired_spawn_marker() {
-        let claimed = std::sync::atomic::AtomicBool::new(false);
-        // Unmarked callers do not invoke claim_node_ipc; invalid paired input
-        // is rejected without consuming the one-time ownership transfer.
-        assert!(claim_node_ipc(&claimed, "not-a-fd", None).is_none());
-        assert!(!claimed.load(std::sync::atomic::Ordering::Acquire));
-        assert_eq!(
-            claim_node_ipc(&claimed, "10", None),
-            Some((10, ChildIpcSerialization::Json))
-        );
-        assert!(claim_node_ipc(&claimed, "10", None).is_none());
-    }
-
-    #[test]
-    fn node_ipc_claim_validates_before_consuming_and_propagates_serialization() {
-        let claimed = std::sync::atomic::AtomicBool::new(false);
-        assert!(claim_node_ipc(&claimed, "bad", None).is_none());
-        assert!(!claimed.load(std::sync::atomic::Ordering::Acquire));
-        assert_eq!(
-            claim_node_ipc(&claimed, "10", Some("advanced")),
-            Some((10, ChildIpcSerialization::Advanced))
-        );
-        assert!(claim_node_ipc(&claimed, "11", None).is_none());
-    }
-
-    #[test]
-    fn node_ipc_claim_is_concurrent_once_only() {
-        let claimed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let threads: Vec<_> = (0..16)
-            .map(|_| {
-                let claimed = claimed.clone();
-                std::thread::spawn(move || claim_node_ipc(&claimed, "10", None).is_some())
-            })
-            .collect();
-        assert_eq!(
-            threads
-                .into_iter()
-                .map(|t| t.join().unwrap())
-                .filter(|won| *won)
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn parse_node_channel_fd_rejects_negative_values() {
-        assert_eq!(parse_node_channel_fd("-1"), None);
-    }
-
-    #[test]
-    fn parse_node_channel_fd_rejects_non_numeric_values() {
-        assert_eq!(parse_node_channel_fd("not-a-fd"), None);
-    }
-
-    #[test]
-    fn parse_node_channel_fd_accepts_normal_values() {
-        assert_eq!(parse_node_channel_fd("10"), Some(10));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn parse_node_channel_fd_rejects_values_outside_raw_fd_range() {
-        assert_eq!(
-            parse_node_channel_fd(&(i32::MAX as i64 + 1).to_string()),
-            None
-        );
-        assert_eq!(parse_node_channel_fd(&i64::MAX.to_string()), None);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn parse_node_channel_fd_rejects_null_and_invalid_handles() {
-        assert_eq!(parse_node_channel_fd("0"), None);
-        assert_eq!(parse_node_channel_fd(&u64::MAX.to_string()), None);
     }
 }

@@ -16,7 +16,6 @@ use std::sync::{mpsc, Arc, Mutex};
 #[cfg(feature = "execution-control")]
 use std::time::{Duration, Instant};
 
-use crate::limits::LIBDENO_SPAWNED_IPC;
 use crate::run;
 use crate::timing::{ExecutionTiming, Phase};
 use crate::LibdenoError;
@@ -26,16 +25,19 @@ use crate::RunOutput;
 
 #[cfg(feature = "execution-control")]
 use crate::limits::CancellationContext;
+#[cfg(all(feature = "execution-control", target_vendor = "apple"))]
+use crate::supervisor::poll_readable;
 #[cfg(feature = "execution-control")]
 use crate::supervisor::{
-    decode_payload, encode_payload, read_frame, read_frame_after_first_byte,
-    read_frame_with_cancellation, validate_supervisor_terminal_shape, write_frame, CancelReason,
-    CleanupStrength, FrameDirection, FrameKind, SupervisorCancellation, SupervisorChildSession,
-    SupervisorFailureCategory, SupervisorFrame, SupervisorFrameEvent, SupervisorParentSession,
-    SupervisorRequest, SupervisorTerminal, SupervisorToken, SUPERVISOR_CANCEL_GRACE,
-    SUPERVISOR_CAPTURE_BYTES_PER_STREAM, SUPERVISOR_CHILD_EXIT_GRACE, SUPERVISOR_CONNECT_TIMEOUT,
-    SUPERVISOR_ENDPOINT_ENV, SUPERVISOR_FRAME_TIMEOUT, SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM,
-    SUPERVISOR_MODE_ENV, SUPERVISOR_TOKEN_ENV,
+    decode_payload, encode_payload, prepare_supervisor_stream, read_frame,
+    read_frame_after_first_byte, read_frame_with_cancellation, validate_supervisor_terminal_shape,
+    write_frame_until, CancelReason, CleanupStrength, FrameDirection, FrameKind,
+    SupervisorCancellation, SupervisorChildSession, SupervisorFailureCategory, SupervisorFrame,
+    SupervisorFrameEvent, SupervisorParentSession, SupervisorRequest, SupervisorTerminal,
+    SupervisorToken, SUPERVISOR_CANCEL_GRACE, SUPERVISOR_CAPTURE_BYTES_PER_STREAM,
+    SUPERVISOR_CHILD_EXIT_GRACE, SUPERVISOR_CONNECT_TIMEOUT, SUPERVISOR_ENDPOINT_ENV,
+    SUPERVISOR_FRAME_TIMEOUT, SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM, SUPERVISOR_MODE_ENV,
+    SUPERVISOR_TOKEN_ENV,
 };
 
 /// The request writer is detached because a blocking `write_all` cannot be
@@ -276,7 +278,9 @@ fn spawn_child_request(
     };
     let child = std::process::Command::new(exe)
         .env(LIBDENO_CHILD_MODE, "1")
-        .env(LIBDENO_SPAWNED_IPC, "1")
+        .env_remove("NODE_CHANNEL_FD")
+        .env_remove("NODE_CHANNEL_SERIALIZATION_MODE")
+        .env_remove("LIBDENO_SPAWNED_IPC")
         .env(LIBDENO_CHILD_TOKEN, &token)
         .current_dir(&cwd)
         .stdin(std::process::Stdio::piped())
@@ -489,6 +493,12 @@ fn run_in_subprocess_with_output_inner(
     let capture = output_readers.collect(None);
     if let Some(error) = capture.error {
         return Err(LibdenoError::Io(error));
+    }
+    if capture.incomplete {
+        return Err(LibdenoError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "subprocess output capture incomplete",
+        )));
     }
     Ok(crate::RunOutput {
         exit_code: status.code().unwrap_or(1),
@@ -813,10 +823,9 @@ fn spawn_supervisor_child(
         .env(SUPERVISOR_MODE_ENV, "1")
         .env(SUPERVISOR_ENDPOINT_ENV, endpoint)
         .env(SUPERVISOR_TOKEN_ENV, token.to_hex())
-        // Keep the existing Node IPC pairing exactly as the legacy child path
-        // does. Supervisor variables are removed by the child handler; this
-        // marker is intentionally left for deno_node/fork descendants.
-        .env(LIBDENO_SPAWNED_IPC, "1")
+        .env_remove("NODE_CHANNEL_FD")
+        .env_remove("NODE_CHANNEL_SERIALIZATION_MODE")
+        .env_remove("LIBDENO_SPAWNED_IPC")
         .current_dir(cwd)
         .stdin(Stdio::inherit())
         .stdout(if capture_stdout {
@@ -1367,7 +1376,6 @@ fn supervisor_control_loop(
     deadline: Option<Instant>,
     terminal_seen: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    stream.set_write_timeout(Some(SUPERVISOR_FRAME_TIMEOUT))?;
     loop {
         if stop_rx.recv_timeout(Duration::from_millis(10)).is_ok() {
             return Ok(());
@@ -1387,6 +1395,7 @@ fn supervisor_control_loop(
             return Ok(());
         }
         let reason = cancellation.reason();
+        let grace_deadline = supervisor_deadline_after(SUPERVISOR_CANCEL_GRACE);
         let should_send = state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1394,13 +1403,15 @@ fn supervisor_control_loop(
         if should_send {
             let payload = encode_payload(&reason)?;
             let frame = SupervisorFrame::new(FrameKind::Cancel, SUPERVISOR_REQUEST_ID, payload)?;
-            if let Err(error) = write_frame(&mut stream, &frame) {
+            let cancel_deadline =
+                supervisor_deadline_after(Duration::from_millis(100)).min(grace_deadline);
+            if let Err(error) = write_frame_until(&mut stream, &frame, Some(cancel_deadline), None)
+            {
                 let _ = stream.shutdown(Shutdown::Both);
                 return Err(error);
             }
         }
 
-        let grace_deadline = supervisor_deadline_after(SUPERVISOR_CANCEL_GRACE);
         loop {
             let remaining = grace_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1455,26 +1466,6 @@ fn phase_frame_deadline(effective_deadline: Option<Instant>) -> Instant {
 }
 
 #[cfg(feature = "execution-control")]
-fn set_supervisor_write_timeout(
-    stream: &TcpStream,
-    effective_deadline: Option<Instant>,
-    cancellation: &SupervisorCancellation,
-) -> std::io::Result<()> {
-    let deadline = phase_frame_deadline(effective_deadline);
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        if effective_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
-            cancellation.request(CancelReason::Deadline);
-        }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "supervisor frame deadline exceeded",
-        ));
-    }
-    stream.set_write_timeout(Some(remaining))
-}
-
-#[cfg(feature = "execution-control")]
 fn read_supervisor_handshake_frame(
     stream: &mut TcpStream,
     effective_deadline: Option<Instant>,
@@ -1504,8 +1495,12 @@ fn write_supervisor_frame(
     effective_deadline: Option<Instant>,
     cancellation: &SupervisorCancellation,
 ) -> std::io::Result<()> {
-    set_supervisor_write_timeout(stream, effective_deadline, cancellation)?;
-    let result = write_frame(stream, frame);
+    let result = write_frame_until(
+        stream,
+        frame,
+        Some(phase_frame_deadline(effective_deadline)),
+        Some(cancellation),
+    );
     if result
         .as_ref()
         .is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
@@ -1538,7 +1533,9 @@ fn accept_supervisor_peer(
                 if !peer.ip().is_loopback() {
                     continue;
                 }
+                #[cfg(not(target_vendor = "apple"))]
                 stream.set_nonblocking(false)?;
+                prepare_supervisor_stream(&stream)?;
                 return Ok(stream);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1579,7 +1576,8 @@ fn send_supervisor_cancel(
     stream: &mut TcpStream,
     state: &Arc<Mutex<SupervisorParentSession>>,
     reason: CancelReason,
-) -> std::io::Result<()> {
+) -> std::io::Result<Instant> {
+    let grace_deadline = supervisor_deadline_after(SUPERVISOR_CANCEL_GRACE);
     let should_send = state
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -1587,22 +1585,38 @@ fn send_supervisor_cancel(
     if should_send {
         let payload = encode_payload(&reason)?;
         let frame = SupervisorFrame::new(FrameKind::Cancel, SUPERVISOR_REQUEST_ID, payload)?;
-        stream.set_write_timeout(Some(Duration::from_millis(100)))?;
-        write_frame(stream, &frame)?;
+        let send_deadline =
+            supervisor_deadline_after(Duration::from_millis(100)).min(grace_deadline);
+        write_frame_until(stream, &frame, Some(send_deadline), None)?;
     }
-    Ok(())
+    Ok(grace_deadline)
+}
+
+#[cfg(feature = "execution-control")]
+struct SupervisorTerminalReadContext<'a> {
+    state: &'a Arc<Mutex<SupervisorParentSession>>,
+    effective_deadline: Option<Instant>,
+    started_phase_deadline: Instant,
+    cancel_grace_deadline: Option<Instant>,
+    cancellation: &'a SupervisorCancellation,
+    read_cancellation: Option<&'a SupervisorCancellation>,
+    on_started: Option<&'a dyn Fn()>,
 }
 
 #[cfg(feature = "execution-control")]
 fn read_supervisor_terminal(
     stream: &mut TcpStream,
-    state: &Arc<Mutex<SupervisorParentSession>>,
-    effective_deadline: Option<Instant>,
-    started_phase_deadline: Instant,
-    cancellation: &SupervisorCancellation,
-    read_cancellation: Option<&SupervisorCancellation>,
-    on_started: Option<&dyn Fn()>,
+    context: SupervisorTerminalReadContext<'_>,
 ) -> std::io::Result<SupervisorTerminal> {
+    let SupervisorTerminalReadContext {
+        state,
+        effective_deadline,
+        started_phase_deadline,
+        cancel_grace_deadline,
+        cancellation,
+        read_cancellation,
+        on_started,
+    } = context;
     let terminal = loop {
         let (parent_state, started_received) = {
             let state = state.lock().unwrap_or_else(|error| error.into_inner());
@@ -1618,10 +1632,9 @@ fn read_supervisor_terminal(
             // STARTED is one phase: all bytes share the same absolute bound.
             (Some(started_phase_deadline), Some(started_phase_deadline))
         } else if cancelled_before_start {
-            let grace_deadline = supervisor_deadline_after(SUPERVISOR_CANCEL_GRACE);
-            let terminal_deadline =
-                effective_deadline.map_or(grace_deadline, |deadline| deadline.min(grace_deadline));
-            (Some(terminal_deadline), Some(terminal_deadline))
+            let grace_deadline = cancel_grace_deadline
+                .unwrap_or_else(|| supervisor_deadline_after(SUPERVISOR_CANCEL_GRACE));
+            (Some(grace_deadline), Some(grace_deadline))
         } else {
             // After STARTED, the control worker owns execution cancellation;
             // keep waiting for a cooperative TERMINAL during its grace. Once
@@ -1629,11 +1642,7 @@ fn read_supervisor_terminal(
             // absolute SUPERVISOR_FRAME_TIMEOUT assembly bound.
             (None, None)
         };
-        let phase_deadline = if waiting_started || cancelled_before_start {
-            effective_deadline
-        } else {
-            None
-        };
+        let phase_deadline = waiting_started.then_some(effective_deadline).flatten();
         let frame = read_frame_after_first_byte(
             stream,
             FrameDirection::ChildToParent,
@@ -1677,6 +1686,8 @@ fn read_supervisor_terminal(
     // a peer a short bounded window to prove an identical duplicate is benign
     // while still rejecting a conflicting duplicate.
     let duplicate_deadline = supervisor_deadline_after(Duration::from_millis(100));
+    let duplicate_deadline =
+        cancel_grace_deadline.map_or(duplicate_deadline, |grace| duplicate_deadline.min(grace));
     loop {
         match read_frame(stream, FrameDirection::ChildToParent, duplicate_deadline) {
             Ok(frame) => {
@@ -1759,6 +1770,7 @@ fn drive_supervisor_session(
     // execution deadline is owned by the control worker from this point on.
     let started_phase_deadline = phase_frame_deadline(None);
     let mut control_worker = None;
+    let mut cancel_grace_deadline = None;
     if start_authorized {
         let start = SupervisorFrame::new(FrameKind::Start, SUPERVISOR_REQUEST_ID, Vec::new())
             .map_err(LibdenoError::Io)?;
@@ -1772,7 +1784,8 @@ fn drive_supervisor_session(
         )?);
     } else {
         let reason = cancellation.reason();
-        send_supervisor_cancel(&mut stream, &state, reason).map_err(LibdenoError::Io)?;
+        cancel_grace_deadline =
+            Some(send_supervisor_cancel(&mut stream, &state, reason).map_err(LibdenoError::Io)?);
     }
 
     // After START authorization, the control worker owns cancellation and its
@@ -1780,12 +1793,15 @@ fn drive_supervisor_session(
     // immediate Interrupted result.
     let terminal = read_supervisor_terminal(
         &mut stream,
-        &state,
-        deadline,
-        started_phase_deadline,
-        &cancellation,
-        (!start_authorized).then_some(&cancellation),
-        on_started,
+        SupervisorTerminalReadContext {
+            state: &state,
+            effective_deadline: deadline,
+            started_phase_deadline,
+            cancel_grace_deadline,
+            cancellation: &cancellation,
+            read_cancellation: (!start_authorized).then_some(&cancellation),
+            on_started,
+        },
     );
     let cancellation_before_terminal = state
         .lock()
@@ -2441,7 +2457,8 @@ fn supervisor_child_exit(
     let payload = encode_payload(&terminal).map_err(LibdenoError::Io)?;
     let frame =
         SupervisorFrame::new(FrameKind::Terminal, request_id, payload).map_err(LibdenoError::Io)?;
-    write_frame(stream, &frame).map_err(LibdenoError::Io)?;
+    write_frame_until(stream, &frame, Some(phase_frame_deadline(None)), None)
+        .map_err(LibdenoError::Io)?;
     Ok(match outcome {
         crate::supervisor::SupervisorOutcome::Completed => exit_code.unwrap_or(1),
         crate::supervisor::SupervisorOutcome::Failed
@@ -2462,11 +2479,23 @@ fn start_supervisor_child_control(
         .name("libdeno-supervisor-child-control".to_string())
         .spawn(move || {
             let result = (|| {
+                #[cfg(not(target_vendor = "apple"))]
                 stream.set_read_timeout(Some(Duration::from_millis(100)))?;
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         return Ok(());
                     }
+                    #[cfg(target_vendor = "apple")]
+                    match poll_readable(
+                        &stream,
+                        Some(supervisor_deadline_after(Duration::from_millis(100))),
+                        None,
+                    ) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+                        Err(error) => return Err(error),
+                    }
+                    #[cfg(not(target_vendor = "apple"))]
                     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
                     let mut first_byte = [0u8; 1];
                     match stream.peek(&mut first_byte) {
@@ -2523,14 +2552,13 @@ fn start_supervisor_child_control(
 fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<i32, LibdenoError> {
     let mut stream = TcpStream::connect_timeout(&endpoint, SUPERVISOR_CONNECT_TIMEOUT)
         .map_err(LibdenoError::Io)?;
-    stream
-        .set_write_timeout(Some(SUPERVISOR_FRAME_TIMEOUT))
-        .map_err(LibdenoError::Io)?;
+    prepare_supervisor_stream(&stream).map_err(LibdenoError::Io)?;
     let mut state = SupervisorChildSession::new();
 
     let hello = SupervisorFrame::new(FrameKind::Hello, 0, token.as_bytes().to_vec())
         .map_err(LibdenoError::Io)?;
-    write_frame(&mut stream, &hello).map_err(LibdenoError::Io)?;
+    write_frame_until(&mut stream, &hello, Some(phase_frame_deadline(None)), None)
+        .map_err(LibdenoError::Io)?;
     let request_frame = read_frame(
         &mut stream,
         FrameDirection::ParentToChild,
@@ -2547,7 +2575,13 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
         .ok_or_else(|| supervisor_error("supervisor REQUEST did not establish an ID"))?;
     let accepted = SupervisorFrame::new(FrameKind::Accepted, request_id, Vec::new())
         .map_err(LibdenoError::Io)?;
-    write_frame(&mut stream, &accepted).map_err(LibdenoError::Io)?;
+    write_frame_until(
+        &mut stream,
+        &accepted,
+        Some(phase_frame_deadline(None)),
+        None,
+    )
+    .map_err(LibdenoError::Io)?;
 
     let next = read_frame(
         &mut stream,
@@ -2590,15 +2624,19 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
     // made before this frame is successfully written.
     let started = SupervisorFrame::new(FrameKind::Started, request_id, Vec::new())
         .map_err(LibdenoError::Io)?;
-    if let Err(error) = write_frame(&mut stream, &started) {
+    if let Err(error) = write_frame_until(
+        &mut stream,
+        &started,
+        Some(phase_frame_deadline(None)),
+        None,
+    ) {
         let _ = stop_tx.send(());
         let _ = control.join();
         return Err(LibdenoError::Io(error));
     }
 
     // The supervisor environment is deliberately stripped only after the
-    // authenticated control setup and before the first runtime entry. The
-    // legacy LIBDENO_SPAWNED_IPC marker is not touched. Capture stays in the
+    // authenticated control setup and before the first runtime entry. Capture stays in the
     // parent on every platform, so the terminal cannot become a second output
     // channel and the child keeps no capture budget.
     let options = LibdenoOptions {
@@ -2756,12 +2794,12 @@ mod tests {
     #[cfg(feature = "execution-control")]
     use super::{
         read_supervisor_terminal, start_supervisor_child_control, SupervisorCancellation,
-        SupervisorParentSession,
+        SupervisorParentSession, SupervisorTerminalReadContext,
     };
     #[cfg(feature = "execution-control")]
     use crate::supervisor::{
-        read_frame, write_frame, CancelReason, FrameDirection, FrameKind,
-        SupervisorFailureCategory, SupervisorFrame, SupervisorOutcome, SupervisorToken,
+        prepare_supervisor_stream, read_frame, write_frame, CancelReason, FrameDirection,
+        FrameKind, SupervisorFailureCategory, SupervisorFrame, SupervisorOutcome, SupervisorToken,
         SupervisorTransportStatus, SUPERVISOR_CAPTURE_BYTES_PER_STREAM,
         SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM, SUPERVISOR_VERSION,
     };
@@ -3476,6 +3514,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let peer = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            prepare_supervisor_stream(&stream).unwrap();
             let mut frame = Vec::new();
             frame.extend_from_slice(b"LDSV");
             frame.push(SUPERVISOR_VERSION);
@@ -3487,6 +3526,7 @@ mod tests {
             let _ = stream.write_all(&frame[1..]);
         });
         let mut stream = TcpStream::connect(address).unwrap();
+        prepare_supervisor_stream(&stream).unwrap();
         let cancellation = SupervisorCancellation::new(
             crate::limits::CancellationContext::new(),
             CancelReason::User,
@@ -3496,12 +3536,15 @@ mod tests {
         let started = Instant::now();
         let error = read_supervisor_terminal(
             &mut stream,
-            &state,
-            None,
-            phase_deadline,
-            &cancellation,
-            None,
-            None,
+            SupervisorTerminalReadContext {
+                state: &state,
+                effective_deadline: None,
+                started_phase_deadline: phase_deadline,
+                cancel_grace_deadline: None,
+                cancellation: &cancellation,
+                read_cancellation: None,
+                on_started: None,
+            },
         )
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
@@ -3521,6 +3564,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let peer = std::thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
+            prepare_supervisor_stream(&stream).unwrap();
             let hello = SupervisorFrame::new(FrameKind::Hello, 0, token_bytes).unwrap();
             write_frame(&mut stream, &hello).unwrap();
             let request = read_frame(
@@ -3599,7 +3643,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        prepare_supervisor_stream(&sender).unwrap();
         let (receiver, _) = listener.accept().unwrap();
+        prepare_supervisor_stream(&receiver).unwrap();
         let request_id = 73;
         let cancellation = SupervisorCancellation::new(
             crate::limits::CancellationContext::new(),
@@ -3618,6 +3664,7 @@ mod tests {
         .unwrap();
         // Serialize through the existing TCP codec, then split its exact bytes.
         let mut codec_sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        prepare_supervisor_stream(&codec_sender).unwrap();
         let (mut codec_receiver, _) = listener.accept().unwrap();
         codec_receiver
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -3637,7 +3684,9 @@ mod tests {
         assert!(cancellation.is_requested(), "CANCEL was not received");
         assert_eq!(cancellation.reason(), CancelReason::Deadline);
 
+        #[cfg(not(target_vendor = "apple"))]
         let deadline = Instant::now() + Duration::from_secs(1);
+        #[cfg(not(target_vendor = "apple"))]
         loop {
             if receiver
                 .read_timeout()
@@ -3653,8 +3702,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
 
+        let stopped_at = Instant::now();
         stop_tx.send(()).unwrap();
         control.join().unwrap().unwrap();
+        assert!(
+            stopped_at.elapsed() < Duration::from_millis(200),
+            "idle control poll exceeded its stop budget"
+        );
     }
 
     #[cfg(feature = "execution-control")]
@@ -3665,7 +3719,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        prepare_supervisor_stream(&peer).unwrap();
         let (receiver, _) = listener.accept().unwrap();
+        prepare_supervisor_stream(&receiver).unwrap();
         let cancellation = SupervisorCancellation::new(
             crate::limits::CancellationContext::new(),
             CancelReason::User,
@@ -3688,7 +3744,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        prepare_supervisor_stream(&peer).unwrap();
         let (receiver, _) = listener.accept().unwrap();
+        prepare_supervisor_stream(&receiver).unwrap();
         let cancellation = SupervisorCancellation::new(
             crate::limits::CancellationContext::new(),
             CancelReason::User,
@@ -3712,7 +3770,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        prepare_supervisor_stream(&_peer).unwrap();
         let (receiver, _) = listener.accept().unwrap();
+        prepare_supervisor_stream(&receiver).unwrap();
         let cancellation = SupervisorCancellation::new(
             crate::limits::CancellationContext::new(),
             CancelReason::User,

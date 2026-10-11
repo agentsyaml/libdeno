@@ -7,6 +7,54 @@ breaking changes are highlighted per release with migration notes.
 
 ## Unreleased
 
+## 0.3.4
+
+### Corrected contracts and limits
+
+- **Fork IPC startup migration**: hosts using Node `child_process.fork` must
+  explicitly call the unsafe `initialize_node_ipc_from_env()` during trusted
+  startup, before creating threads. Initialization is one-shot even on error;
+  after claiming a valid raw endpoint, later validation failure closes it and
+  cannot be retried. Ordinary runs no longer mutate the marker or adopt a live
+  environment channel. Third-party fork hosts must migrate; see
+  [API](docs/api.md#initialize_node_ipc_from_env).
+- **Permission provenance**: only typed Rust denial sources are classified as
+  permission errors. JavaScript names, classes, causes, aggregate errors, and
+  rendered text are not trusted; a JS denial without typed provenance is a
+  `Runtime` or `Core` error depending on its Rust wrapper path (both map to
+  `DenoRuntimeError` in Python). Invalid flags retain their permission or
+  configuration errors.
+- **Output and transport boundaries**: supervisor `TERMINAL` messages do not
+  carry stdout/stderr; the parent captures from pipes, and 64/96 KiB are
+  retention limits rather than a 1 MiB JSON-expansion workaround. Legacy
+  incomplete capture is an `Io`/`TimedOut` failure, distinct from successful
+  byte truncation. Windows overlapped cancellation may wait past the deadline
+  for safe completion and memory lifetime; this is not hard real-time cleanup.
+- **Resource limits**: for an explicit `.tgz` path whose response body starts
+  with gzip magic, libdeno checks the body's final four bytes as an `ISIZE`
+  hint (the final member's size modulo 2^32);
+  `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES` sets the hint
+  threshold, not a decompressed-output budget. This does not identify the first
+  member consumed or account for total extraction; fallback extraction can
+  read to end. HTTP body caps, including the `.tgz` cap, apply to reqwest's
+  returned transport-decoded bytes, not wire bytes, and upstream may allocate
+  during decoding before libdeno checks them.
+  V8 heap limits do not cap native memory or process RSS.
+- **Resolver and workers**: CJS `NodeAnalysisCache` is resolver-local, while
+  the module-graph `ModuleInfoCache` is process-global. Each web worker
+  owns its loader, permission-bound fetcher, and module graph while sharing
+  resolver/cache state. Normal managed `node_modules` directory creation and
+  content changes do not invalidate its resolver path identity/snapshot; a
+  change in the root symlink target does. In-memory module URLs use
+  the `$deno$__libdeno_virtual_` prefix and a random suffix. npm batch errors
+  are root-local, and scheduler wakeups are fixed.
+- **Lifecycle scripts**: npm lifecycle execution remains fixed disabled; the
+  docs do not promise that the system shell runs by default.
+- **Platform validation status**: Windows SDK compilation was blocked by the
+  missing Windows SDK headers in this validation environment. This is a
+  release-validation limitation, not a statement that Windows functionality is
+  unavailable. Windows release approval remains pending a real Windows runner.
+
 ## 0.3.3
 
 ### Correctness and documented limits
@@ -348,19 +396,19 @@ breaking changes are highlighted per release with migration notes.
   reusable). Size-capped; cap configurable via
   `LIBDENO_ANALYSIS_CACHE_ENTRIES` (default 8192; overflow clears the cache).
 - **CJS analysis cache wired in**: the in-memory CJS analysis cache (content-
-  hash keyed, process-global) is enabled on the resolver stack's
+  hash keyed, resolver-local) is enabled on the resolver stack's
   `NodeAnalysisCache` seam. The node resolution / package.json caches stay
   `None` deliberately: upstream's thread-local stores are keyed by path only
   with no invalidation path, so in-process filesystem changes between runs
   (an `npm install`, an edited package.json) would serve stale resolutions.
-- **npm tarball ISIZE guard**: gzip tarballs whose ISIZE trailer claims a
-  decompressed size above the budget are rejected at download time, closing
-  the documented host-OOM exposure for standard npm registry tarball URLs.
-  Budget configurable via `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES` (default
-  1 GiB). Coarse by design: the check keys off the `.tgz` URL path (a
-  registry that serves tarballs without the extension bypasses it), and
-  multi-member gzip files can still decompress past a single member's ISIZE —
-  upstream's streaming fallback (no reservation) remains the precise bound.
+- **npm tarball ISIZE precheck**: for an explicit `.tgz` URL whose response
+  body starts with gzip magic, the final four response bytes are checked as an
+  `ISIZE` hint (the final member's size modulo 2^32). The configurable
+  `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES` value (default 1 GiB) is only this
+  hint threshold, not a hard decompression limit; it does not identify the
+  first consumed member or total extraction size, and downstream fallback may
+  read decompressed output to end. The `.tgz` response-byte cap is also on
+  reqwest's transport-decoded body, not wire bytes.
 - **Disk-backed V8 code cache**: compiled script bytes now survive process
   restarts — CLI-style hosts (every npm-plugin invocation is a fresh process)
   skip recompilation on cold starts. Located under a dedicated

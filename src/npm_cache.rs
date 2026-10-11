@@ -79,6 +79,7 @@ struct ResolverInputIdentity {
 struct ResolverInputProbe {
     files: Vec<FileProbe>,
     byonm_node_modules: Vec<DirectoryProbe>,
+    managed_root_node_modules: Option<RootPathProbe>,
     npmrc_has_auth: bool,
     environment: EnvironmentProbe,
 }
@@ -124,6 +125,12 @@ enum FileProbeKind {
 struct DirectoryProbe {
     path: PathBuf,
     fingerprint: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RootPathProbe {
+    path: PathBuf,
+    identity: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,14 +216,22 @@ pub(crate) fn resolver_input_manifest(
     let (npmrc, npmrc_path) = workspace_factory.npmrc_with_path()?;
     let (byonm, node_modules_path) =
         crate::deno_resolver_adapter::resolver_byonm_and_root_node_modules_path(resolver_factory)?;
+    let managed_root_path = crate::deno_resolver_adapter::managed_root_node_modules_path(
+        workspace_factory,
+        resolver_factory,
+        &initial_cwd,
+    )?;
     let manifest = manifest_from_workspace(
         initial_cwd.clone(),
         config_start_paths.clone(),
         workspace_directory,
         npmrc,
-        npmrc_path.as_deref(),
-        byonm,
-        node_modules_path.as_deref(),
+        WorkspaceResolverInputs {
+            npmrc_path: npmrc_path.as_deref(),
+            byonm,
+            node_modules_path: node_modules_path.as_deref(),
+            managed_root_path: managed_root_path.as_deref(),
+        },
     )?;
 
     // The semantic values above came from memoized discovery. Reparse through
@@ -238,14 +253,23 @@ pub(crate) fn resolver_input_manifest(
         crate::deno_resolver_adapter::resolver_byonm_and_root_node_modules_path(
             &authoritative_resolver,
         )?;
+    let authoritative_managed_root_path =
+        crate::deno_resolver_adapter::managed_root_node_modules_path(
+            &authoritative_factory,
+            &authoritative_resolver,
+            &initial_cwd,
+        )?;
     let authoritative = manifest_from_workspace(
         initial_cwd,
         config_start_paths,
         authoritative_workspace,
         authoritative_npmrc,
-        authoritative_npmrc_path.as_deref(),
-        authoritative_byonm,
-        authoritative_node_modules_path.as_deref(),
+        WorkspaceResolverInputs {
+            npmrc_path: authoritative_npmrc_path.as_deref(),
+            byonm: authoritative_byonm,
+            node_modules_path: authoritative_node_modules_path.as_deref(),
+            managed_root_path: authoritative_managed_root_path.as_deref(),
+        },
     )?;
     if manifest.identity != authoritative.identity
         || !npm_sensitive_state_equal(npmrc, authoritative_npmrc)
@@ -253,10 +277,18 @@ pub(crate) fn resolver_input_manifest(
             node_modules_path.as_deref(),
             authoritative_node_modules_path.as_deref(),
         )
+        || managed_root_path != authoritative_managed_root_path
     {
         return Err(deno_core::anyhow::anyhow!(RESOLVER_INPUTS_CHANGED));
     }
     Ok(manifest)
+}
+
+struct WorkspaceResolverInputs<'a> {
+    npmrc_path: Option<&'a Path>,
+    byonm: bool,
+    node_modules_path: Option<&'a Path>,
+    managed_root_path: Option<&'a Path>,
 }
 
 fn manifest_from_workspace(
@@ -264,10 +296,14 @@ fn manifest_from_workspace(
     config_start_paths: Vec<PathBuf>,
     workspace_directory: &deno_config::workspace::WorkspaceDirectoryRc,
     npmrc: &deno_npmrc::ResolvedNpmRc,
-    npmrc_path: Option<&Path>,
-    byonm: bool,
-    node_modules_path: Option<&Path>,
+    resolver_inputs: WorkspaceResolverInputs<'_>,
 ) -> deno_core::anyhow::Result<ResolverInputManifest> {
+    let WorkspaceResolverInputs {
+        npmrc_path,
+        byonm,
+        node_modules_path,
+        managed_root_path,
+    } = resolver_inputs;
     let workspace = &workspace_directory.workspace;
     let (npmrc_identity, npmrc_has_auth) = npm_config_fingerprint(npmrc);
 
@@ -375,6 +411,15 @@ fn manifest_from_workspace(
     normalize_file_probes(&mut files);
     let environment = environment_probe(&files, npmrc_has_auth, global_npmrc);
 
+    // Canonical path identity is stable when a missing root becomes a regular
+    // directory, but changes when the path is replaced by a link or its target
+    // changes. It deliberately ignores directory metadata and children.
+    let managed_root_node_modules = managed_root_path.map(|path| {
+        let path = absolute_path(path);
+        let identity = canonical_path(&path);
+        RootPathProbe { path, identity }
+    });
+
     let mut byonm_paths = if byonm {
         collect_byonm_node_modules_paths(&scope_dirs)
     } else {
@@ -414,6 +459,7 @@ fn manifest_from_workspace(
         probe: ResolverInputProbe {
             files,
             byonm_node_modules,
+            managed_root_node_modules,
             npmrc_has_auth,
             environment,
         },
@@ -430,6 +476,14 @@ impl ResolverInputManifest {
             .files
             .iter()
             .any(|probe| current_file_fingerprint(&probe.path, probe.kind) != probe.fingerprint)
+        {
+            return Ok(false);
+        }
+        if self
+            .probe
+            .managed_root_node_modules
+            .as_ref()
+            .is_some_and(|probe| canonical_path(&probe.path) != probe.identity)
         {
             return Ok(false);
         }
@@ -1083,6 +1137,7 @@ mod tests {
             probe: ResolverInputProbe {
                 files: vec![],
                 byonm_node_modules: vec![],
+                managed_root_node_modules: None,
                 npmrc_has_auth: false,
                 environment: EnvironmentProbe {
                     deno_dir: None,
@@ -1099,6 +1154,167 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[cfg(feature = "npm")]
+    struct ColdInstallRegistry {
+        shutdown: std::sync::mpsc::Sender<()>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    #[cfg(feature = "npm")]
+    impl ColdInstallRegistry {
+        fn new() -> (Self, String) {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let base_url = format!("http://127.0.0.1:{}/", address.port());
+            let packument = format!(
+                r#"{{"name":"cold-pkg","dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"cold-pkg","version":"1.0.0","main":"index.js","dist":{{"tarball":"{base_url}cold-pkg-1.0.0.tgz"}}}}}}}}"#
+            );
+            let archive = test_gzip(&test_tar_archive(&[
+                (
+                    "package/package.json",
+                    br#"{"name":"cold-pkg","version":"1.0.0","main":"index.js"}"#,
+                ),
+                ("package/index.js", b"module.exports = 'cold-install-ok';"),
+            ]));
+            let responses = [
+                (
+                    "/cold-pkg".to_string(),
+                    ("application/json".to_string(), packument.into_bytes()),
+                ),
+                (
+                    "/cold-pkg-1.0.0.tgz".to_string(),
+                    ("application/octet-stream".to_string(), archive),
+                ),
+            ]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+            let (shutdown, receiver) = std::sync::mpsc::channel();
+            listener.set_nonblocking(true).unwrap();
+            let thread = std::thread::spawn(move || loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut request = Vec::new();
+                        let mut buffer = [0; 1024];
+                        loop {
+                            match stream.read(&mut buffer) {
+                                Ok(0) => break,
+                                Ok(count) => {
+                                    request.extend_from_slice(&buffer[..count]);
+                                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let path = request
+                            .split(|byte| *byte == b' ')
+                            .nth(1)
+                            .map(|path| String::from_utf8_lossy(path).into_owned())
+                            .unwrap_or_default();
+                        let response = responses
+                            .get(&path)
+                            .map(|(content_type, body)| test_http_response(200, content_type, body))
+                            .unwrap_or_else(|| test_http_response(404, "text/plain", b"missing"));
+                        let _ = stream.write_all(&response);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if receiver.try_recv().is_ok() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            });
+            (Self { shutdown, thread }, base_url)
+        }
+
+        fn shutdown(self) {
+            let _ = self.shutdown.send(());
+            let _ = self.thread.join();
+        }
+    }
+
+    #[cfg(feature = "npm")]
+    fn test_http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    #[cfg(feature = "npm")]
+    fn test_tar_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        for (name, contents) in entries {
+            let mut header = [0u8; 512];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            header[100..108].copy_from_slice(b"0000644\0");
+            header[108..116].copy_from_slice(b"0000000\0");
+            header[116..124].copy_from_slice(b"0000000\0");
+            header[124..136].copy_from_slice(format!("{:011o}\0", contents.len()).as_bytes());
+            header[136..148].copy_from_slice(b"00000000000\0");
+            header[148..156].copy_from_slice(b"        ");
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let checksum: u32 = header.iter().map(|byte| *byte as u32).sum();
+            header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            archive.extend_from_slice(&header);
+            archive.extend_from_slice(contents);
+            archive.extend(std::iter::repeat_n(0, (512 - contents.len() % 512) % 512));
+        }
+        archive.extend([0u8; 1024]);
+        archive
+    }
+
+    #[cfg(feature = "npm")]
+    fn test_gzip(data: &[u8]) -> Vec<u8> {
+        let mut compressed = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0x03];
+        let mut offset = 0;
+        loop {
+            let count = (data.len() - offset).min(65535);
+            let final_block = offset + count == data.len();
+            let length = count as u16;
+            compressed.push(final_block as u8);
+            compressed.extend_from_slice(&length.to_le_bytes());
+            compressed.extend_from_slice(&(!length).to_le_bytes());
+            compressed.extend_from_slice(&data[offset..offset + count]);
+            offset += count;
+            if final_block {
+                break;
+            }
+        }
+        let crc = test_crc32(data);
+        compressed.extend_from_slice(&crc.to_le_bytes());
+        compressed.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        compressed
+    }
+
+    #[cfg(feature = "npm")]
+    fn test_crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff;
+        for byte in data {
+            crc ^= *byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    0xedb8_8320 ^ (crc >> 1)
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        crc ^ 0xffff_ffff
     }
 
     #[test]
@@ -1182,6 +1398,232 @@ mod tests {
             .iter()
             .any(|probe| probe.path == absolute_path(&node_modules)));
         assert!(managed_snapshot_key(&manifest).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_manifest_tracks_effective_root_identity_not_its_contents() {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "libdeno-managed-node-modules-manifest-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target_a = dir.join("target-a");
+        let target_b = dir.join("target-b");
+        std::fs::create_dir_all(&target_a).unwrap();
+        std::fs::create_dir_all(&target_b).unwrap();
+        let node_modules = dir.join("node_modules");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"managed-link-project","dependencies":{}}"#,
+        )
+        .unwrap();
+
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
+        let resolver = new_resolver_factory(
+            factory.clone(),
+            crate::analysis_cache::node_analysis_cache(),
+        );
+        assert!(!resolver.use_byonm().unwrap());
+        let manifest =
+            resolver_input_manifest(dir.clone(), vec![dir.clone()], &factory, &resolver).unwrap();
+        assert!(manifest.is_current().unwrap());
+        std::fs::create_dir(&node_modules).unwrap();
+        std::fs::create_dir(node_modules.join("installed-package")).unwrap();
+        assert!(manifest.is_current().unwrap());
+
+        std::fs::remove_dir(node_modules.join("installed-package")).unwrap();
+        std::fs::remove_dir(&node_modules).unwrap();
+        std::os::unix::fs::symlink(&target_a, &node_modules).unwrap();
+        assert!(!manifest.is_current().unwrap());
+
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
+        let resolver = new_resolver_factory(
+            factory.clone(),
+            crate::analysis_cache::node_analysis_cache(),
+        );
+        let manifest =
+            resolver_input_manifest(dir.clone(), vec![dir.clone()], &factory, &resolver).unwrap();
+        assert!(!manifest.identity.byonm);
+        assert!(manifest.is_current().unwrap());
+        std::fs::remove_file(&node_modules).unwrap();
+        std::os::unix::fs::symlink(&target_b, &node_modules).unwrap();
+        assert!(!manifest.is_current().unwrap());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_root_path_falls_back_to_initial_cwd_without_discovery_config() {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "libdeno-managed-root-selection-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let initial_cwd = dir.join("project");
+        let discovery_start = dir.join("discovery");
+        std::fs::create_dir_all(&initial_cwd).unwrap();
+        std::fs::create_dir_all(&discovery_start).unwrap();
+        let factory =
+            new_workspace_factory(initial_cwd.clone(), vec![discovery_start.clone()]).unwrap();
+        let root_folder = factory
+            .workspace_directory()
+            .unwrap()
+            .workspace
+            .root_folder_configs();
+        assert!(root_folder.deno_json.is_none());
+        assert!(root_folder.pkg_json.is_none());
+        let resolver = new_resolver_factory(
+            factory.clone(),
+            crate::analysis_cache::node_analysis_cache(),
+        );
+        assert!(!resolver.use_byonm().unwrap());
+        let managed_root = crate::deno_resolver_adapter::managed_root_node_modules_path(
+            &factory,
+            &resolver,
+            &initial_cwd,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(managed_root, initial_cwd.join("node_modules"));
+        assert_ne!(managed_root, discovery_start.join("node_modules"));
+
+        let manifest = resolver_input_manifest(
+            initial_cwd.clone(),
+            vec![discovery_start],
+            &factory,
+            &resolver,
+        )
+        .unwrap();
+        assert_eq!(
+            manifest
+                .probe
+                .managed_root_node_modules
+                .as_ref()
+                .unwrap()
+                .path,
+            initial_cwd.join("node_modules")
+        );
+        std::fs::create_dir_all(dir.join("discovery/node_modules/unrelated")).unwrap();
+        assert!(manifest.is_current().unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn managed_root_probe_is_absent_when_node_modules_mode_is_none() {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("libdeno-managed-root-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("deno.json"), r#"{"nodeModulesDir":"none"}"#).unwrap();
+
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
+        let resolver = new_resolver_factory(
+            factory.clone(),
+            crate::analysis_cache::node_analysis_cache(),
+        );
+        assert!(!resolver.use_byonm().unwrap());
+        assert!(
+            crate::deno_resolver_adapter::resolver_byonm_and_root_node_modules_path(&resolver)
+                .unwrap()
+                .1
+                .is_none()
+        );
+        let manifest =
+            resolver_input_manifest(dir.clone(), vec![dir.clone()], &factory, &resolver).unwrap();
+        assert!(manifest.probe.managed_root_node_modules.is_none());
+
+        std::fs::create_dir_all(dir.join("node_modules/unrelated")).unwrap();
+        assert!(manifest.is_current().unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "npm")]
+    #[test]
+    fn successful_cold_install_saves_snapshot_when_root_appears() {
+        let _semantic_lock = semantic_probe_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env_lock = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "libdeno-cold-snapshot-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = dir.join("home");
+        let deno_dir = dir.join("deno-dir");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&deno_dir).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let _env = TestEnvGuard::new(&["HOME", "NPM_CONFIG_REGISTRY", "DENO_DIR"]);
+        let (registry, registry_url) = ColdInstallRegistry::new();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("DENO_DIR", &deno_dir);
+        std::env::set_var("NPM_CONFIG_REGISTRY", registry_url);
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"cold-snapshot-project","dependencies":{"cold-pkg":"1.0.0"}}"#,
+        )
+        .unwrap();
+        let entry = project.join("main.js");
+        std::fs::write(
+            &entry,
+            "import value from 'npm:cold-pkg'; if (value !== 'cold-install-ok') throw new Error('bad package');",
+        )
+        .unwrap();
+
+        let factory = new_workspace_factory(project.clone(), vec![project.clone()]).unwrap();
+        let resolver = new_resolver_factory(
+            factory.clone(),
+            crate::analysis_cache::node_analysis_cache(),
+        );
+        let manifest =
+            resolver_input_manifest(project.clone(), vec![project.clone()], &factory, &resolver)
+                .unwrap();
+        let key = managed_snapshot_key(&manifest).expect("managed project should be cacheable");
+        assert!(get(&key).is_none(), "snapshot must be cold before the run");
+        assert!(!project.join("node_modules").exists());
+
+        assert_eq!(
+            crate::run(
+                &entry,
+                &crate::LibdenoOptions {
+                    cwd: Some(project.clone()),
+                    allow_all_permissions: true,
+                    ..Default::default()
+                }
+            )
+            .unwrap(),
+            0
+        );
+        registry.shutdown();
+
+        assert!(project.join("node_modules").is_dir());
+        assert!(
+            get(&key).is_some(),
+            "successful first install did not save its snapshot"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

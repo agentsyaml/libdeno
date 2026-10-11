@@ -113,6 +113,34 @@ pub(crate) fn resolver_byonm_and_root_node_modules_path(
     Ok((byonm, root_node_modules_path))
 }
 
+/// Returns the project-side identity path for the managed node_modules root.
+/// Respect the resolver's effective mode, while retaining the non-canonical
+/// path selected from the workspace root folder for link-change detection.
+pub(crate) fn managed_root_node_modules_path(
+    workspace_factory: &WorkspaceFactory<RealSys>,
+    resolver_factory: &ResolverFactory<RealSys>,
+    initial_cwd: &Path,
+) -> deno_core::anyhow::Result<Option<PathBuf>> {
+    let (byonm, configured_root) = resolver_byonm_and_root_node_modules_path(resolver_factory)?;
+    if byonm || configured_root.is_none() {
+        return Ok(None);
+    }
+    let workspace = workspace_factory.workspace_directory()?;
+    let root_folder = workspace.workspace.root_folder_configs();
+    let root = root_folder
+        .deno_json
+        .as_ref()
+        .map(|config| config.dir_path())
+        .or_else(|| {
+            root_folder
+                .pkg_json
+                .as_ref()
+                .and_then(|package| package.path.parent().map(Path::to_path_buf))
+        })
+        .unwrap_or_else(|| initial_cwd.to_path_buf());
+    Ok(Some(root.join("node_modules")))
+}
+
 /// Returns only upstream resolver data needed by the service-owned process
 /// state serializer. The provider implementation remains in `services`.
 #[cfg(feature = "npm")]

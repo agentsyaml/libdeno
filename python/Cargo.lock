@@ -4847,7 +4847,7 @@ dependencies = [
 
 [[package]]
 name = "libdeno"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4878,11 +4878,12 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "url",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "libdeno-python"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "libdeno",
  "pyo3",

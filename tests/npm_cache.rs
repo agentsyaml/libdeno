@@ -452,6 +452,59 @@ fn first_run_requires_the_registry() {
 }
 
 #[test]
+fn registry_recovery_across_runs_preserves_sibling_root() {
+    let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard::new(&["NPM_CONFIG_REGISTRY", "DENO_DIR", "HOME"]);
+    let home = temp_dir("dep-graph-retry-home");
+    std::env::set_var("HOME", &home);
+    let dir = temp_dir("dep-graph-retry");
+    let deno_dir = temp_dir("dep-graph-retry-deno");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&deno_dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&deno_dir).unwrap();
+    let refusing_registry = RefusingRegistry::new();
+    std::env::set_var("NPM_CONFIG_REGISTRY", refusing_registry.url());
+    std::env::set_var("DENO_DIR", &deno_dir);
+
+    // Keep an unrelated root usable while the npm run fails, then recover on
+    // a later run after the registry identity changes.
+    let runtime = build_runtime(&dir);
+    write_project(&dir);
+    std::fs::write(dir.join("sibling.js"), "export const sibling = true;").unwrap();
+    let options = LibdenoOptions {
+        cwd: Some(dir.clone()),
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    let sibling = dir.join("sibling.js");
+    assert_eq!(run_with(&runtime, &sibling, &options).unwrap(), 0);
+
+    let entry = dir.join("main.js");
+    let error = run_with(&runtime, &entry, &options).unwrap_err();
+    assert!(
+        error.to_string().contains("mock-pkg"),
+        "expected an npm-resolution failure, got: {error}"
+    );
+    assert_eq!(run_with(&runtime, &sibling, &options).unwrap(), 0);
+    assert!(refusing_registry.connection_count() > 0);
+    refusing_registry.shutdown();
+
+    let registry = MockRegistry::new();
+    std::env::set_var("NPM_CONFIG_REGISTRY", registry.url());
+    assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+        "hello-from-mock-pkg"
+    );
+    registry.shutdown();
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&deno_dir);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn cached_snapshot_skips_network_on_second_run() {
     // P1-1: run 1 resolves through the live mock registry (and populates the
     // in-process snapshot cache + the on-disk npm cache). After the registry

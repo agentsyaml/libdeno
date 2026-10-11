@@ -66,6 +66,15 @@ pub use executor::{
     ExecutionCapability, ExecutionError, ExecutionFailure, ExecutionOutput, ExecutionReport,
     ExecutionRequest, ExecutionResult, Executor, ExecutorBuilder, UnsupportedCapability,
 };
+/// Initializes the optional Node IPC channel from the launcher environment.
+/// This is a one-attempt startup operation, including on error. Once a
+/// parseable handle is claimed, later validation errors consume and close it;
+/// it cannot be retried or reclaimed by the caller.
+///
+/// # Safety
+/// When `NODE_CHANNEL_FD` is present, the caller guarantees it names a valid
+/// IPC endpoint with unique ownership, transferred exclusively to libdeno.
+pub use limits::initialize_node_ipc_from_env;
 pub use permission_broker::{
     install_permission_broker, install_permission_hook, PermissionPrompt, PermissionRequest,
 };
@@ -420,6 +429,15 @@ pub enum LibdenoError {
     Timeout(String),
 }
 
+/// Join a worker thread, preserving spawn I/O errors and translating panics.
+pub(crate) fn join_worker<T>(
+    spawn: impl FnOnce() -> std::io::Result<std::thread::JoinHandle<T>>,
+) -> Result<T, LibdenoError> {
+    spawn().map_err(LibdenoError::Io)?.join().map_err(|_| {
+        LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
+    })
+}
+
 // The lifecycle event dispatches (`dispatch_load_event` and friends) return
 // `Result<_, Box<JsError>>`; funnel those through the Runtime variant via
 // anyhow instead of keeping a dedicated (never-constructed) enum variant.
@@ -430,50 +448,93 @@ impl From<Box<deno_core::error::JsError>> for LibdenoError {
 }
 
 impl LibdenoError {
-    /// Returns whether this error carries Deno's typed `NotCapable` permission
-    /// error class. This deliberately ignores rendered error text so a user
-    /// exception mentioning permission wording remains a runtime error.
+    /// Returns whether a trusted Rust permission-check path produced this error.
+    ///
+    /// Classification is based only on concrete Rust permission error types
+    /// (including their standard source chains), never JavaScript `name`,
+    /// `cause`, aggregate errors, `JsErrorBox` class labels, or rendered text.
+    /// JavaScript exceptions that mimic Deno's `NotCapable` shape remain runtime
+    /// errors. Typed option parsing errors remain [`Self::Permission`].
     pub fn is_permission_error(&self) -> bool {
         match self {
-            Self::Runtime(error) => error.chain().any(error_chain_has_not_capable),
-            Self::Core(error) => error_chain_has_not_capable(error),
+            Self::Runtime(error) => error
+                .chain()
+                .any(error_chain_has_permission_source_in_chain),
+            Self::Core(error) => error_chain_has_permission_source(error),
             _ => false,
         }
     }
 }
 
-fn error_chain_has_not_capable(error: &(dyn std::error::Error + 'static)) -> bool {
-    if let Some(error) = error.downcast_ref::<deno_core::error::JsError>() {
-        return js_error_has_not_capable(error);
+fn error_chain_has_permission_source(error: &(dyn std::error::Error + 'static)) -> bool {
+    use deno_core::error::{CoreError, CoreErrorKind};
+    use deno_runtime::deno_permissions::{
+        ChildPermissionError, PermissionCheckError, PermissionDeniedError,
+    };
+
+    if error.downcast_ref::<PermissionDeniedError>().is_some()
+        || error.downcast_ref::<Box<PermissionDeniedError>>().is_some()
+        || matches!(
+            error.downcast_ref::<PermissionCheckError>(),
+            Some(PermissionCheckError::PermissionDenied(_))
+        )
+        || error
+            .downcast_ref::<Box<PermissionCheckError>>()
+            .is_some_and(|error| {
+                matches!(error.as_ref(), PermissionCheckError::PermissionDenied(_))
+            })
+        || matches!(
+            error.downcast_ref::<ChildPermissionError>(),
+            Some(ChildPermissionError::Escalation)
+        )
+    {
+        return true;
     }
-    if let Some(error) = error.downcast_ref::<Box<deno_core::error::JsError>>() {
-        return js_error_has_not_capable(error);
+    // CoreError's and CoreErrorKind's transparent sources skip the wrapper
+    // value. Follow their stored variants so JsBox's Rust inner error is seen.
+    if let Some(error) = error.downcast_ref::<CoreError>() {
+        return error_chain_has_permission_source(error.0.as_ref());
     }
+    if let Some(CoreErrorKind::JsBox(error)) = error.downcast_ref::<CoreErrorKind>() {
+        return error_chain_has_permission_source(error);
+    }
+    if let Some(CoreErrorKind::ExtensionTranspiler(error)) = error.downcast_ref::<CoreErrorKind>() {
+        return error
+            .get_inner_ref()
+            .is_some_and(|inner| error_chain_has_permission_source(inner));
+    }
+    // Box<T>'s Error::source also forwards to T::source, skipping T itself.
+    if let Some(error) = error.downcast_ref::<Box<CoreError>>() {
+        return error_chain_has_permission_source(error.as_ref());
+    }
+    if let Some(error) = error.downcast_ref::<Box<CoreErrorKind>>() {
+        return error_chain_has_permission_source(error.as_ref());
+    }
+    // JsErrorBox may wrap a concrete permission error. Inspect only its inner
+    // Rust error, not its JS-facing class or message.
     if let Some(error) = error.downcast_ref::<deno_error::JsErrorBox>() {
-        return js_error_class_is_not_capable(error);
-    }
-    if let Some(error) = error.downcast_ref::<Box<deno_error::JsErrorBox>>() {
-        return js_error_class_is_not_capable(error);
-    }
-    if let Some(error) = error.downcast_ref::<deno_core::error::CoreError>() {
-        if js_error_class_is_not_capable(error) {
+        if error
+            .get_inner_ref()
+            .is_some_and(|inner| error_chain_has_permission_source(inner))
+        {
             return true;
         }
     }
-    error.source().is_some_and(error_chain_has_not_capable)
+    if let Some(error) = error.downcast_ref::<Box<deno_error::JsErrorBox>>() {
+        if error
+            .get_inner_ref()
+            .is_some_and(|inner| error_chain_has_permission_source(inner))
+        {
+            return true;
+        }
+    }
+    error
+        .source()
+        .is_some_and(error_chain_has_permission_source)
 }
 
-fn js_error_class_is_not_capable(error: &dyn deno_error::JsErrorClass) -> bool {
-    error.get_class().as_ref() == "NotCapable"
-}
-
-fn js_error_has_not_capable(error: &deno_core::error::JsError) -> bool {
-    error.name.as_deref() == Some("NotCapable")
-        || error.cause.as_deref().is_some_and(js_error_has_not_capable)
-        || error
-            .aggregated
-            .as_ref()
-            .is_some_and(|errors| errors.iter().any(js_error_has_not_capable))
+fn error_chain_has_permission_source_in_chain(error: &(dyn std::error::Error + 'static)) -> bool {
+    error_chain_has_permission_source(error)
 }
 
 fn check_entry_read_permission(
@@ -518,7 +579,7 @@ pub fn run(entry: impl AsRef<Path>, options: &LibdenoOptions) -> Result<i32, Lib
 /// `Vec<u8>` — anything `AsRef<[u8]>`) to completion and returns the exit code.
 ///
 /// The source is registered under a unique virtual `file:` URL inside
-/// `base_dir` (e.g. `<base_dir>/__libdeno_virtual_<random-hex>.ts` for
+/// `base_dir` (e.g. `<base_dir>/$deno$__libdeno_virtual_<random-hex>.ts` for
 /// [`SourceLang::TypeScript`]) and then flows through the *entire* normal
 /// pipeline — graph build, TypeScript transpile, CJS, JSON, npm/remote
 /// imports — exactly like a file on disk. That means:
@@ -641,16 +702,12 @@ pub(crate) fn run_with_output_observed(
         let _admission = timing.span(Phase::Admission);
         RunLease::acquire(options.capture_stdout || options.capture_stderr)?
     };
-    // Capture the entry-time child-IPC marker (and write it back so fork children inherit it).
-    limits::capture_spawned_ipc_marker();
     let entry = entry.clone();
     let options = options.clone();
     if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run_sync_output(&entry, &options, timing))
-            .join()
-            .map_err(|_| {
-                LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
-            })?
+        join_worker(|| {
+            std::thread::Builder::new().spawn(move || run_sync_output(&entry, &options, timing))
+        })?
     } else {
         run_sync_output(&entry, &options, timing)
     }
@@ -667,17 +724,13 @@ pub(crate) fn run_with_output_observed_cancellable(
         let _admission = timing.span(Phase::Admission);
         RunLease::acquire(options.capture_stdout || options.capture_stderr)?
     };
-    limits::capture_spawned_ipc_marker();
     let entry = entry.clone();
     let options = options.clone();
     if tokio::runtime::Handle::try_current().is_ok() {
         let cancellation = cancellation.clone();
-        std::thread::spawn(move || {
-            run_sync_output_cancellable(&entry, &options, timing, cancellation)
-        })
-        .join()
-        .map_err(|_| {
-            LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
+        join_worker(|| {
+            std::thread::Builder::new()
+                .spawn(move || run_sync_output_cancellable(&entry, &options, timing, cancellation))
         })?
     } else {
         run_sync_output_cancellable(&entry, &options, timing, cancellation)
@@ -694,7 +747,8 @@ pub(crate) fn run_with_output_observed_cancellable_until(
     absolute_deadline: Option<std::time::Instant>,
 ) -> Result<RunOutput, LibdenoError> {
     let deadline_guard =
-        limits::AbsoluteDeadlineGuard::new(absolute_deadline, cancellation.clone());
+        limits::AbsoluteDeadlineGuard::new(absolute_deadline, cancellation.clone())
+            .map_err(LibdenoError::Io)?;
     let result = crate::runtime::run_with_output_observed_cancellable(
         runtime,
         entry,
@@ -938,8 +992,6 @@ where
         let _admission = timing.span(Phase::Admission);
         RunLease::acquire(options.capture_stdout || options.capture_stderr)?
     };
-    // Capture the entry-time child-IPC marker (fork children inherit it).
-    limits::capture_spawned_ipc_marker();
     #[cfg(windows)]
     if options.capture_stdout || options.capture_stderr {
         return Err(LibdenoError::Configuration(
@@ -1167,6 +1219,9 @@ pub(crate) async fn run_inner_with_cancellation(
                 "execution cancellation requested; isolate terminated".to_string(),
             ))
         }
+        Err(limits::ExecutionTermination::Infrastructure(error)) => {
+            return Err(LibdenoError::Io(error));
+        }
     };
 
     let exit_code = match run_result {
@@ -1226,7 +1281,7 @@ fn resolve_main_module(
                 ))
             })?;
             let virtual_path = base_dir.join(format!(
-                "__libdeno_virtual_{:016x}.{ext}",
+                "$deno$__libdeno_virtual_{:016x}.{ext}",
                 u64::from_ne_bytes(suffix)
             ));
             let url = ModuleSpecifier::from_file_path(&virtual_path).map_err(|_| {
@@ -1327,6 +1382,99 @@ fn package_main(pkg_path: &Path) -> Result<PathBuf, AnyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn denied_read() -> deno_runtime::deno_permissions::PermissionDeniedError {
+        deno_runtime::deno_permissions::PermissionDeniedError {
+            access: "read".into(),
+            name: "read",
+            custom_message: None,
+            state: deno_runtime::deno_permissions::PermissionState::Denied,
+        }
+    }
+
+    #[test]
+    fn permission_source_survives_js_error_box_and_core_error_wrappers() {
+        use deno_runtime::deno_permissions::PermissionCheckError;
+
+        let js_error =
+            deno_error::JsErrorBox::from_err(PermissionCheckError::PermissionDenied(denied_read()));
+        assert!(
+            LibdenoError::Runtime(deno_core::anyhow::Error::new(js_error)).is_permission_error()
+        );
+
+        let core_error = deno_core::error::CoreErrorKind::JsBox(deno_error::JsErrorBox::from_err(
+            PermissionCheckError::PermissionDenied(denied_read()),
+        ))
+        .into_box();
+        assert!(LibdenoError::Core(core_error).is_permission_error());
+
+        let boxed_core_error = Box::new(
+            deno_core::error::CoreErrorKind::JsBox(deno_error::JsErrorBox::from_err(
+                PermissionCheckError::PermissionDenied(denied_read()),
+            ))
+            .into_box(),
+        );
+        assert!(
+            LibdenoError::Runtime(deno_core::anyhow::Error::new(boxed_core_error))
+                .is_permission_error()
+        );
+
+        let boxed_js_error = Box::new(deno_error::JsErrorBox::from_err(
+            PermissionCheckError::PermissionDenied(denied_read()),
+        ));
+        assert!(
+            LibdenoError::Runtime(deno_core::anyhow::Error::new(boxed_js_error))
+                .is_permission_error()
+        );
+
+        let boxed_permission_check =
+            Box::new(PermissionCheckError::PermissionDenied(denied_read()));
+        assert!(
+            LibdenoError::Runtime(deno_core::anyhow::Error::new(boxed_permission_check))
+                .is_permission_error()
+        );
+
+        let boxed_permission_denied = Box::new(denied_read());
+        assert!(
+            LibdenoError::Runtime(deno_core::anyhow::Error::new(boxed_permission_denied))
+                .is_permission_error()
+        );
+
+        let transpiler_error = deno_core::error::CoreErrorKind::ExtensionTranspiler(
+            deno_error::JsErrorBox::from_err(PermissionCheckError::PermissionDenied(denied_read())),
+        )
+        .into_box();
+        assert!(LibdenoError::Core(transpiler_error).is_permission_error());
+    }
+
+    #[test]
+    fn permission_classification_rejects_io_and_js_class_only() {
+        use deno_runtime::deno_permissions::PermissionCheckError;
+
+        let io_error = deno_error::JsErrorBox::from_err(PermissionCheckError::Io(
+            std::io::Error::other("not a permission denial"),
+        ));
+        assert!(
+            !LibdenoError::Runtime(deno_core::anyhow::Error::new(io_error)).is_permission_error()
+        );
+
+        let forged_class = deno_error::JsErrorBox::new("NotCapable", "forged permission error");
+        assert!(
+            !LibdenoError::Runtime(deno_core::anyhow::Error::new(forged_class))
+                .is_permission_error()
+        );
+    }
+
+    #[test]
+    fn failed_worker_spawn_returns_io_error_and_releases_lease() {
+        let result = {
+            let _lease = RunLease::acquire(true).unwrap();
+            join_worker::<()>(|| Err(std::io::Error::other("injected spawn failure")))
+        };
+        assert!(matches!(result, Err(LibdenoError::Io(_))));
+        let lease = RunLease::acquire(true).expect("failed spawn must release its run lease");
+        drop(lease);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir =

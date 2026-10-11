@@ -31,9 +31,8 @@ Behavior notes:
 - Each HTTP operation has a 300-second wall-clock budget covering its retries,
   backoff, redirects where applicable, and response-body reads. This transport
   budget is separate from `execution_deadline`.
-- npm lifecycle scripts are disabled by default. If an embedder/configuration
-  enables them, each direct lifecycle child is supervised for 60 seconds and a
-  kill is followed by a five-second wait; descendants are not supervised.
+- npm lifecycle scripts are currently disabled; there is no promise that a
+  system shell runs them by default.
 - Safe to call from inside a tokio runtime: the run executes on a fresh
   thread (tokio forbids nested runtimes) and joins back. Same for
   `run_with_output` and `run_with`.
@@ -58,6 +57,11 @@ If in-process capture does not observe EOF or reader disconnection within its
 500ms collection budget, the run returns `LibdenoError::Io` with
 `std::io::ErrorKind::TimedOut` and an `output capture incomplete` message rather
 than returning partial output as a success.
+
+Legacy subprocess capture also distinguishes incomplete pipe collection from
+successful byte truncation: if its collection deadline expires before EOF, it
+returns `LibdenoError::Io` with `ErrorKind::TimedOut`; `capture_truncated` only
+marks successful retention of a bounded prefix.
 
 Like `run`, but captures the script's stdout/stderr into `RunOutput` when
 `LibdenoOptions.capture_stdout` / `capture_stderr` are set. The capture is
@@ -110,8 +114,8 @@ pub async fn run_source_with_output_async(
 Runs JS/TS **source held in memory** (`&str`, `String`, `&[u8]`, `Vec<u8>` —
 anything `AsRef<[u8]>`) without writing a temp file. The source is registered
 under a unique virtual `file:` URL inside `base_dir` and then flows through the
-normal pipeline — graph build, TypeScript transpile, CJS, JSON, npm/remote
-imports — exactly like a file on disk.
+normal module pipeline — graph build, TypeScript transpile, CJS, JSON,
+npm/remote imports — as a file-like module.
 
 Behavior notes:
 
@@ -125,7 +129,7 @@ Behavior notes:
   virtual entry), and resolver/config discovery (`deno.json` / `package.json` /
   `node_modules`) starts there.
 - `import.meta.url` / `Deno.mainModule` show the virtual specifier
-  (`__libdeno_virtual_<16-hex-digits>.<ext>` — a fixed prefix plus a random
+  (`$deno$__libdeno_virtual_<16-hex-digits>.<ext>` — a fixed prefix plus a random
   suffix, so two runs never collide), unique per call — there is no API to
   choose a custom module name.
 - The entry's virtual path is subject to the same read-permission check as any
@@ -478,8 +482,10 @@ bound for legacy/in-process capture. In-process capture remains process-global
 and exclusive; subprocess capture drains the child's pipes while retaining only
 the bounded prefix. The execution-control supervisor path is separately
 bounded: `None` means 64 KiB per stream, explicit values up to 96 KiB are
-honored, and larger explicit values are rejected before the child is spawned
-because terminal bytes are JSON-embedded in a 1 MiB frame.
+honored, and larger explicit values are rejected before the child is spawned.
+This is the retained-output policy: supervisor `TERMINAL` frames contain no
+stdout/stderr; the parent drains the child's capture pipes. The separate 1 MiB
+control-frame limit is not the reason for this output budget.
 In-process fd capture is rejected on Windows; use
 `run_in_subprocess_with_output` there.
 
@@ -495,23 +501,31 @@ permission-gated regardless.
 
 ## Resource and supervision boundaries
 
-- Remote module response bodies are capped at 256 MiB after transport
-  decompression, regardless of `Content-Length`. npm registry metadata uses
-  the same cap; an explicit `.tgz` tarball path has a 1 GiB compressed-byte
-  cap. A tarball's gzip `ISIZE` is checked against a default 1 GiB
-  decompressed budget, configurable with
-  `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`; this is a coarse guard, not an
-  exact multi-member gzip total.
+- Remote module response bodies and npm metadata are capped at 256 MiB in the
+  body returned by reqwest after transport decoding, regardless of
+  `Content-Length`. This is not a wire-byte cap, and upstream decoding may
+  allocate before libdeno checks the body. An explicit `.tgz` path is capped
+  at 1 GiB of reqwest-returned, transport-decoded response-body bytes, also not
+  wire bytes. For a gzip response on that path, libdeno checks the final four
+  body bytes as an `ISIZE` hint: the final member's size modulo 2^32. The
+  default 1 GiB threshold, configurable with
+  `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`, is not a decompressed-output budget
+  and does not identify the first consumed member or total extraction.
+  Downstream fallback may read decompressed data to end; wrapper/multi-member
+  cases are not precisely accounted. This is not a decompression or RSS hard
+  limit.
 - The HTTP client allows 300 seconds per operation for retries, backoff,
   redirects on the npm path, and body reads. Remote-module redirects are
   handled by the file fetcher rather than followed by the HTTP client.
-- npm lifecycle scripts are disabled by default. When enabled, the direct
-  lifecycle child has a 60-second run budget and a five-second kill/wait
-  cleanup window. Descendants are not supervised.
+- npm lifecycle scripts are currently disabled. No system-shell execution or
+  enabled-script supervision guarantee is made by this contract.
 - `run_in_subprocess` contains `Deno.exit` and hard runtime termination to the
   direct child, but does not promise complete process-tree cleanup or a
   cross-platform process-group/Windows Job Object boundary. Neither
   `max_heap_bytes` nor `execution_deadline` provides an RSS or CPU hard limit.
+  Windows overlapped-write cancellation can wait past the requested deadline
+  while completion is observed to keep kernel-owned buffers alive; deadlines
+  are not hard real-time cleanup guarantees.
 
 ## `LibdenoError`
 
@@ -522,14 +536,21 @@ pub enum LibdenoError {
   Permission(String),                    // invalid permission flag strings
   Configuration(String),                 // options cannot form a valid configuration (e.g. empty permission list without opt-in since v0.2.0)
   Runtime(AnyError),                     // runtime startup / script failure
-  Core(deno_core::error::CoreError),     // reserved: script JS exceptions surface as Runtime(AnyError), never constructed for script errors
+  Core(deno_core::error::CoreError),     // deno_core execution/event-loop errors, including JS exceptions from that path
   Io(std::io::Error),                    // host I/O failure (e.g. cwd, output capture setup)
   Timeout(String),                     // deadline exceeded / subprocess handshake timed out (message explains which)
 }
 ```
 
 All variants implement `std::error::Error`; `Runtime`, `Core`, and `Io`
-use `#[from]` so `?` works naturally.
+use `#[from]` so `?` works naturally. `LibdenoError::is_permission_error()`
+recognizes concrete typed Rust permission-denial sources only. JavaScript
+`name`, class labels, `cause`, aggregate errors, and rendered text are
+untrusted and do not establish permission provenance. A JavaScript-only
+failure without typed denial evidence can be wrapped as either `Runtime` or
+`Core`, depending on the Rust error path; `is_permission_error()` is false for
+both, and Python maps both to `DenoRuntimeError`. Invalid permission flags and
+typed entry/option errors retain their dedicated error variants.
 
 ## `run_in_subprocess`
 
@@ -628,6 +649,28 @@ fn main() {
   // ... normal host logic ...
 }
 ```
+
+## `initialize_node_ipc_from_env`
+
+```rust
+pub unsafe fn initialize_node_ipc_from_env() -> Result<(), LibdenoError>
+```
+
+Explicitly adopts the Node IPC endpoint supplied by a trusted fork launcher.
+Call it as early as possible during startup, before creating threads; then call
+`maybe_handle_child_mode()` before ordinary host logic. The caller must ensure
+that `NODE_CHANNEL_FD` identifies a valid connected endpoint and transfer its
+raw descriptor/handle ownership exclusively to libdeno. Do not use
+untrusted environment input as authority to claim a raw OS handle.
+
+Initialization is one-shot: the first attempt consumes the state even if it
+fails. A parseable raw handle is claimed before later mode/validation checks;
+if those checks fail, the handle is closed and initialization cannot be
+retried. If `NODE_CHANNEL_FD` is absent, initialization records a no-IPC state;
+`LIBDENO_SPAWNED_IPC` is not consulted. Ordinary
+`run()` does not modify `NODE_CHANNEL_FD` or automatically claim a live
+environment channel. Hosts that previously relied on automatic fork IPC
+initialization must migrate to this explicit startup call.
 
 ## `install_permission_broker`
 

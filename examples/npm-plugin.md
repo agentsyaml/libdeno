@@ -16,9 +16,9 @@ const chalk = require('chalk'); // or any npm package
 console.log(chalk.green('plugin ok'));
 ```
 
-Put it in your project next to a `node_modules` directory (BYONM mode:
-libdeno uses an existing `node_modules`; if none exists it installs
-`npm:` specifiers on demand in managed mode).
+Put it in your project with its package configuration. `nodeModulesDir` mode is
+respected; without an explicit setting, libdeno uses managed `auto`. Merely
+having a `node_modules` directory does not select BYONM.
 
 ## 2. The host
 

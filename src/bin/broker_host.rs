@@ -4,6 +4,8 @@
 //! by LIBDENO_TEST_BROKER_PATH; this process is the connector
 //! (PermissionBroker::new connects to that socket).
 fn main() {
+    // SAFETY: this test host is launched only by the trusted libdeno test harness.
+    unsafe { libdeno::initialize_node_ipc_from_env() }.unwrap();
     let path =
         std::env::var("LIBDENO_TEST_BROKER_PATH").expect("LIBDENO_TEST_BROKER_PATH must be set");
     libdeno::install_permission_broker(path).unwrap();

@@ -1,8 +1,9 @@
 # npm & Module Resolution
 
-libdeno runs the official Deno module graph pipeline end to end. Everything
-the CLI's loader does — `npm:`, `jsr:`, remote modules, import maps, CJS
-packages, WASM, JSON — comes from the graph.
+libdeno composes the official Deno module-graph and resolver crates for
+`npm:`, `jsr:`, remote modules, import maps, CJS packages, WASM, and JSON.
+These crate-provided features do not imply complete Deno CLI loader behavior
+equivalence; the supported behavior and boundaries are described below.
 
 ## Optional `npm` Cargo feature
 
@@ -56,11 +57,10 @@ dependency tree. A missing package is a local resolution error; there is no
 automatic installer. Unconfigured projects remain in managed `auto` mode, and
 declared npm dependencies require the `npm` feature.
 
-npm lifecycle scripts (`preinstall`/`install`/`postinstall`) do **not** run
-by default, matching the deno CLI 2.x default: installing a dependency must
-never execute arbitrary shell code without an explicit opt-in. Packages that
-need a build step at install time (e.g. `esbuild`) will not work out of the
-box.
+npm lifecycle scripts (`preinstall`/`install`/`postinstall`) are currently
+disabled. There is no claim that an explicit opt-in causes them to run through
+the system shell. Packages that need a build step at install time (e.g.
+`esbuild`) will not work out of the box.
 
 The npm resolution snapshot is initialized before the module graph starts
 requesting packages
@@ -94,17 +94,9 @@ always skips lockfile writes and never persists updates.
 
 ## Lifecycle scripts
 
-`preinstall` / `install` / `postinstall` run through the system shell exactly
-like npm does:
-
-```
-sh -c <script>
-```
-
-with `INIT_CWD`, `npm_lifecycle_event`, `npm_lifecycle_script`,
-`npm_package_name`, `npm_package_version` set, and the package's
-`node_modules/.bin` + the root `.bin` prepended to `PATH`. Scripts that need
-a runtime (`node`, `node-gyp`, ...) must be available on `PATH`.
+Lifecycle execution is currently fixed disabled. This documentation does not
+promise system-shell execution, lifecycle environment variables, or lifecycle
+child supervision.
 
 ## `child_process.fork`
 
@@ -118,14 +110,23 @@ snapshot restoration in forked children is unsupported. libdeno does not read,
 seek, adopt, or close an unknown inherited state descriptor/handle. A fork
 child may still resolve packages from its local `node_modules` or lockfile;
 that is ordinary resolution, not proof that the inherited snapshot was
-restored. Supporting restoration requires an explicit host-owned startup
-handoff contract.
+restored. Node IPC is separate: fork hosts that need `NODE_CHANNEL_FD` must
+explicitly invoke unsafe `initialize_node_ipc_from_env()` during trusted startup,
+before creating threads. It claims a connected raw endpoint with exclusive
+ownership; an attempt is consumed even on error, and a claimed endpoint closes
+on later validation failure. Ordinary `run()` neither changes the marker nor
+automatically claims a live channel. Do not supply untrusted environment input
+as authority for raw handle adoption. See
+[the API contract](api.md#initialize_node_ipc_from_env). Supporting npm-state
+restoration remains a separate host-owned startup handoff contract.
 
 ## Module graph
 
-- A single shared `ModuleGraph` (guarded by a mutex) is built on demand:
+- The main run owns a `ModuleGraph` (guarded by a mutex), built on demand:
   `prepare_load` builds the tree rooted at the requested specifier;
-  `load` reads from it. Already-loaded specifiers are not rebuilt.
+  `load` reads from it. Already-loaded specifiers are not rebuilt within that
+  graph. Each web worker has its own graph and permission-bound loader/fetcher;
+  workers share resolver and cache state, not the main worker's graph.
 - Graph building uses the official `deno_graph::ModuleGraph::build` with the
   `GraphResolver` (resolver + npm resolver) and the `DenoGraphLoader` (file
   fetcher).

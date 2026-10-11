@@ -78,12 +78,6 @@ impl OutputCapture {
         max_bytes: Option<usize>,
     ) -> Result<Self, std::io::Error> {
         // Validate targets on Unix; all internal descriptors are kept >= 3.
-        #[cfg(unix)]
-        for (enabled, fd) in [(capture_stdout, 1), (capture_stderr, 2)] {
-            if enabled && unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
         let saved_stdout = if capture_stdout {
             Some(SavedFd::duplicate(1)?)
         } else {
@@ -152,6 +146,8 @@ struct StreamCapture {
     /// `None` once restored (taken by finish / Drop), so a stale fd number
     /// can never be dup2'd again after the OS reused it for another file.
     saved: Option<libc::c_int>,
+    #[cfg(unix)]
+    target_flags: libc::c_int,
     /// Captured blocks from the (detached) reader thread.
     rx: std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
     /// Set by the reader thread when the byte cap was hit (truncated).
@@ -193,6 +189,24 @@ impl StreamCapture {
         max_bytes: Option<usize>,
         dup_fd: SavedFd,
     ) -> Result<Self, std::io::Error> {
+        #[cfg(test)]
+        if std::env::var("LIBDENO_TEST_FAIL_CAPTURE_FD")
+            .ok()
+            .as_deref()
+            == Some(fd.to_string().as_str())
+        {
+            return Err(std::io::Error::other(
+                "injected output capture setup failure",
+            ));
+        }
+        #[cfg(unix)]
+        let target_flags = {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            flags
+        };
         let reader_budget = reserve_capture_reader()?;
         let dup_fd = dup_fd.into_raw();
         let mut fds = [0; 2];
@@ -241,17 +255,25 @@ impl StreamCapture {
         // (CRT fds need SetHandleInformation); the finish() timeout below
         // covers the child-holds-pipe case there.
         #[cfg(unix)]
-        let set_cloexec = |fd: libc::c_int| {
+        let set_cloexec = |fd: libc::c_int| -> Result<(), std::io::Error> {
             // SAFETY: fd was just created by pipe() (or dup2'd to a pipe end).
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            if flags >= 0 {
-                unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+            {
+                return Err(std::io::Error::last_os_error());
             }
+            Ok(())
         };
         #[cfg(unix)]
         {
-            set_cloexec(read_fd);
-            set_cloexec(write_fd);
+            if let Err(error) = set_cloexec(read_fd).and_then(|_| set_cloexec(write_fd)) {
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                    libc::close(dup_fd);
+                }
+                return Err(error);
+            }
         }
         let saved = Some(dup_fd);
         if unsafe { libc::dup2(write_fd, fd) } < 0 {
@@ -264,7 +286,17 @@ impl StreamCapture {
             return Err(err);
         }
         #[cfg(unix)]
-        set_cloexec(fd);
+        if let Err(error) = set_cloexec(fd) {
+            if let Err(restore_error) = restore_target(fd, dup_fd, target_flags) {
+                abort_restore(fd, &restore_error);
+            }
+            unsafe {
+                libc::close(dup_fd);
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            return Err(error);
+        }
         // The pipe write end now lives at `fd` (dup2 copied it); the original
         // write fd is dropped so the pipe reaches EOF exactly when the run
         // restores `fd` on finish.
@@ -354,14 +386,13 @@ impl StreamCapture {
             // creation fails. Restore the target fd and close the reader end
             // so a failed capture cannot leave stdio redirected or leak a
             // pipe.
+            #[cfg(unix)]
+            if let Err(restore_error) = restore_target(fd, dup_fd, target_flags) {
+                abort_restore(fd, &restore_error);
+            }
+            #[cfg(windows)]
             if unsafe { libc::dup2(dup_fd, fd) } < 0 {
-                eprintln!(
-                    "libdeno: failed to restore fd {} after output reader spawn failed: {}; \
-                     aborting to avoid silent stdio corruption",
-                    fd,
-                    std::io::Error::last_os_error()
-                );
-                std::process::abort();
+                abort_restore(fd, &std::io::Error::last_os_error());
             }
             unsafe {
                 libc::close(dup_fd);
@@ -372,6 +403,8 @@ impl StreamCapture {
         Ok(Self {
             target: fd,
             saved,
+            #[cfg(unix)]
+            target_flags,
             rx,
             overflow,
         })
@@ -407,14 +440,13 @@ impl StreamCapture {
         // stdio is permanently corrupted and every later println would be
         // swallowed, then block when the pipe fills. Abort rather than
         // continue in a wedged state.
+        #[cfg(unix)]
+        if let Err(error) = restore_target(self.target, saved, self.target_flags) {
+            abort_restore(self.target, &error);
+        }
+        #[cfg(windows)]
         if unsafe { libc::dup2(saved, self.target) } < 0 {
-            eprintln!(
-                "libdeno: failed to restore fd {} after output capture: {}; aborting to avoid \
-                 silent stdio corruption",
-                self.target,
-                std::io::Error::last_os_error()
-            );
-            std::process::abort();
+            abort_restore(self.target, &std::io::Error::last_os_error());
         }
         // The original fd's content was copied back to `target`; the spare
         // copy is no longer needed.
@@ -479,12 +511,39 @@ impl Drop for StreamCapture {
         // finish() ran, `saved` is None, so the (possibly reused) fd number
         // is never touched again.
         if let Some(saved) = self.saved.take() {
+            #[cfg(unix)]
+            if let Err(error) = restore_target(self.target, saved, self.target_flags) {
+                abort_restore(self.target, &error);
+            }
+            #[cfg(windows)]
+            if unsafe { libc::dup2(saved, self.target) } < 0 {
+                abort_restore(self.target, &std::io::Error::last_os_error());
+            }
             unsafe {
-                libc::dup2(saved, self.target);
                 libc::close(saved);
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn restore_target(
+    target: libc::c_int,
+    saved: libc::c_int,
+    flags: libc::c_int,
+) -> Result<(), std::io::Error> {
+    if unsafe { libc::dup2(saved, target) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(target, libc::F_SETFD, flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn abort_restore(target: libc::c_int, error: &std::io::Error) -> ! {
+    eprintln!("libdeno: failed to restore fd {target}: {error}; aborting to avoid silent stdio corruption");
+    std::process::abort()
 }
 
 #[cfg(test)]
@@ -641,6 +700,61 @@ mod tests {
             assert!(
                 output.status.success(),
                 "isolated capture child failed for {selection}: {diagnostics}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_restores_target_descriptor_flags_in_isolated_children() {
+        const CHILD: &str = "LIBDENO_FD_FLAGS_CHILD";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            let mode = mode.to_str().unwrap();
+            let original_flags = if mode.ends_with("cloexec") {
+                libc::FD_CLOEXEC
+            } else {
+                0
+            };
+            assert_eq!(unsafe { libc::fcntl(1, libc::F_SETFD, original_flags) }, 0);
+            if mode == "partial-zero" {
+                std::env::set_var("LIBDENO_TEST_FAIL_CAPTURE_FD", "2");
+                assert!(super::OutputCapture::new(true, true, None).is_err());
+                assert_eq!(unsafe { libc::fcntl(1, libc::F_GETFD) }, original_flags);
+                return;
+            }
+            let capture = super::OutputCapture::new(true, false, None).unwrap();
+            assert_ne!(
+                unsafe { libc::fcntl(1, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            if mode.starts_with("drop") {
+                drop(capture);
+            } else {
+                capture.finish().unwrap();
+            }
+            assert_eq!(unsafe { libc::fcntl(1, libc::F_GETFD) }, original_flags);
+            return;
+        }
+        for mode in [
+            "finish-zero",
+            "finish-cloexec",
+            "drop-zero",
+            "drop-cloexec",
+            "partial-zero",
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "output::tests::capture_restores_target_descriptor_flags_in_isolated_children",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
         }
     }

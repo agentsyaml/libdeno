@@ -11,9 +11,9 @@ English: [README.md](README.md)
 ## 特性
 
 - **官方模块图管线**：`npm:`、`jsr:`、远程 `https://`、`node:`、本地文件、JSON、WASM、import map（来自 `deno.json`）、TypeScript 转译，全部由 `deno_graph` + `deno_resolver` 处理。远程（`https:`/`jsr:`）导入需要 `--allow-import`（或 `allow_all_permissions`/`prompt`）——模块加载没有 `--allow-net` 兜底，与 `deno run` 一致。
-- **npm 集成**：遵循 `deno.json` 中显式配置的 `nodeModulesDir`（`manual`、`auto` 或 `none`）；仅有 `node_modules` 目录不会自动选择 BYONM。未配置时保留 libdeno 的 managed `auto` 默认模式。支持 CJS 包、`.node` 原生插件。npm 生命周期脚本默认不执行（与 deno CLI 2.x 一致）。
+- **npm 集成**：遵循 `deno.json` 中显式配置的 `nodeModulesDir`（`manual`、`auto` 或 `none`）；仅有 `node_modules` 目录不会自动选择 BYONM。未配置时保留 libdeno 的 managed `auto` 默认模式。支持 CJS 包、`.node` 原生插件。npm 生命周期脚本目前关闭。
 - **`child_process.fork`**：Node IPC 与 deno_process 私有继承 npm 状态文件描述符/句柄是分开的。本版本不会自动从该资源恢复快照；本地包/lockfile 解析仍可能独立工作。
-- **Web Worker**：每个 `new Worker(...)` 拥有独立模块图和受权限约束的 loader；worker 共享 resolver/cache 状态及 V8 启动快照。
+- **Web Worker**：每个 `new Worker(...)` 拥有独立模块图和受权限约束的 loader；worker 共享 resolver 状态、缓存及 V8 启动快照。
 - **Blob 模块**：支持动态导入 Blob 模块及 Blob-backed worker。worker 可在 URL 撤销后继续使用已捕获的根 Blob；这不会恢复已撤销的依赖 URL，也不会让其他 loader 获得该根模块。
 - **只读 lockfile**：`deno.lock` 参与 npm 解析并进行一致性检查，但 libdeno 不会写入它。
 - **权限模型**：与 CLI 一致的 `--allow-*` 能力字符串；权限为显式选择——空列表是构造错误，除非设置 `allow_all_permissions`。
@@ -56,7 +56,7 @@ run_source("console.log('hi')", SourceLang::JavaScript, "./my-app", &options).un
 run_source("const x: number = 1 + 2; console.log(x)", SourceLang::TypeScript, "./my-app", &options).unwrap();
 ```
 
-源码会注册到 `base_dir` 下一个唯一的虚拟 `file:` URL（例如 `<base_dir>/__libdeno_virtual_9f2c1ab4d7e5f001.ts`），然后走**完整的**正常管线——模块图构建、TypeScript 转译、CJS、JSON、npm/远程导入——与磁盘上的文件完全一致。由此带来的行为：
+源码会注册到 `base_dir` 下一个唯一的虚拟 `file:` URL（例如 `<base_dir>/$deno$__libdeno_virtual_9f2c1ab4d7e5f001.ts`），然后走正常模块管线——模块图构建、TypeScript 转译、CJS、JSON、npm/远程导入——作为类文件模块加载。由此带来的行为：
 
 - 相对导入按 `base_dir` 解析（会从磁盘加载虚拟入口旁边的真实文件）。
 - `import.meta.url` / `Deno.mainModule` 显示的是虚拟说明符，而不是调用方指定的名字；URL 每次调用唯一。
@@ -126,7 +126,7 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `LibdenoOptions.cwd: Option<PathBuf>` | 相对路径（入口、权限、node_modules 发现）解析的基准目录，默认进程当前目录。进程 cwd 从不切换——脚本观察到的是宿主的 cwd（`Deno.cwd()`），需要按运行指定工作目录时请用 `run_in_subprocess`。 |
 | `LibdenoOptions.max_heap_bytes: Option<usize>` | 进程内、尽力而为的 V8 老生代堆约束（字节）；小于 8 MiB 的值会被拒绝。不覆盖 native 分配、V8 external memory、宿主分配、RSS、CPU 或子进程内存，也不是 OS/进程级边界。适用于主 worker **以及** `new Worker(...)` 派生的 web worker。 |
 | `LibdenoOptions.execution_deadline: Option<Duration>` | 进程内、尽力而为的时限；当 V8 到达可中断的 JavaScript stack check 时可中断并返回 `LibdenoError::Timeout`。**不能**中断阻塞系统调用、native code、子进程等待或阻塞的 permission broker/hook，因此运行可能超过请求的时限，也不是 CPU 时间上限。 |
-| `LibdenoError` | 枚举：`Entry`（入口解析失败）、`Permission`（权限字符串非法）、`Configuration`（选项无法构成合法配置，如 v0.2.0 起空权限列表未显式选择）、`Runtime`（运行时启动 / 脚本失败——脚本 JS 异常走这里）、`Core`（保留；不会为脚本错误构造）、`Io`、`Timeout`（超时；消息说明具体原因）。 |
+| `LibdenoError` | 枚举：`Entry`（入口解析失败）、`Permission`（权限字符串非法）、`Configuration`（选项无法构成合法配置，如 v0.2.0 起空权限列表未显式选择）、`Runtime`（运行时启动或脚本失败）、`Core`（deno_core 执行/事件循环错误，也可能承载 JS 异常）、`Io`、`Timeout`（超时；消息说明具体原因）。JS 异常根据 Rust wrapper 路径可能归为 `Runtime` 或 `Core`。`is_permission_error()` 只信任带类型的 Rust 拒绝来源；JS 异常的名称、class 或 cause 不能证明权限拒绝来源。 |
 
 支持的权限标志：`--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-import[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`，以及 `-A` / `--allow-all`。`--allow-import` 管控远程模块加载（没有 `--allow-net` 兜底）；静态与动态文件导入由 `--allow-read` 管控。
 
@@ -150,16 +150,21 @@ println!("exit={} stdout={:?}", out.exit_code, out.stdout);
 
 捕获是 fd 级：`console.log` / `console.error` / `Deno.stderr.write` 及任何直接 fd 写入都会进入 `RunOutput`。注意：捕获运行期间，宿主其他线程写到 stdout/stderr 的内容也会被捕获。捕获还是**独占**的：由于它是进程级 fd 重定向，捕获运行会拒绝任何并发运行（无论是否捕获）并返回 `LibdenoError::Configuration`——需要并行执行捕获时请用 `run_in_subprocess_with_output`，它把子进程自己的 fd 管道回传。
 
-`LibdenoOptions.max_capture_bytes` 限制每个流的缓冲区（stdout 与 stderr 各一份额度）：流超限时停止捕获、丢弃多余输出并置位 `RunOutput.capture_truncated`，防止冗长或恶意的脚本无限撑大宿主内存。`None`（默认）不限量。
+`LibdenoOptions.max_capture_bytes` 限制每个流的缓冲区（stdout 与 stderr 各一份额度）：流超限时停止捕获、丢弃多余输出并置位 `RunOutput.capture_truncated`，防止冗长或恶意的脚本无限撑大宿主内存。`None`（默认）不限量。execution-control supervisor 默认每流保留 64 KiB，显式值上限为 96 KiB；这是输出保留策略。Supervisor `TERMINAL` 帧不含 stdout/stderr，父进程从子进程管道读取并只保留配置的前缀；独立的 1 MiB 控制帧限制并非该捕获预算的原因。legacy capture 若在 EOF 前达到收集期限，会返回 `LibdenoError::Io` 和 `ErrorKind::TimedOut`；这是捕获不完整错误，不是成功的字节截断。
 
 输出捕获仅限 unix：Windows 上 Rust std 的 stdout/stderr 绕过被重定向的 CRT fd，因此 `capture_stdout`/`capture_stderr` 在那里会以 `LibdenoError::Configuration` 错误失败（请改用 `run_in_subprocess_with_output`——子进程自己的 fd 被管道回传，Windows 上也可用）。`run_with` 不支持捕获——请用 `run_with_output`，长驻宿主复用解析器栈时用 `libdeno::runtime::run_with_output(&runtime, ...)`。
 
 ### 资源与监督边界
 
-- 远程模块响应体与 npm 元数据在解压后限制为 256 MiB；明确的 npm `.tgz` 路径下载限制为 1 GiB，并按默认 1 GiB 的 gzip `ISIZE` 解压预算预检（可用 `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES` 调整）。这是粗粒度防护，不是多成员 gzip 的精确总量核算。
+- 远程模块响应体与 npm 元数据限制为 reqwest 传输解码后返回的 256 MiB body；这不是 wire-byte 上限，且上游解码可能在 libdeno 检查前分配内存。明确的 npm `.tgz` 路径同样限制为 1 GiB 的 reqwest 返回、传输解码后响应体字节（不是 wire bytes）。该路径的 gzip 响应会把 body 最后 4 字节作为 `ISIZE` hint 检查：它是最后一个 gzip member 的大小模 2^32。默认 1 GiB threshold（可用 `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES` 调整）不是解压输出预算，也不表示实际首先读取的 member 或总提取量。下游 fallback 可能无硬输出预算地 `read_to_end`；gzip wrapper 与多成员边界没有精确核算。这不是解压或 RSS 硬上限。
 - 每个 HTTP 操作有 300 秒墙钟预算，覆盖重试、退避、适用的重定向和响应体读取；它与 `execution_deadline` 分离。
-- npm 生命周期脚本默认关闭。启用时只监督直接子进程：运行预算 60 秒，随后最多等待 5 秒完成 kill/wait；后代进程不受监督。
+- npm 生命周期脚本目前固定关闭；不承诺默认通过系统 shell 执行这些脚本。
 - 子进程模式只把 `Deno.exit` 与直接运行时终止限制在直接子进程内，不承诺完整进程树清理，也不提供 RSS 或 CPU 硬隔离；需要这些边界时请使用 OS 级 supervisor 或 sandbox。
+
+### Node `child_process.fork` 宿主初始化
+
+需要 Node IPC 的 fork 宿主必须在可信启动代码中显式调用
+`initialize_node_ipc_from_env()`，尽可能早地在 `main()` 中、创建线程之前调用。该 `unsafe` 函数假设 launcher 提供的 `NODE_CHANNEL_FD` 指向有效且已连接的 endpoint，并将其 raw handle 所有权独占转交给 libdeno。普通 `run()` 不会修改 marker，也不会自动认领环境中的 live channel。初始化尝试只能执行一次，失败也会消耗此状态；认领有效 raw handle 后若 mode/validation 失败，handle 会关闭且不可重试。不要把不可信环境值当作 raw handle 权限来源。第三方 fork 宿主需要迁移，详见[API 文档](docs/api.md#initialize_node_ipc_from_env)。
 
 完整 API 文档见 [`docs/api.md`](docs/api.md)（英文）。常见嵌入形态（npm 插件 + 输出捕获）的端到端示例见 [`examples/npm-plugin.md`](examples/npm-plugin.md)（英文）。
 

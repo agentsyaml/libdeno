@@ -410,6 +410,26 @@ async fn build_graph(
     specifier: &ModuleSpecifier,
     timing: &ExecutionTiming,
 ) -> Result<(), JsErrorBox> {
+    let graph_resolver = shared.graph_resolver.clone();
+    build_graph_with_npm_resolver(
+        shared,
+        graph_loader,
+        graph,
+        specifier,
+        timing,
+        &*graph_resolver,
+    )
+    .await
+}
+
+async fn build_graph_with_npm_resolver(
+    shared: &SharedServices,
+    graph_loader: &dyn deno_graph::source::Loader,
+    graph: &tokio::sync::Mutex<ModuleGraph>,
+    specifier: &ModuleSpecifier,
+    timing: &ExecutionTiming,
+    npm_resolver: &dyn deno_graph::source::NpmResolver,
+) -> Result<(), JsErrorBox> {
     let _graph_build = timing.span(Phase::GraphBuild);
     let jsr_version_resolver = shared
         .resolver_factory
@@ -473,7 +493,7 @@ async fn build_graph(
         passthrough_jsr_specifiers: false,
         module_analyzer: &*shared.module_info_cache,
         module_info_cacher: &*shared.module_info_cache,
-        npm_resolver: Some(&*graph_resolver),
+        npm_resolver: Some(npm_resolver),
         reporter: None,
         resolver: Some(&*graph_resolver),
         jsr_metadata_store: None,
@@ -577,7 +597,9 @@ fn module_type_from_media_and_requested_type(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deno_graph::source::{LoadError, LoadFuture, LoadOptions, LoadResponse, Loader};
+    use deno_graph::source::{
+        LoadError, LoadFuture, LoadOptions, LoadResponse, Loader, NpmResolvePkgReqsResult,
+    };
     use std::cell::{Cell, RefCell};
     use std::sync::Arc;
     use std::time::SystemTime;
@@ -692,6 +714,171 @@ mod tests {
             assert!(graph.get(&sibling).is_some());
             assert_eq!(loader.requests.into_inner(), vec![sibling, a, b.clone(), b]);
         });
+    }
+
+    #[test]
+    fn npm_batch_failure_retries_same_graph_and_preserves_sibling() {
+        use deno_error::JsErrorClass;
+        use deno_semver::package::PackageReq;
+
+        const CAUSE: &str = "controlled npm dependency graph failure";
+
+        #[derive(Debug, Default)]
+        struct RetryingNpmResolver {
+            nonempty_calls: Cell<usize>,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl deno_graph::source::NpmResolver for RetryingNpmResolver {
+            fn load_and_cache_npm_package_info(&self, _package_name: &str) {}
+
+            async fn resolve_pkg_reqs(
+                &self,
+                package_reqs: &[PackageReq],
+            ) -> NpmResolvePkgReqsResult {
+                if package_reqs.is_empty() {
+                    return NpmResolvePkgReqsResult {
+                        results: vec![],
+                        dep_graph_result: Ok(()),
+                    };
+                }
+                self.nonempty_calls.set(self.nonempty_calls.get() + 1);
+                let first_attempt = self.nonempty_calls.get() == 1;
+                let mut result = NpmResolvePkgReqsResult {
+                    // Exercise the actual deno_graph seam: successful request
+                    // slots accompany a failed overall dependency install.
+                    results: package_reqs.iter().map(|_| Ok(())).collect(),
+                    dep_graph_result: if first_attempt {
+                        Err(Arc::new(JsErrorBox::generic(CAUSE)) as Arc<dyn JsErrorClass>)
+                    } else {
+                        Ok(())
+                    },
+                };
+                if first_attempt {
+                    assert!(result.results.iter().all(|result| result.is_ok()));
+                }
+                crate::graph::propagate_dep_graph_error(&mut result);
+                result
+            }
+        }
+
+        struct NpmRetryLoader {
+            target: ModuleSpecifier,
+            sibling: ModuleSpecifier,
+            requests: RefCell<Vec<ModuleSpecifier>>,
+        }
+
+        impl Loader for NpmRetryLoader {
+            fn load(&self, specifier: &ModuleSpecifier, _options: LoadOptions) -> LoadFuture {
+                self.requests.borrow_mut().push(specifier.clone());
+                let content: &[u8] = if specifier == &self.target {
+                    b"import 'npm:retry-pkg@1.0.0'; export const target = true;"
+                } else if specifier == &self.sibling {
+                    b"export const sibling = true;"
+                } else {
+                    return Box::pin(std::future::ready(Err(LoadError::Other(Arc::new(
+                        JsErrorBox::generic(format!("unexpected loader request: {specifier}")),
+                    )))));
+                };
+                Box::pin(std::future::ready(Ok(Some(LoadResponse::Module {
+                    content: Arc::from(content),
+                    mtime: None,
+                    maybe_headers: None,
+                    specifier: specifier.clone(),
+                }))))
+            }
+        }
+
+        let _semantic = crate::npm_cache::semantic_probe_test_lock().lock().unwrap();
+        let _resolver_env = crate::npm_cache::resolver_env_test_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "libdeno-npm-batch-retry-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("deno.json"), r#"{"lock":false}"#).unwrap();
+        let dir = TestDir(path);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cwd = dir.0.clone();
+        let shared = runtime
+            .block_on(crate::services::SharedServices::new(cwd.clone(), vec![cwd]))
+            .unwrap();
+        assert!(shared.lockfile.is_none());
+
+        let sibling = ModuleSpecifier::parse("http://127.0.0.1/sibling.js").unwrap();
+        let target = ModuleSpecifier::parse("http://127.0.0.1/target.js").unwrap();
+        let npm_specifier = ModuleSpecifier::parse("npm:retry-pkg@1.0.0").unwrap();
+        let loader = NpmRetryLoader {
+            target: target.clone(),
+            sibling: sibling.clone(),
+            requests: RefCell::new(Vec::new()),
+        };
+        let npm_resolver = RetryingNpmResolver::default();
+        let graph = tokio::sync::Mutex::new(ModuleGraph::new(GraphKind::CodeOnly));
+        let timing = ExecutionTiming::disabled();
+
+        // First root succeeds; the later npm root fails only after its batch's
+        // overall failure has been attached to the originally-Ok req slot.
+        runtime
+            .block_on(build_graph_with_npm_resolver(
+                &shared,
+                &loader,
+                &graph,
+                &sibling,
+                &timing,
+                &npm_resolver,
+            ))
+            .unwrap();
+        let first_error = runtime
+            .block_on(build_graph_with_npm_resolver(
+                &shared,
+                &loader,
+                &graph,
+                &target,
+                &timing,
+                &npm_resolver,
+            ))
+            .unwrap_err();
+        assert!(first_error.to_string().contains(CAUSE), "{first_error}");
+        runtime.block_on(async {
+            let graph = graph.lock().await;
+            let root_error = validate_root(&graph, &target).unwrap_err();
+            assert!(root_error.to_string().contains(CAUSE), "{root_error}");
+            validate_root(&graph, &sibling).unwrap();
+        });
+
+        // A second build takes build_graph's existing error-slot reload path
+        // on the same ModuleGraph and the same fake resolver.
+        runtime
+            .block_on(build_graph_with_npm_resolver(
+                &shared,
+                &loader,
+                &graph,
+                &target,
+                &timing,
+                &npm_resolver,
+            ))
+            .unwrap();
+        assert_eq!(npm_resolver.nonempty_calls.get(), 2);
+        runtime.block_on(async {
+            let graph = graph.lock().await;
+            validate_root(&graph, &target).unwrap();
+            validate_root(&graph, &sibling).unwrap();
+            assert!(graph.get(&npm_specifier).unwrap().npm().is_some());
+            assert!(!graph.module_errors().any(|error| {
+                error.specifier() == &target || error.specifier() == &npm_specifier
+            }));
+        });
+        let requests = loader.requests.borrow();
+        assert_eq!(requests.iter().filter(|url| *url == &sibling).count(), 1);
+        assert_eq!(requests.iter().filter(|url| *url == &target).count(), 2);
     }
 
     #[test]

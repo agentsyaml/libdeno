@@ -151,24 +151,31 @@ Output capture has its own boundary:
   and stderr on every platform. Its cap bounds the retained parent buffers,
   not the child's CPU, memory, or descendants.
 - Execution-control supervisor capture is bounded separately because terminal
-  output is JSON-embedded in a 1 MiB frame: `None` retains at most 64 KiB per
-  requested stream, explicit values up to 96 KiB are honored, and larger
-  explicit values are rejected before spawning. This does not change the
-  legacy or in-process capture semantics above.
+  output retention is configured independently: `None` retains at most 64 KiB
+  per requested stream, explicit values up to 96 KiB are honored, and larger
+  explicit values are rejected before spawning. Supervisor `TERMINAL` frames
+  do not carry stdout/stderr; the parent drains the capture pipes. The separate
+  1 MiB control-frame limit is not the reason for these retention values. This
+  does not change legacy or in-process capture semantics above.
 
 Network and package-install guards are also finite but not isolation controls:
 
-- Remote module bodies and npm metadata are capped at 256 MiB after
-  decompression. Explicit npm `.tgz` downloads are capped at 1 GiB of
-  downloaded bytes, with a coarse default 1 GiB gzip `ISIZE` decompression
-  pre-check (`LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES` overrides it). A gzip
-  multi-member stream can still differ from that trailer estimate.
+- Remote module bodies and npm metadata are capped at 256 MiB in the body
+  returned by reqwest after transport decoding, not at the wire; upstream
+  decoding may allocate before this check. Explicit npm `.tgz` paths are
+  capped at 1 GiB of reqwest-returned, transport-decoded response-body bytes,
+  also not wire bytes. For a gzip response on that path, libdeno checks the
+  final four body bytes as an `ISIZE` hint: the final member's size modulo
+  2^32. The default 1 GiB threshold (`LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`
+  overrides it) is not an output budget and does not identify the first
+  consumed member or total extraction. The downstream fallback has no hard
+  decompressed-output budget; wrapper and multi-member cases are not precisely
+  accounted. This is not an RSS or decompression hard limit.
 - Each HTTP operation has a 300-second wall-clock budget covering retries,
   backoff, applicable redirects, and body reads. This does not impose a CPU or
   process lifetime limit on the runtime.
-- npm lifecycle scripts are disabled by default. If enabled, only the direct
-  lifecycle child is supervised for 60 seconds, followed by a five-second
-  kill/wait window; descendants are not supervised.
+- npm lifecycle scripts are currently disabled. This contract does not promise
+  that a system shell executes them by default.
 
 None of these options provides CPU isolation, a complete execution-time limit,
 an RSS cap, or an in-process sandbox. They do not replace a process-level sandbox and resource
@@ -183,6 +190,18 @@ Descendants spawned by the script can outlive the direct child, retain file
 descriptors, or continue consuming CPU and memory; libdeno does not provide a
 cross-platform process-group / Windows Job Object kill-tree guarantee. Use an
 OS-level supervisor or sandbox when descendant containment matters.
+
+On Windows, cancellation of an overlapped write can wait beyond the requested
+deadline while completion is observed so kernel-owned buffers remain valid.
+This is a safety requirement, not a hard real-time cleanup guarantee.
+
+Node `child_process.fork` hosts must explicitly initialize IPC during trusted
+startup with `initialize_node_ipc_from_env()`, before creating threads. The
+unsafe call takes exclusive ownership of a trusted, connected raw endpoint;
+it is a one-shot attempt, and a claimed endpoint is closed on subsequent
+validation failure. Ordinary runs do not claim or rewrite the environment
+channel. Never treat an untrusted `NODE_CHANNEL_FD` value as authority to claim
+an OS handle; see [the API contract](docs/api.md#initialize_node_ipc_from_env).
 
 `install_permission_broker` and `install_permission_hook` are process-global,
 install-once, synchronous decision paths, not isolation mechanisms. A blocked

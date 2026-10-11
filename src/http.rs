@@ -127,10 +127,9 @@ fn remaining_http_budget(deadline: Instant) -> Result<Duration, String> {
     }
 }
 
-/// Default post-decompression budget for npm tarballs, and the env override
-/// (`LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`). The budget is used for the
-/// publisher-controlled ISIZE guard; it is deliberately configurable so hosts with
-/// unusual packages can raise it.
+/// Default threshold for the trailing-ISIZE hint on npm tarballs, configurable
+/// with `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`. This threshold is not a
+/// decompressed-output budget.
 #[cfg(feature = "npm")]
 fn tarball_decompress_budget() -> usize {
     const DEFAULT: usize = 1 << 30;
@@ -144,16 +143,16 @@ fn tarball_decompress_budget() -> usize {
 }
 
 /// Rejects gzip tarballs whose ISIZE trailer (last 4 bytes, little-endian,
-/// mod 2^32) claims a decompressed size above the configured budget.
+/// mod 2^32) claims a member size above the configured hint threshold.
 ///
 /// This is a coarse guard, not a precise bound: ISIZE only reflects the last
 /// gzip member (multi-member tarballs can decompress larger in total) and
 /// wraps at 4 GiB. It exists to block the cheap malicious case — a tiny
 /// tarball declaring ~4 GiB that would make upstream's `try_reserve` commit
-/// that much virtual memory before the real decompressed size is known;
-/// upstream falls back to streaming (no reservation) when the reserve fails,
-/// and that path plus this check bound the practical exposure. The
-/// `read_body_limited` cap above bounds the *compressed* bytes already.
+/// that much virtual memory before the real decompressed size is known. This is
+/// only a trailer pre-check: upstream's actual decompression/read_to_end path
+/// has no hard decompressed-byte budget, so neither this check nor the
+/// reqwest-returned response-body cap above establishes a decompressed-memory bound.
 #[cfg(feature = "npm")]
 fn guard_tarball_isize(is_tarball: bool, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     // Only .tgz URLs carry gzip-compressed tar data; registry metadata

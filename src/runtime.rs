@@ -284,8 +284,6 @@ fn run_with_exit_code(
     // RunLease); ordinary runs are otherwise fully parallel. The exit-code
     // path never captures, so the lease is taken as a plain parallel run.
     let _lease = RunLease::acquire(false)?;
-    // Capture the entry-time child-IPC marker (fork children inherit it).
-    crate::limits::capture_spawned_ipc_marker();
     let entry = entry.clone();
     let options = options.clone();
     let runtime = runtime.clone();
@@ -294,11 +292,10 @@ fn run_with_exit_code(
     // async hosts.
     let timing = ExecutionTiming::disabled();
     if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run_with_sync(&runtime, &entry, &options, timing))
-            .join()
-            .map_err(|_| {
-                LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
-            })?
+        crate::join_worker(|| {
+            std::thread::Builder::new()
+                .spawn(move || run_with_sync(&runtime, &entry, &options, timing))
+        })?
     } else {
         run_with_sync(&runtime, &entry, &options, timing)
     }
@@ -418,17 +415,14 @@ pub(crate) fn run_with_output_observed_cancellable(
         let _admission = timing.span(Phase::Admission);
         RunLease::acquire(options.capture_stdout || options.capture_stderr)?
     };
-    crate::limits::capture_spawned_ipc_marker();
     let entry = entry.clone();
     let options = options.clone();
     let runtime = runtime.clone();
     if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || {
-            run_with_sync_output_cancellable(&runtime, &entry, &options, timing, cancellation)
-        })
-        .join()
-        .map_err(|_| {
-            LibdenoError::Runtime(deno_core::anyhow::anyhow!("libdeno worker thread panicked"))
+        crate::join_worker(|| {
+            std::thread::Builder::new().spawn(move || {
+                run_with_sync_output_cancellable(&runtime, &entry, &options, timing, cancellation)
+            })
         })?
     } else {
         run_with_sync_output_cancellable(&runtime, &entry, &options, timing, cancellation)

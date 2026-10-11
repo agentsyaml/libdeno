@@ -462,6 +462,39 @@ fn reusable_runtime_runs_in_memory_source() {
 }
 
 #[test]
+fn reusable_runtime_memory_entry_in_manual_node_modules_is_synthetic() {
+    let dir = temp_dir("source-manual-node-modules");
+    fs::write(dir.join("deno.json"), r#"{"nodeModulesDir":"manual"}"#).unwrap();
+    let package_dir = dir.join("node_modules/pkg");
+    fs::create_dir_all(&package_dir).unwrap();
+    fs::write(package_dir.join("package.json"), r#"{"name":"pkg"}"#).unwrap();
+    let result_file = dir.join("result.txt");
+    let result_path = result_file.display().to_string();
+    let runtime = build_runtime(&dir);
+    let code = run_with_source(
+        &runtime,
+        format!("Deno.writeTextFileSync({result_path:?}, 'executed');"),
+        SourceLang::JavaScript,
+        &package_dir,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(fs::read_to_string(result_file).unwrap(), "executed");
+    assert!(fs::read_dir(&package_dir).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("$deno$")
+    }));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn concurrent_in_memory_runs_on_one_runtime_succeed() {
     // Two concurrent in-memory runs on one runtime each get their own
     // per-run `memory_files` map, so both must complete with exit code 0.

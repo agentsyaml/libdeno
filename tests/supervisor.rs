@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use libdeno::{run_in_supervised_subprocess, LibdenoError, LibdenoOptions};
+use libdeno::{
+    run_in_subprocess_with_output, run_in_supervised_subprocess, LibdenoError, LibdenoOptions,
+};
 
 static HOST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static HOST_PREWARM: std::sync::Once = std::sync::Once::new();
@@ -70,7 +72,7 @@ fn handshake_start_barrier_terminal_mapping_and_env_stripping() {
     fs::write(
         &entry,
         format!(
-            "Deno.writeTextFileSync({marker:?}, JSON.stringify({{mode:Deno.env.get('LIBDENO_SUPERVISOR_MODE') ?? 'missing', endpoint:Deno.env.get('LIBDENO_SUPERVISOR_ENDPOINT') ?? 'missing', token:Deno.env.get('LIBDENO_SUPERVISOR_TOKEN') ?? 'missing', spawned:Deno.env.get('LIBDENO_SPAWNED_IPC')}}));\nconsole.log('supervised-out'); console.error('supervised-err'); Deno.exit(3);"
+            "Deno.writeTextFileSync({marker:?}, JSON.stringify({{mode:Deno.env.get('LIBDENO_SUPERVISOR_MODE') ?? 'missing', endpoint:Deno.env.get('LIBDENO_SUPERVISOR_ENDPOINT') ?? 'missing', token:Deno.env.get('LIBDENO_SUPERVISOR_TOKEN') ?? 'missing', spawned:Deno.env.get('LIBDENO_SPAWNED_IPC') ?? 'missing'}}));\nconsole.log('supervised-out'); console.error('supervised-err'); Deno.exit(3);"
         ),
     )
     .unwrap();
@@ -95,7 +97,7 @@ fn handshake_start_barrier_terminal_mapping_and_env_stripping() {
     assert!(env.contains(r#""mode":"missing""#));
     assert!(env.contains(r#""endpoint":"missing""#));
     assert!(env.contains(r#""token":"missing""#));
-    assert!(env.contains(r#""spawned":"1""#));
+    assert!(env.contains(r#""spawned":"missing""#));
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -174,6 +176,39 @@ fn supervised_helper_rejects_incomplete_parent_capture() {
     assert!(matches!(error, LibdenoError::Runtime(_)));
     assert_eq!(error.to_string(), "supervisor infrastructure failure");
     let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_output_capture_rejects_descendant_held_pipe_after_child_exit() {
+    let dir = temp_dir("legacy-descendant-pipe");
+    let entry = dir.join("main.js");
+    let descendant_pid = dir.join("descendant.pid");
+    fs::write(
+        &entry,
+        format!(
+            "console.log('descendant-prefix');\n\
+             new Deno.Command('/bin/sh', {{ args: ['-c', 'sleep 30 & echo $! > {descendant_pid:?}'], stdout: 'inherit', stderr: 'null' }}).outputSync();\n\
+             Deno.exit(0);"
+        ),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let result = with_child_host(|| run_in_subprocess_with_output(&entry, &allow_all()));
+    let pid = fs::read_to_string(&descendant_pid).ok();
+    if let Some(pid) = pid
+        .as_deref()
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+    {
+        let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
+    }
+    let _ = fs::remove_dir_all(&dir);
+    let error = result.unwrap_err();
+    assert_eq!(error.to_string(), "subprocess output capture incomplete");
+    assert!(
+        matches!(error, LibdenoError::Io(ref error) if error.kind() == std::io::ErrorKind::TimedOut)
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 #[test]

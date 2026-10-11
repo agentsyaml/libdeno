@@ -15,9 +15,9 @@ libdeno is a Rust crate that embeds a full Deno runtime (V8 + the official modul
 ## Features
 
 - **Official module graph pipeline**: `npm:`, `jsr:`, remote `https://`, `node:`, local files, JSON, WASM, import maps (from `deno.json`), and TypeScript transpilation are all handled by `deno_graph` + `deno_resolver`. Remote (`https:`/`jsr:`) imports require `--allow-import` (or `allow_all_permissions`/`prompt`) — there is no `--allow-net` fallback for module loading, matching `deno run`.
-- **npm integration**: respects `nodeModulesDir` in `deno.json` (`manual`, `auto`, or `none`); an existing `node_modules` directory does not itself select BYONM. Unconfigured projects retain libdeno's managed `auto` default. Supports CJS packages and `.node` native addons. npm lifecycle scripts do not run by default (matching deno CLI 2.x).
+- **npm integration**: respects `nodeModulesDir` in `deno.json` (`manual`, `auto`, or `none`); an existing `node_modules` directory does not itself select BYONM. Unconfigured projects retain libdeno's managed `auto` default. Supports CJS packages and `.node` native addons. npm lifecycle scripts are currently disabled.
 - **`child_process.fork`**: Node IPC is separate from deno_process's private inherited npm-state file descriptor/handle. This release does not automatically restore snapshots from that resource; local package/lockfile resolution may still work independently.
-- **Web Workers**: each `new Worker(...)` has its own module graph and permission-bound loader; workers share resolver/cache state and the V8 startup snapshot.
+- **Web Workers**: each `new Worker(...)` has its own module graph and permission-bound loader; workers share resolver state, caches, and the V8 startup snapshot.
 - **Blob modules**: dynamic Blob imports and Blob-backed workers are supported. A worker can use its captured root Blob after revocation; this does not restore revoked dependency URLs or make the root available to other loaders.
 - **Read-only lockfiles**: `deno.lock` participates in npm resolution and is checked for consistency, but libdeno does not write it.
 - **Permission model**: CLI-style `--allow-*` capability strings; permissions are opt-in — an empty list is a construction error unless `allow_all_permissions` is set.
@@ -60,7 +60,7 @@ run_source("console.log('hi')", SourceLang::JavaScript, "./my-app", &options).un
 run_source("const x: number = 1 + 2; console.log(x)", SourceLang::TypeScript, "./my-app", &options).unwrap();
 ```
 
-The source is registered under a unique virtual `file:` URL inside `base_dir` (e.g. `<base_dir>/__libdeno_virtual_9f2c1ab4d7e5f001.ts`) and then flows through the entire normal pipeline — graph build, TypeScript transpile, CJS, JSON, npm/remote imports — exactly like a file on disk. Consequences:
+The source is registered under a unique virtual `file:` URL inside `base_dir` (e.g. `<base_dir>/$deno$__libdeno_virtual_9f2c1ab4d7e5f001.ts`) and then flows through the entire normal pipeline — graph build, TypeScript transpile, CJS, JSON, npm/remote imports — as a file-like module. Consequences:
 
 - Relative imports resolve against `base_dir` (they load real files from disk next to the virtual entry).
 - `import.meta.url` / `Deno.mainModule` show the virtual specifier, not a caller-chosen name; the URL is unique per call.
@@ -130,7 +130,7 @@ cd examples/demo-app && ../../target/debug/examples/demo .
 | `LibdenoOptions.cwd: Option<PathBuf>` | Resolution base that relative paths (entry, permissions, `node_modules` discovery) resolve against. Defaults to the process current directory. The process cwd is never switched — scripts observe the host's cwd (`Deno.cwd()`), so use `run_in_subprocess` for a per-run working directory. |
 | `LibdenoOptions.max_heap_bytes: Option<usize>` | In-process, best-effort constraint on the V8 old-generation heap in bytes; values below 8 MiB are rejected. It does not cap native allocations, V8 external memory, host allocations, RSS, CPU, or child-process memory, and is not an OS/process boundary. Applies to the main worker **and** web workers spawned via `new Worker(...)`. |
 | `LibdenoOptions.execution_deadline: Option<Duration>` | In-process, best-effort deadline; it can interrupt JavaScript when V8 reaches an interruptible stack check and report `LibdenoError::Timeout`. It cannot interrupt blocking system calls, native code, child-process waits, or a blocked permission broker/hook, so the run may exceed the requested deadline; it is not a CPU-time limit. |
-| `LibdenoError` | Enum: `Entry` (entry resolution failed), `Permission` (invalid permission flags), `Configuration` (options that cannot form a valid configuration, e.g. an empty permission list without opt-in), `Runtime` (runtime startup / script failure — JS exceptions surface here), `Core` (reserved; never constructed for script errors), `Io`, `Timeout` (deadline exceeded / subprocess handshake timed out; the message says which). |
+| `LibdenoError` | Enum: `Entry` (entry resolution failed), `Permission` (invalid permission flags), `Configuration` (options that cannot form a valid configuration, e.g. an empty permission list without opt-in), `Runtime` (runtime startup or script failure), `Core` (deno_core execution/event-loop error, which can carry a JS exception), `Io`, `Timeout` (deadline exceeded / subprocess handshake timed out; the message says which). JS exceptions can surface as `Runtime` or `Core` depending on the Rust wrapper path. `is_permission_error()` trusts typed Rust denial sources only; JS exception names/classes/causes do not establish permission provenance. |
 
 ### Async hosts (tokio/axum)
 
@@ -182,9 +182,14 @@ each get the budget): when a stream exceeds it, capture stops and
 `RunOutput.capture_truncated` is set, so a verbose or hostile script can no
 longer grow host memory without limit. `None` (default) captures without a
 bound for legacy/in-process capture. The execution-control supervisor path
-uses a 64 KiB per-stream default and a 96 KiB explicit maximum because its
-terminal output is JSON-embedded inside a 1 MiB protocol frame; larger explicit
-values are rejected with `LibdenoError::Configuration`.
+uses a 64 KiB per-stream default and a 96 KiB explicit maximum as its output
+retention policy; larger explicit values are rejected with
+`LibdenoError::Configuration`. Supervisor `TERMINAL` frames do not contain
+stdout/stderr: the parent drains the child's capture pipes and retains only the
+configured prefix. The independent 1 MiB control-frame limit is not the reason
+for the capture budget. Legacy capture that reaches its collection deadline
+before EOF returns `LibdenoError::Io` with `ErrorKind::TimedOut`; this is an
+incomplete-capture error, not successful byte truncation.
 
 Output capture is unix-only: on Windows Rust std's stdout/stderr bypass the
 redirected CRT fd, so `capture_stdout`/`capture_stderr` fail with a
@@ -196,21 +201,40 @@ running many scripts.
 
 ### Resource boundaries
 
-- Remote module bodies and npm metadata are capped at 256 MiB after
-  decompression. An explicit npm `.tgz` path is capped at 1 GiB of downloaded
-  bytes; its gzip `ISIZE` is checked against a default 1 GiB decompressed
-  budget (`LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES` overrides it). These are
-  bounded guards, not exact multi-member gzip accounting.
+- Remote module bodies and npm metadata are capped at 256 MiB in the body
+  returned by reqwest after its transport decoding; this is not a wire-byte
+  cap, and upstream decoding may allocate before libdeno checks the body. An
+  explicit npm `.tgz` path is capped at 1 GiB of reqwest-returned,
+  transport-decoded response-body bytes (not wire bytes). For a gzip response
+  on that path, libdeno checks the final four body bytes as an `ISIZE` hint:
+  the final member's size modulo 2^32. The default 1 GiB threshold, configurable
+  with `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`, is not a decompressed-output
+  budget and does not identify the first consumed member or total extraction.
+  Downstream fallback may read decompressed data to end; wrapper and
+  multi-member cases are not precisely accounted. This is not a decompression
+  or RSS hard limit.
 - Each HTTP operation has a 300-second wall-clock budget for retries, backoff,
   applicable redirects, and body reads. This is separate from
   `execution_deadline`.
-- npm lifecycle scripts are disabled by default. If enabled, the direct child
-  is supervised for 60 seconds, followed by up to five seconds to kill/wait;
-  descendants are not supervised.
+- npm lifecycle scripts are currently disabled; there is no promise that a
+  system shell runs them by default.
 - Subprocess mode contains the direct child's `Deno.exit` and hard runtime
   termination, but does not promise complete process-tree cleanup. No API here
   provides an RSS or CPU hard-isolation boundary; use an OS-level supervisor
   or sandbox when that is required.
+
+### Node `child_process.fork` host setup
+
+Fork hosts that need Node IPC must explicitly call
+`initialize_node_ipc_from_env()` in trusted startup code, as early as possible
+in `main()` and before creating threads. This `unsafe` function assumes the
+launcher-provided `NODE_CHANNEL_FD` names a valid connected endpoint whose raw
+handle ownership is transferred exclusively to libdeno. Ordinary `run()` does
+not modify the marker or claim a live environment channel. Initialization is a
+one-shot attempt, including failures; after a valid raw handle is claimed,
+later mode/validation failures close it and cannot be retried. Do not pass
+untrusted environment values as raw-handle authority. Third-party fork hosts
+must migrate explicitly; see [API](docs/api.md#initialize_node_ipc_from_env).
 
 Supported permission flags: `--allow-read[=paths] --allow-write[=paths] --allow-env[=names] --allow-net[=hosts] --allow-import[=hosts] --allow-run[=names] --allow-ffi[=paths] --allow-sys[=names]`, plus `-A` / `--allow-all`. `--allow-import` gates remote module loading (there is no `--allow-net` fallback); static and dynamic file imports are gated by `--allow-read`.
 

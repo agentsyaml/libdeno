@@ -41,12 +41,23 @@ value, import access is granted globally.
 **File imports** (`import ... from "./x.js"` or a `file://` URL, static and
 dynamic) are gated by `--allow-read`: the graph loader checks each file
 against the declared read scope (and the broker/hook), so a static import
-outside the scope fails with a `NotCapable` error. This matches the strict
-`--allow-read` guarantee the runtime ops provide.
+outside the scope fails with a `NotCapable` error. This documents libdeno's
+loader behavior; do not treat it as a claim that every entry path is exactly
+interchangeable with the CLI's broader compatibility behavior.
 
 Deny/ignore forms (`--deny-*`, `--ignore-*`) are not currently exposed, and
 any unrecognized flag is rejected with a permission error rather than silently
 ignored (an unknown flag must never silently widen the granted scope).
+
+Rust callers can use `LibdenoError::is_permission_error()` to recognize
+permission denials only when typed Rust denial provenance is preserved. A JS
+exception's `name`, class label, `cause`, aggregate members, or message is not
+trusted evidence of a denial. Runtime denials that lose this provenance remain
+ordinary execution errors: the Rust wrapper may produce either
+`LibdenoError::Runtime` or `LibdenoError::Core`, and `is_permission_error()` is
+false for both without typed denial evidence. Python reports either as
+`DenoRuntimeError`. Invalid permission flag syntax remains a typed
+permission/configuration error.
 
 ## Interactive prompting (`prompt`)
 

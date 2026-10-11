@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -17,12 +17,10 @@ pub(crate) const SUPERVISOR_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const SUPERVISOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SUPERVISOR_CANCEL_GRACE: Duration = Duration::from_secs(2);
 pub(crate) const SUPERVISOR_CHILD_EXIT_GRACE: Duration = Duration::from_millis(250);
-/// Default retained bytes per requested capture stream. Supervisor TERMINAL
-/// payloads encode bytes as JSON numbers inside a 1 MiB frame.
+/// Default bytes retained per requested stream by the parent's bounded-pipe
+/// capture reader; excess output is drained and discarded.
 pub(crate) const SUPERVISOR_CAPTURE_BYTES_PER_STREAM: usize = 64 * 1024;
-/// Conservative explicit per-stream ceiling: two 96 KiB JSON byte arrays,
-/// including their worst-case four-byte-per-input expansion, remain below the
-/// supervisor frame payload limit with terminal metadata overhead.
+/// Maximum explicit per-stream retention for the parent's bounded-pipe capture.
 pub(crate) const SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM: usize = 96 * 1024;
 
 pub(crate) const SUPERVISOR_MODE_ENV: &str = "LIBDENO_SUPERVISOR_MODE";
@@ -31,6 +29,14 @@ pub(crate) const SUPERVISOR_TOKEN_ENV: &str = "LIBDENO_SUPERVISOR_TOKEN";
 
 const SUPERVISOR_HEADER_LEN: usize = 4 + 1 + 1 + 8 + 4;
 const SUPERVISOR_TOKEN_LEN: usize = 16;
+
+pub(crate) fn prepare_supervisor_stream(_stream: &TcpStream) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    // MSG_DONTWAIT alone still waited for send-space on the host probe. Set
+    // nonblocking once before any clone; read/write paths then poll readiness.
+    _stream.set_nonblocking(true)?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrameDirection {
@@ -242,10 +248,32 @@ fn read_frame_with_magic(
 }
 
 pub(crate) fn write_frame(stream: &mut TcpStream, frame: &SupervisorFrame) -> io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(SUPERVISOR_FRAME_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    write_frame_until(stream, frame, Some(deadline), None)
+}
+
+pub(crate) fn write_frame_until(
+    stream: &mut TcpStream,
+    frame: &SupervisorFrame,
+    deadline: Option<Instant>,
+    cancellation: Option<&SupervisorCancellation>,
+) -> io::Result<()> {
     if frame.payload.len() > MAX_SUPERVISOR_FRAME_PAYLOAD {
         return Err(invalid_data("supervisor frame payload is too large"));
     }
 
+    let header = encode_header(frame)?;
+    let result = write_until(stream, &header, deadline, cancellation, false)
+        .and_then(|()| write_until(stream, &frame.payload, deadline, cancellation, true));
+    if result.is_err() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+    result
+}
+
+fn encode_header(frame: &SupervisorFrame) -> io::Result<[u8; SUPERVISOR_HEADER_LEN]> {
     let payload_len = u32::try_from(frame.payload.len())
         .map_err(|_| invalid_data("supervisor frame payload length does not fit"))?;
     let mut header = [0u8; SUPERVISOR_HEADER_LEN];
@@ -254,9 +282,517 @@ pub(crate) fn write_frame(stream: &mut TcpStream, frame: &SupervisorFrame) -> io
     header[5] = frame.kind.to_byte();
     header[6..14].copy_from_slice(&frame.request_id.to_be_bytes());
     header[14..18].copy_from_slice(&payload_len.to_be_bytes());
-    stream.write_all(&header)?;
-    stream.write_all(&frame.payload)
+    Ok(header)
 }
+
+fn check_write_conditions(
+    deadline: Option<Instant>,
+    cancellation: Option<&SupervisorCancellation>,
+) -> io::Result<()> {
+    if cancellation.is_some_and(SupervisorCancellation::is_requested) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "supervisor cancellation requested",
+        ));
+    }
+    if deadline.is_some_and(|at| at <= Instant::now()) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "supervisor frame deadline exceeded",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum FrameWriteTestEvent {
+    PayloadSend {
+        offset: usize,
+        count: usize,
+        at: Instant,
+    },
+    WouldBlock {
+        offset: usize,
+        at: Instant,
+    },
+}
+
+#[cfg(test)]
+thread_local! {
+    static FRAME_WRITE_TEST_EVENTS: std::cell::RefCell<Option<Vec<FrameWriteTestEvent>>> = const { std::cell::RefCell::new(None) };
+    static FRAME_WRITE_TEST_LIVE_SENDER: std::cell::RefCell<Option<std::sync::mpsc::Sender<FrameWriteTestEvent>>> = const { std::cell::RefCell::new(None) };
+    static FRAME_WRITE_TEST_FINAL_PAUSE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_frame_write(event: FrameWriteTestEvent) {
+    FRAME_WRITE_TEST_EVENTS.with(|events| {
+        if let Some(events) = events.borrow_mut().as_mut() {
+            events.push(event);
+        }
+    });
+    FRAME_WRITE_TEST_LIVE_SENDER.with(|sender| {
+        if let Some(sender) = sender.borrow().as_ref() {
+            let _ = sender.send(event);
+        }
+    });
+}
+
+#[cfg(test)]
+fn pause_before_final_write_check() {
+    FRAME_WRITE_TEST_FINAL_PAUSE.with(|pause| {
+        if let Some(pause) = pause.borrow_mut().take() {
+            pause();
+        }
+    });
+}
+
+#[cfg(unix)]
+fn write_until(
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    deadline: Option<Instant>,
+    cancellation: Option<&SupervisorCancellation>,
+    payload: bool,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    #[cfg(not(test))]
+    let _ = payload;
+
+    #[cfg(target_vendor = "apple")]
+    {
+        let enabled: libc::c_int = 1;
+        let result = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let mut offset = 0;
+    while offset < bytes.len() {
+        check_write_conditions(deadline, cancellation)?;
+        let flags = libc::MSG_DONTWAIT;
+        #[cfg(not(target_vendor = "apple"))]
+        let flags = flags | libc::MSG_NOSIGNAL;
+        let sent = unsafe {
+            libc::send(
+                stream.as_raw_fd(),
+                bytes[offset..].as_ptr().cast(),
+                bytes.len() - offset,
+                flags,
+            )
+        };
+        if sent > 0 {
+            let sent = sent as usize;
+            #[cfg(test)]
+            if payload {
+                observe_frame_write(FrameWriteTestEvent::PayloadSend {
+                    offset,
+                    count: sent,
+                    at: Instant::now(),
+                });
+            }
+            offset += sent;
+            check_write_conditions(deadline, cancellation)?;
+            continue;
+        }
+        if sent == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write supervisor frame",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            #[cfg(test)]
+            if payload {
+                observe_frame_write(FrameWriteTestEvent::WouldBlock {
+                    offset,
+                    at: Instant::now(),
+                });
+            }
+            poll_writable(stream, deadline, cancellation)?;
+            continue;
+        }
+        return Err(error);
+    }
+    #[cfg(test)]
+    if payload {
+        pause_before_final_write_check();
+    }
+    check_write_conditions(deadline, cancellation)
+}
+
+#[cfg(unix)]
+fn poll_writable(
+    stream: &TcpStream,
+    deadline: Option<Instant>,
+    cancellation: Option<&SupervisorCancellation>,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        check_write_conditions(deadline, cancellation)?;
+        let remaining = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+        let wait = match (remaining, cancellation.is_some()) {
+            (Some(remaining), true) => Some(remaining.min(Duration::from_millis(10))),
+            (Some(remaining), false) => Some(remaining),
+            (None, true) => Some(Duration::from_millis(10)),
+            (None, false) => None,
+        };
+        let timeout_ms = wait.map_or(-1, duration_to_poll_timeout_ms);
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if result == 0 {
+            continue;
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        if descriptor.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            let mut socket_error: libc::c_int = 0;
+            let mut length = std::mem::size_of_val(&socket_error) as libc::socklen_t;
+            let result = unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&mut socket_error as *mut libc::c_int).cast(),
+                    &mut length,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            return Err(if socket_error != 0 {
+                io::Error::from_raw_os_error(socket_error)
+            } else {
+                io::Error::new(io::ErrorKind::BrokenPipe, "supervisor peer closed")
+            });
+        }
+        if descriptor.revents & libc::POLLOUT != 0 {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn duration_to_poll_timeout_ms(duration: Duration) -> libc::c_int {
+    let round_up = u128::from(!duration.subsec_nanos().is_multiple_of(1_000_000));
+    let millis = duration.as_millis().saturating_add(round_up);
+    millis.min(libc::c_int::MAX as u128) as libc::c_int
+}
+
+#[cfg(windows)]
+fn write_until(
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    deadline: Option<Instant>,
+    cancellation: Option<&SupervisorCancellation>,
+    payload: bool,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    #[cfg(not(test))]
+    let _ = payload;
+    use windows_sys::Win32::Foundation::{GetLastError, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
+    use windows_sys::Win32::Networking::WinSock::{
+        WSACloseEvent, WSACreateEvent, WSAGetLastError, WSAGetOverlappedResult, WSASend, WSABUF,
+        WSAEINTR, WSAEVENT, WSAEWOULDBLOCK, WSA_INVALID_EVENT, WSA_IO_PENDING,
+    };
+    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    use windows_sys::Win32::System::IO::{CancelIoEx, OVERLAPPED};
+
+    let socket = stream.as_raw_socket() as usize;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        check_write_conditions(deadline, cancellation)?;
+        let event: WSAEVENT = unsafe { WSACreateEvent() };
+        if event == WSA_INVALID_EVENT {
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        }
+        let event_handle = event as usize as HANDLE;
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = event_handle;
+        let remaining = bytes.len() - offset;
+        let mut buffer = WSABUF {
+            len: remaining.min(u32::MAX as usize) as u32,
+            buf: bytes[offset..].as_ptr() as *mut u8,
+        };
+        // TcpStream's Windows sockets are created overlapped by std. Keep both
+        // the borrowed byte slice and this OVERLAPPED alive until its event is
+        // signaled and WSAGetOverlappedResult has harvested completion.
+        let result = unsafe {
+            WSASend(
+                socket,
+                &mut buffer,
+                1,
+                std::ptr::null_mut(),
+                0,
+                &mut overlapped,
+                None,
+            )
+        };
+        if result == -1 {
+            let error = unsafe { WSAGetLastError() };
+            if error == WSA_IO_PENDING {
+                #[cfg(test)]
+                if payload {
+                    observe_frame_write(FrameWriteTestEvent::WouldBlock {
+                        offset,
+                        at: Instant::now(),
+                    });
+                }
+            } else {
+                unsafe { WSACloseEvent(event) };
+                if error == WSAEINTR {
+                    continue;
+                }
+                if error == WSAEWOULDBLOCK {
+                    #[cfg(test)]
+                    if payload {
+                        observe_frame_write(FrameWriteTestEvent::WouldBlock {
+                            offset,
+                            at: Instant::now(),
+                        });
+                    }
+                    poll_socket_writable(socket, deadline, cancellation)?;
+                    continue;
+                }
+                return Err(io::Error::from_raw_os_error(error));
+            }
+        }
+
+        let mut cancelled = None;
+        let transferred = loop {
+            if let Err(error) = check_write_conditions(deadline, cancellation) {
+                cancelled = Some(error);
+                cancel_and_reap_socket_write(socket, event_handle, &mut overlapped);
+                break None;
+            }
+            let timeout = match (
+                deadline.map(|at| at.saturating_duration_since(Instant::now())),
+                cancellation.is_some(),
+            ) {
+                (Some(remaining), true) => Some(remaining.min(Duration::from_millis(10))),
+                (Some(remaining), false) => Some(remaining),
+                (None, true) => Some(Duration::from_millis(10)),
+                (None, false) => None,
+            };
+            let timeout_ms = timeout.map_or(INFINITE, duration_to_win_timeout_ms);
+            let wait_result = unsafe { WaitForSingleObject(event_handle, timeout_ms) };
+            if wait_result == WAIT_OBJECT_0 {
+                let mut transferred = 0;
+                let mut flags = 0;
+                let completed = unsafe {
+                    WSAGetOverlappedResult(socket, &overlapped, &mut transferred, 0, &mut flags)
+                };
+                if completed == 0 {
+                    let error = unsafe { WSAGetLastError() };
+                    cancelled = Some(io::Error::from_raw_os_error(error));
+                    break None;
+                }
+                break Some(transferred as usize);
+            }
+            if wait_result == WAIT_FAILED {
+                let error = io::Error::from_raw_os_error(unsafe { GetLastError() } as i32);
+                cancel_and_reap_socket_write(socket, event_handle, &mut overlapped);
+                cancelled = Some(error);
+                break None;
+            }
+            if wait_result != windows_sys::Win32::Foundation::WAIT_TIMEOUT {
+                let error = io::Error::other("unexpected overlapped send wait result");
+                cancel_and_reap_socket_write(socket, event_handle, &mut overlapped);
+                cancelled = Some(error);
+                break None;
+            }
+        };
+        unsafe { WSACloseEvent(event) };
+        if let Some(error) = cancelled {
+            return Err(error);
+        }
+        let transferred = transferred.expect("completed overlapped send has a byte count");
+        if transferred == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write supervisor frame",
+            ));
+        }
+        offset += transferred;
+        #[cfg(test)]
+        if payload {
+            observe_frame_write(FrameWriteTestEvent::PayloadSend {
+                offset: offset - transferred,
+                count: transferred,
+                at: Instant::now(),
+            });
+        }
+        check_write_conditions(deadline, cancellation)?;
+    }
+    #[cfg(test)]
+    if payload {
+        pause_before_final_write_check();
+    }
+    check_write_conditions(deadline, cancellation)
+}
+
+#[cfg(windows)]
+fn cancel_and_reap_socket_write(
+    socket: usize,
+    event_handle: windows_sys::Win32::Foundation::HANDLE,
+    overlapped: &mut windows_sys::Win32::System::IO::OVERLAPPED,
+) {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_FOUND};
+    use windows_sys::Win32::Networking::WinSock::WSAGetOverlappedResult;
+    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    use windows_sys::Win32::System::IO::CancelIoEx;
+    let handle = socket as *mut std::ffi::c_void;
+    unsafe {
+        let cancelled = CancelIoEx(handle, overlapped);
+        if cancelled == 0 {
+            let error = GetLastError();
+            if error != ERROR_NOT_FOUND {
+                // Cancellation failure cannot permit returning while the
+                // operation may still borrow the frame buffer. Keep waiting
+                // for completion; this is safety-bounded, not hard real-time.
+            }
+        }
+        // ERROR_NOT_FOUND means completion may have won the cancellation race;
+        // either way, wait for and harvest the operation before locals expire.
+        if WaitForSingleObject(event_handle, INFINITE)
+            != windows_sys::Win32::Foundation::WAIT_OBJECT_0
+        {
+            // Returning would invalidate OVERLAPPED and its borrowed buffer while
+            // Winsock could still own them. This can only indicate a corrupted
+            // event handle; fail-stop rather than permit kernel use-after-return.
+            std::process::abort();
+        }
+        let mut transferred = 0;
+        let mut flags = 0;
+        let _ = WSAGetOverlappedResult(socket, overlapped, &mut transferred, 0, &mut flags);
+    }
+}
+
+#[cfg(windows)]
+fn poll_socket_writable(
+    socket: usize,
+    deadline: Option<Instant>,
+    cancellation: Option<&SupervisorCancellation>,
+) -> io::Result<()> {
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAPoll, POLLERR, POLLHUP, POLLNVAL, POLLWRNORM, WSAPOLLFD,
+    };
+
+    loop {
+        check_write_conditions(deadline, cancellation)?;
+        let remaining = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+        let timeout = match (remaining, cancellation.is_some()) {
+            (Some(remaining), true) => Some(remaining.min(Duration::from_millis(10))),
+            (Some(remaining), false) => Some(remaining),
+            (None, true) => Some(Duration::from_millis(10)),
+            (None, false) => None,
+        };
+        let millis = timeout.map_or(-1, duration_to_poll_timeout_ms);
+        let mut descriptor = WSAPOLLFD {
+            fd: socket,
+            events: POLLWRNORM,
+            revents: 0,
+        };
+        let result = unsafe { WSAPoll(&mut descriptor, 1, millis) };
+        if result == -1 {
+            let error = unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() };
+            if error == windows_sys::Win32::Networking::WinSock::WSAEINTR {
+                continue;
+            }
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        if result == 0 {
+            continue;
+        }
+        if descriptor.revents & POLLNVAL != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid supervisor socket",
+            ));
+        }
+        if descriptor.revents & (POLLERR | POLLHUP) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "supervisor peer closed",
+            ));
+        }
+        if descriptor.revents & POLLWRNORM != 0 {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(windows)]
+fn duration_to_win_timeout_ms(duration: Duration) -> u32 {
+    let millis = duration.as_millis();
+    let round_up = u128::from((duration.subsec_nanos() % 1_000_000 != 0) as u8);
+    let rounded = millis.saturating_add(round_up);
+    rounded.min((u32::MAX - 1) as u128) as u32
+}
+
+#[cfg(windows)]
+fn duration_to_poll_timeout_ms(duration: Duration) -> i32 {
+    let millis = duration.as_millis();
+    let round_up = u128::from((duration.subsec_nanos() % 1_000_000 != 0) as u8);
+    let rounded = millis.saturating_add(round_up);
+    rounded.min(i32::MAX as u128) as i32
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_until(
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    deadline: Option<Instant>,
+    cancellation: Option<&SupervisorCancellation>,
+    _payload: bool,
+) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        check_write_conditions(deadline, cancellation)?;
+        match stream.write(&bytes[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write supervisor frame",
+                ))
+            }
+            Ok(count) => offset += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+        check_write_conditions(deadline, cancellation)?;
+    }
+    check_write_conditions(deadline, cancellation)
+}
+
+#[cfg(not(any(unix, windows)))]
+use std::io::Write;
 
 fn read_until(
     stream: &mut TcpStream,
@@ -279,16 +815,19 @@ fn read_until(
                 "supervisor frame deadline exceeded",
             ));
         }
-        let timeout = match (remaining, cancellation.is_some()) {
-            (Some(remaining), true) => Some(remaining.min(Duration::from_millis(10))),
-            (Some(remaining), false) => Some(remaining),
-            (None, true) => Some(Duration::from_millis(10)),
-            (None, false) => None,
-        };
         // Set the timeout for each syscall. `read_exact` would keep one socket
         // timeout across its internal reads, allowing a peer to reset the
         // effective deadline by sending one byte at a time.
-        stream.set_read_timeout(timeout)?;
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let timeout = match (remaining, cancellation.is_some()) {
+                (Some(remaining), true) => Some(remaining.min(Duration::from_millis(10))),
+                (Some(remaining), false) => Some(remaining),
+                (None, true) => Some(Duration::from_millis(10)),
+                (None, false) => None,
+            };
+            stream.set_read_timeout(timeout)?;
+        }
         match stream.read(&mut buffer[offset..]) {
             Ok(0) => {
                 return Err(io::Error::new(
@@ -303,23 +842,105 @@ fn read_until(
                     io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
                 ) =>
             {
-                if cancellation.is_some_and(|cancellation| cancellation.is_requested()) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "supervisor cancellation requested",
-                    ));
-                }
-                if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "supervisor frame deadline exceeded",
-                    ));
+                #[cfg(target_vendor = "apple")]
+                poll_readable(stream, deadline, cancellation)?;
+                #[cfg(not(target_vendor = "apple"))]
+                {
+                    if cancellation.is_some_and(|cancellation| cancellation.is_requested()) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "supervisor cancellation requested",
+                        ));
+                    }
+                    if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "supervisor frame deadline exceeded",
+                        ));
+                    }
                 }
             }
             Err(error) => return Err(error),
         }
     }
     Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+pub(crate) fn poll_readable(
+    stream: &TcpStream,
+    deadline: Option<Instant>,
+    cancellation: Option<&SupervisorCancellation>,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        if cancellation.is_some_and(SupervisorCancellation::is_requested) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "supervisor cancellation requested",
+            ));
+        }
+        let remaining = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+        if remaining.is_some_and(|remaining| remaining.is_zero()) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "supervisor frame deadline exceeded",
+            ));
+        }
+        let wait = match (remaining, cancellation.is_some()) {
+            (Some(remaining), true) => Some(remaining.min(Duration::from_millis(10))),
+            (Some(remaining), false) => Some(remaining),
+            (None, true) => Some(Duration::from_millis(10)),
+            (None, false) => None,
+        };
+        let timeout = wait.map_or(-1, duration_to_poll_timeout_ms);
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            continue;
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        if descriptor.revents & libc::POLLERR != 0 {
+            let mut socket_error: libc::c_int = 0;
+            let mut length = std::mem::size_of_val(&socket_error) as libc::socklen_t;
+            let result = unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&mut socket_error as *mut libc::c_int).cast(),
+                    &mut length,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if socket_error != 0 {
+                return Err(io::Error::from_raw_os_error(socket_error));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "supervisor read poll failed",
+            ));
+        }
+        if descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            return Ok(());
+        }
+    }
 }
 
 pub(crate) struct SupervisorToken([u8; SUPERVISOR_TOKEN_LEN]);
@@ -939,6 +1560,139 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn shrink_socket_buffer(stream: &TcpStream, option: libc::c_int) {
+        use std::os::fd::AsRawFd;
+
+        shrink_raw_socket_buffer(stream.as_raw_fd(), option).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn shrink_raw_socket_buffer(socket: libc::c_int, option: libc::c_int) -> io::Result<()> {
+        let size: libc::c_int = 4096;
+        let result = unsafe {
+            libc::setsockopt(
+                socket,
+                libc::SOL_SOCKET,
+                option,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of_val(&size) as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(unix)]
+    fn prepare_test_listener(listener: &std::net::TcpListener) {
+        use std::os::fd::AsRawFd;
+
+        shrink_raw_socket_buffer(listener.as_raw_fd(), libc::SO_RCVBUF).unwrap();
+    }
+
+    fn begin_write_observation(sender: std::sync::mpsc::Sender<FrameWriteTestEvent>) {
+        FRAME_WRITE_TEST_EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
+        FRAME_WRITE_TEST_LIVE_SENDER.with(|live| *live.borrow_mut() = Some(sender));
+    }
+
+    fn take_write_observation() -> Vec<FrameWriteTestEvent> {
+        let _ = FRAME_WRITE_TEST_LIVE_SENDER.with(|sender| sender.borrow_mut().take());
+        FRAME_WRITE_TEST_EVENTS.with(|events| events.borrow_mut().take().unwrap_or_default())
+    }
+
+    fn connect_test_stream(address: std::net::SocketAddr) -> io::Result<TcpStream> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+
+            let address = match address {
+                std::net::SocketAddr::V4(address) => address,
+                std::net::SocketAddr::V6(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "IPv4 test address required",
+                    ))
+                }
+            };
+            let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            if socket < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let configure = (|| {
+                shrink_raw_socket_buffer(socket, libc::SO_SNDBUF)?;
+                #[cfg(target_vendor = "apple")]
+                {
+                    let enabled: libc::c_int = 1;
+                    let result = unsafe {
+                        libc::setsockopt(
+                            socket,
+                            libc::SOL_SOCKET,
+                            libc::SO_NOSIGPIPE,
+                            (&enabled as *const libc::c_int).cast(),
+                            std::mem::size_of_val(&enabled) as libc::socklen_t,
+                        )
+                    };
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                let mut target: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                #[cfg(target_vendor = "apple")]
+                {
+                    target.sin_len = std::mem::size_of_val(&target) as u8;
+                }
+                target.sin_family = libc::AF_INET as _;
+                target.sin_port = address.port().to_be();
+                target.sin_addr.s_addr = u32::from_ne_bytes(address.ip().octets());
+                let connected = unsafe {
+                    libc::connect(
+                        socket,
+                        (&target as *const libc::sockaddr_in).cast(),
+                        std::mem::size_of_val(&target) as libc::socklen_t,
+                    )
+                };
+                if connected != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            })();
+            if let Err(error) = configure {
+                unsafe { libc::close(socket) };
+                return Err(error);
+            }
+            let stream = unsafe { TcpStream::from_raw_fd(socket) };
+            prepare_supervisor_stream(&stream)?;
+            Ok(stream)
+        }
+        #[cfg(not(unix))]
+        {
+            let stream = TcpStream::connect(address)?;
+            prepare_supervisor_stream(&stream)?;
+            Ok(stream)
+        }
+    }
+
+    fn accept_test_stream(
+        listener: &std::net::TcpListener,
+    ) -> io::Result<(TcpStream, std::net::SocketAddr)> {
+        let (stream, address) = listener.accept()?;
+        prepare_supervisor_stream(&stream)?;
+        Ok((stream, address))
+    }
+
+    fn wait_test_readable(stream: &TcpStream, deadline: Instant) -> io::Result<()> {
+        #[cfg(target_vendor = "apple")]
+        return poll_readable(stream, Some(deadline), None);
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = (stream, deadline);
+            Ok(())
+        }
+    }
+
     fn terminal(outcome: SupervisorOutcome) -> SupervisorTerminal {
         SupervisorTerminal {
             outcome,
@@ -1191,12 +1945,12 @@ mod tests {
     #[test]
     fn version_one_frame_is_rejected_before_state_transition() {
         use std::io::Write;
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let writer = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = accept_test_stream(&listener).unwrap();
             let mut frame = Vec::new();
             frame.extend_from_slice(&SUPERVISOR_MAGIC);
             frame.push(1);
@@ -1206,7 +1960,7 @@ mod tests {
             stream.write_all(&frame).unwrap();
         });
 
-        let mut stream = TcpStream::connect(address).unwrap();
+        let mut stream = connect_test_stream(address).unwrap();
         let error = read_frame(
             &mut stream,
             FrameDirection::ChildToParent,
@@ -1220,13 +1974,13 @@ mod tests {
     #[test]
     fn first_byte_frame_assembly_uses_one_absolute_deadline() {
         use std::io::{self, Write};
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpListener;
         use std::time::{Duration, Instant};
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let writer = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = accept_test_stream(&listener).unwrap();
             let mut frame = Vec::new();
             frame.extend_from_slice(&SUPERVISOR_MAGIC);
             frame.push(SUPERVISOR_VERSION);
@@ -1237,7 +1991,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             let _ = stream.write_all(&frame[1..]);
         });
-        let mut stream = TcpStream::connect(address).unwrap();
+        let mut stream = connect_test_stream(address).unwrap();
         let started = Instant::now();
         let result = read_frame_after_first_byte(
             &mut stream,
@@ -1249,6 +2003,628 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_millis(500));
         writer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frame_write_uses_absolute_deadline_under_backpressure() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        prepare_test_listener(&listener);
+        let address = listener.local_addr().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = accept_test_stream(&listener).unwrap();
+            shrink_socket_buffer(&stream, libc::SO_RCVBUF);
+            ready_tx.send(()).unwrap();
+            let released = release_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            let mut buf = [0; 4096];
+            if released {
+                loop {
+                    if wait_test_readable(&stream, Instant::now() + Duration::from_secs(1)).is_err()
+                    {
+                        break;
+                    }
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+        });
+        let mut stream = connect_test_stream(address).unwrap();
+        let watchdog_stream = stream.try_clone().unwrap();
+        let ready = ready_rx.recv_timeout(Duration::from_secs(1));
+        let frame = SupervisorFrame::new(
+            FrameKind::Request,
+            1,
+            vec![0x5a; MAX_SUPERVISOR_FRAME_PAYLOAD],
+        )
+        .unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (live_tx, _live_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            begin_write_observation(live_tx);
+            let started = Instant::now();
+            let result = write_frame_until(
+                &mut stream,
+                &frame,
+                Some(started + Duration::from_millis(150)),
+                None,
+            );
+            result_tx
+                .send((
+                    result.map_err(|error| error.kind()),
+                    started.elapsed(),
+                    take_write_observation(),
+                ))
+                .unwrap();
+        });
+        let result = result_rx.recv_timeout(Duration::from_secs(1));
+        let _ = release_tx.send(());
+        let _ = watchdog_stream.shutdown(std::net::Shutdown::Both);
+        let writer_join = writer.join();
+        peer.join().unwrap();
+        assert!(ready.is_ok(), "peer did not reach the blocked-read barrier");
+        let late_result = if result.is_err() {
+            result_rx.try_recv().ok()
+        } else {
+            None
+        };
+        assert!(
+            result.is_ok(),
+            "writer watchdog expired; late result after cleanup: {late_result:?}; join={writer_join:?}"
+        );
+        let (write_result, elapsed, events) = result.unwrap();
+        assert!(
+            write_result == Err(io::ErrorKind::TimedOut),
+            "write did not time out under constrained buffers: {write_result:?}; writer={writer_join:?}"
+        );
+        let would_blocks: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                FrameWriteTestEvent::WouldBlock { offset, at } => Some((*offset, *at)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !would_blocks.is_empty(),
+            "no real WouldBlock observed: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, FrameWriteTestEvent::PayloadSend { .. })),
+            "no payload progress observed: {events:?}"
+        );
+        assert!(elapsed < Duration::from_millis(750), "elapsed {elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_drain_partial_writes_share_one_absolute_deadline() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        prepare_test_listener(&listener);
+        let address = listener.local_addr().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (drain_tx, drain_rx) = std::sync::mpsc::channel();
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = accept_test_stream(&listener).unwrap();
+            shrink_socket_buffer(&stream, libc::SO_RCVBUF);
+            ready_tx.send(()).unwrap();
+            let mut buf = [0; 4096];
+            let mut drains = 0;
+            while drains < 2 {
+                if drain_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                    break;
+                }
+                wait_test_readable(&stream, Instant::now() + Duration::from_secs(1)).unwrap();
+                let count = stream.read(&mut buf).unwrap_or(0);
+                drained_tx.send(count).unwrap();
+                drains += 1;
+            }
+            let _ = finish_rx.recv_timeout(Duration::from_secs(2));
+            loop {
+                if wait_test_readable(&stream, Instant::now() + Duration::from_secs(1)).is_err() {
+                    break;
+                }
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            drains
+        });
+        let mut stream = connect_test_stream(address).unwrap();
+        let watchdog_stream = stream.try_clone().unwrap();
+        let ready = ready_rx.recv_timeout(Duration::from_secs(1));
+        let frame = SupervisorFrame::new(
+            FrameKind::Request,
+            1,
+            vec![0x5a; MAX_SUPERVISOR_FRAME_PAYLOAD],
+        )
+        .unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (live_tx, live_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            begin_write_observation(live_tx);
+            let started = Instant::now();
+            let result = write_frame_until(
+                &mut stream,
+                &frame,
+                Some(started + Duration::from_millis(250)),
+                None,
+            );
+            result_tx
+                .send((
+                    result.map_err(|error| error.kind()),
+                    started.elapsed(),
+                    take_write_observation(),
+                ))
+                .unwrap();
+        });
+        let event_deadline = Instant::now() + Duration::from_secs(1);
+        let mut trace = Vec::new();
+        let mut payload_sends = Vec::new();
+        let mut last_block = None;
+        while ready.is_ok() && Instant::now() < event_deadline {
+            match live_rx.recv_timeout(event_deadline.saturating_duration_since(Instant::now())) {
+                Ok(event @ FrameWriteTestEvent::PayloadSend { offset, count, at }) => {
+                    payload_sends.push((offset, count, at));
+                    trace.push(event);
+                }
+                Ok(event @ FrameWriteTestEvent::WouldBlock { offset, .. }) => {
+                    trace.push(event);
+                    if !payload_sends.is_empty() && offset < MAX_SUPERVISOR_FRAME_PAYLOAD {
+                        last_block = Some(offset);
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let first_block_seen = last_block.is_some();
+        let mut drain_counts = Vec::new();
+        let mut sends_after_first_block = 0;
+        if let Some(mut blocked_at) = last_block {
+            for _ in 0..2 {
+                // Drain only after observed backpressure; the 75ms hold shapes
+                // progress without making the readiness decision timing-based.
+                std::thread::sleep(Duration::from_millis(75));
+                let _ = drain_tx.send(());
+                if let Ok(count) = drained_rx.recv_timeout(Duration::from_millis(100)) {
+                    drain_counts.push(count);
+                }
+                let mut progressed = false;
+                let progress_deadline = Instant::now() + Duration::from_millis(100);
+                while Instant::now() < progress_deadline {
+                    match live_rx
+                        .recv_timeout(progress_deadline.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(event @ FrameWriteTestEvent::PayloadSend { offset, count, at }) => {
+                            if offset >= blocked_at {
+                                progressed = true;
+                                sends_after_first_block += 1;
+                                payload_sends.push((offset, count, at));
+                            }
+                            trace.push(event);
+                        }
+                        Ok(event @ FrameWriteTestEvent::WouldBlock { offset, .. }) => {
+                            trace.push(event);
+                            if progressed && offset > blocked_at {
+                                blocked_at = offset;
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+            }
+        }
+        let result = result_rx.recv_timeout(Duration::from_secs(1));
+        let _ = finish_tx.send(());
+        let _ = watchdog_stream.shutdown(std::net::Shutdown::Both);
+        let writer_join = writer.join();
+        let drains = peer.join().unwrap();
+        assert!(ready.is_ok(), "peer did not reach the drain barrier");
+        assert!(
+            first_block_seen,
+            "no incomplete-payload WouldBlock: {trace:?}"
+        );
+        assert_eq!(drains, 2, "expected exactly two peer drains");
+        assert_eq!(drain_counts.len(), 2, "drains: {drain_counts:?}");
+        assert!(
+            sends_after_first_block >= 2,
+            "insufficient progress after the initial WouldBlock: {trace:?}"
+        );
+        let late_result = if result.is_err() {
+            result_rx.try_recv().ok()
+        } else {
+            None
+        };
+        assert!(
+            result.is_ok(),
+            "writer watchdog expired; late result after cleanup: {late_result:?}; trace={trace:?}; join={writer_join:?}"
+        );
+        let (write_result, elapsed, events) = result.expect("writer watchdog expired");
+        assert_eq!(write_result, Err(io::ErrorKind::TimedOut));
+        assert!(
+            payload_sends.len() >= 3,
+            "insufficient live partial sends: {trace:?}"
+        );
+        let would_blocks: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                FrameWriteTestEvent::WouldBlock { offset, at } => Some((*offset, *at)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !would_blocks.is_empty(),
+            "expected backpressure between payload sends: {events:?}"
+        );
+        assert!(
+            payload_sends
+                .windows(2)
+                .all(|pair| pair[1].0 >= pair[0].0 + pair[0].1),
+            "payload offsets did not advance: {payload_sends:?}"
+        );
+        let progressed_at = payload_sends.last().unwrap().2;
+        assert!(
+            progressed_at.duration_since(payload_sends[0].2) < Duration::from_millis(230),
+            "drain progress did not occur during the shared deadline: {payload_sends:?}"
+        );
+        assert!(
+            (Duration::from_millis(200)..Duration::from_millis(350)).contains(&elapsed),
+            "write did not share the 250ms deadline: {elapsed:?}; writer={writer_join:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_write_cancels_while_payload_is_backpressured() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        prepare_test_listener(&listener);
+        let address = listener.local_addr().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = accept_test_stream(&listener).unwrap();
+            shrink_socket_buffer(&stream, libc::SO_RCVBUF);
+            ready_tx.send(()).unwrap();
+            let _ = resume_rx.recv_timeout(Duration::from_secs(2));
+            let mut buf = [0; 4096];
+            let mut payload_bytes = 0;
+            loop {
+                if wait_test_readable(&stream, Instant::now() + Duration::from_secs(1)).is_err() {
+                    break;
+                }
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => payload_bytes += count,
+                }
+            }
+            payload_bytes
+        });
+        let mut stream = connect_test_stream(address).unwrap();
+        let watchdog_stream = stream.try_clone().unwrap();
+        let cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::User,
+        );
+        let writer_cancellation = cancellation.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (live_tx, live_rx) = std::sync::mpsc::channel();
+        let frame = SupervisorFrame::new(
+            FrameKind::Request,
+            1,
+            vec![0x5a; MAX_SUPERVISOR_FRAME_PAYLOAD],
+        )
+        .unwrap();
+        let writer = std::thread::spawn(move || {
+            begin_write_observation(live_tx);
+            let result = write_frame_until(
+                &mut stream,
+                &frame,
+                Some(Instant::now() + Duration::from_secs(2)),
+                Some(&writer_cancellation),
+            );
+            result_tx
+                .send((
+                    result.map_err(|error| error.kind()),
+                    take_write_observation(),
+                ))
+                .unwrap();
+        });
+        let ready = ready_rx.recv_timeout(Duration::from_secs(1));
+        let mut payload_progress = false;
+        let mut blocked_offset = None;
+        let event_deadline = Instant::now() + Duration::from_secs(1);
+        while ready.is_ok() && Instant::now() < event_deadline {
+            match live_rx.recv_timeout(event_deadline.saturating_duration_since(Instant::now())) {
+                Ok(FrameWriteTestEvent::PayloadSend { .. }) => payload_progress = true,
+                Ok(FrameWriteTestEvent::WouldBlock { offset, .. })
+                    if offset < MAX_SUPERVISOR_FRAME_PAYLOAD =>
+                {
+                    blocked_offset = Some(offset);
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        if blocked_offset.is_some() && payload_progress {
+            cancellation.request(CancelReason::User);
+        }
+        // Keep the peer from draining until the writer has returned on cancel.
+        let result = result_rx.recv_timeout(Duration::from_secs(1));
+        let _ = watchdog_stream.shutdown(std::net::Shutdown::Both);
+        let _ = resume_tx.send(());
+        let writer_join = writer.join();
+        let payload_bytes = peer.join().unwrap();
+        assert!(ready.is_ok(), "peer did not reach the no-drain barrier");
+        let late_result = if result.is_err() {
+            result_rx.try_recv().ok()
+        } else {
+            None
+        };
+        assert!(
+            result.is_ok(),
+            "writer watchdog expired; late result after cleanup: {late_result:?}; join={writer_join:?}"
+        );
+        assert!(
+            payload_progress,
+            "no live payload-send event before cancellation"
+        );
+        assert!(
+            blocked_offset.is_some(),
+            "no live incomplete-payload WouldBlock before cancellation"
+        );
+        assert!(payload_bytes < MAX_SUPERVISOR_FRAME_PAYLOAD);
+        assert!(
+            matches!(&result, Ok((Err(io::ErrorKind::Interrupted), _))),
+            "REQUEST did not stop on cancellation: {result:?}; writer={writer_join:?}"
+        );
+        let (_, events) = result.unwrap();
+        let would_blocks: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                FrameWriteTestEvent::WouldBlock { offset, at } => Some((*offset, *at)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !would_blocks.is_empty(),
+            "REQUEST was not observed backpressured: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, FrameWriteTestEvent::PayloadSend { .. })),
+            "REQUEST had no payload sends: {events:?}"
+        );
+    }
+
+    #[test]
+    fn cancelled_execution_does_not_block_control_or_terminal_writes() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut stream = connect_test_stream(address).unwrap();
+            let cancel = read_frame(
+                &mut stream,
+                FrameDirection::ParentToChild,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+            let terminal = read_frame(
+                &mut stream,
+                FrameDirection::ChildToParent,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+            (cancel.kind, terminal.kind)
+        });
+        let (mut stream, _) = accept_test_stream(&listener).unwrap();
+        let cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::User,
+        );
+        cancellation.request(CancelReason::User);
+        let cancel = SupervisorFrame::new(FrameKind::Cancel, 1, Vec::new()).unwrap();
+        write_frame_until(
+            &mut stream,
+            &cancel,
+            Some(Instant::now() + Duration::from_secs(1)),
+            None,
+        )
+        .unwrap();
+        let terminal = SupervisorFrame::new(FrameKind::Terminal, 1, Vec::new()).unwrap();
+        write_frame_until(
+            &mut stream,
+            &terminal,
+            Some(Instant::now() + Duration::from_secs(1)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            peer.join().unwrap(),
+            (FrameKind::Cancel, FrameKind::Terminal)
+        );
+    }
+
+    #[test]
+    fn execution_cancellation_is_checked_before_start_frame_write() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut stream = connect_test_stream(address).unwrap();
+            let mut byte = [0];
+            wait_test_readable(&stream, Instant::now() + Duration::from_secs(1)).unwrap();
+            stream.read(&mut byte).unwrap()
+        });
+        let (mut stream, _) = accept_test_stream(&listener).unwrap();
+        let cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::User,
+        );
+        cancellation.request(CancelReason::User);
+        let start = SupervisorFrame::new(FrameKind::Start, 1, Vec::new()).unwrap();
+        assert_eq!(
+            write_frame_until(
+                &mut stream,
+                &start,
+                Some(Instant::now() + Duration::from_secs(1)),
+                Some(&cancellation),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(peer.join().unwrap(), 0);
+    }
+
+    #[test]
+    fn cancellation_after_last_send_is_caught_before_frame_returns() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut stream = connect_test_stream(address).unwrap();
+            read_frame(
+                &mut stream,
+                FrameDirection::ParentToChild,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .map(|frame| frame.kind)
+        });
+        let (mut stream, _) = accept_test_stream(&listener).unwrap();
+        let watchdog_stream = stream.try_clone().unwrap();
+        let (pause_reached_tx, pause_reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let cancellation = SupervisorCancellation::new(
+            crate::limits::CancellationContext::new(),
+            CancelReason::User,
+        );
+        let writer_cancellation = cancellation.clone();
+        let (live_tx, _live_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            begin_write_observation(live_tx);
+            FRAME_WRITE_TEST_FINAL_PAUSE.with(|pause| {
+                *pause.borrow_mut() = Some(Box::new(move || {
+                    pause_reached_tx.send(()).unwrap();
+                    let _ = resume_rx.recv_timeout(Duration::from_secs(2));
+                }));
+            });
+            let frame = SupervisorFrame::new(FrameKind::Request, 1, vec![7; 32]).unwrap();
+            let result = write_frame_until(
+                &mut stream,
+                &frame,
+                Some(Instant::now() + Duration::from_secs(2)),
+                Some(&writer_cancellation),
+            );
+            result_tx
+                .send((
+                    result.map_err(|error| error.kind()),
+                    take_write_observation(),
+                ))
+                .unwrap();
+        });
+        let pause_reached = pause_reached_rx.recv_timeout(Duration::from_secs(1));
+        if pause_reached.is_ok() {
+            cancellation.request(CancelReason::User);
+        }
+        let _ = resume_tx.send(());
+        let write_result = result_rx.recv_timeout(Duration::from_secs(1));
+        let _ = watchdog_stream.shutdown(std::net::Shutdown::Both);
+        let writer_join = writer.join();
+        let received = peer.join().unwrap();
+        assert!(
+            pause_reached.is_ok(),
+            "writer did not reach final-return barrier"
+        );
+        assert_eq!(received.unwrap(), FrameKind::Request);
+        let (result, events) = write_result.expect("writer watchdog expired");
+        assert_eq!(result, Err(io::ErrorKind::Interrupted));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, FrameWriteTestEvent::PayloadSend { .. })));
+        assert!(writer_join.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_partial_frame_shuts_down_stream() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        prepare_test_listener(&listener);
+        let address = listener.local_addr().unwrap();
+        let (header_tx, header_rx) = std::sync::mpsc::channel();
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = accept_test_stream(&listener).unwrap();
+            shrink_socket_buffer(&stream, libc::SO_RCVBUF);
+            let mut header = [0; SUPERVISOR_HEADER_LEN];
+            read_until(
+                &mut stream,
+                &mut header,
+                Some(Instant::now() + Duration::from_secs(1)),
+                None,
+            )
+            .unwrap();
+            header_tx.send(()).unwrap();
+            let _ = close_rx.recv_timeout(Duration::from_secs(2));
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        let mut stream = connect_test_stream(address).unwrap();
+        let watchdog_stream = stream.try_clone().unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let frame = SupervisorFrame::new(
+            FrameKind::Request,
+            1,
+            vec![0x5a; MAX_SUPERVISOR_FRAME_PAYLOAD],
+        )
+        .unwrap();
+        let writer = std::thread::spawn(move || {
+            let result = write_frame_until(
+                &mut stream,
+                &frame,
+                Some(Instant::now() + Duration::from_secs(1)),
+                None,
+            );
+            result_tx
+                .send(result.map_err(|error| error.kind()))
+                .unwrap();
+        });
+        let header_seen = header_rx.recv_timeout(Duration::from_secs(1));
+        let _ = close_tx.send(());
+        let result = result_rx.recv_timeout(Duration::from_secs(1));
+        let _ = watchdog_stream.shutdown(std::net::Shutdown::Both);
+        let writer_join = writer.join();
+        peer.join().unwrap();
+        assert!(header_seen.is_ok(), "peer did not observe the frame header");
+        assert!(
+            matches!(result, Ok(Err(kind)) if kind != io::ErrorKind::TimedOut),
+            "expected a transport error after the partial header, got {result:?}; writer={writer_join:?}"
+        );
     }
 
     #[test]

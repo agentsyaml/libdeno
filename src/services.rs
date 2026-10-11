@@ -472,10 +472,8 @@ impl SharedServices {
         workspace_factory.workspace_directory()?;
         workspace_factory.npmrc_with_path()?;
 
-        // Cross-run analysis caches wired into the resolver stack (see
-        // analysis_cache.rs): in-memory CJS analysis, a process-global
-        // singleton so `run()` (which builds a fresh SharedServices per
-        // call) still reuses it.
+        // Resolver-owned CJS analysis. Unlike ModuleInfoCache this cannot be
+        // shared across resolver stacks: upstream's key omits package `type`.
         let node_analysis_cache: deno_resolver::cjs::analyzer::NodeAnalysisCacheRc =
             crate::analysis_cache::node_analysis_cache();
 

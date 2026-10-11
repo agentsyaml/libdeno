@@ -7,8 +7,9 @@ libdeno.
 
 - Rust toolchain (edition 2021). A recent stable toolchain is required to
   build the Deno dependency stack.
-- Linux / macOS / Windows. The Rust main API and subprocess paths are covered
-  by the Windows compatibility CI job.
+- Linux / macOS / Windows. Windows support is intended; release validation for
+  the current in-progress changes still requires a real Windows runner (the
+  local SDK check may not be available).
 - Network access on the first build (crates.io) and, at runtime, whenever a
   remote module or npm package needs to be fetched.
 

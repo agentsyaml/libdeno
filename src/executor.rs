@@ -1371,6 +1371,8 @@ struct AdmissionScheduler {
     state: Mutex<SchedulerState>,
     wake: Condvar,
     manager_started: AtomicBool,
+    #[cfg(test)]
+    dispatch_test_hook: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
 }
 
 #[cfg(feature = "execution-control")]
@@ -1388,6 +1390,8 @@ impl AdmissionScheduler {
             }),
             wake: Condvar::new(),
             manager_started: AtomicBool::new(false),
+            #[cfg(test)]
+            dispatch_test_hook: Mutex::new(None),
         })
     }
 
@@ -1565,6 +1569,18 @@ impl AdmissionScheduler {
                     drop(guard);
                     return;
                 }
+                if has_dispatchable_pending(
+                    guard.active.len(),
+                    self.active_limit.get(),
+                    !guard.queue.is_empty(),
+                    !guard.ready.is_empty(),
+                ) {
+                    // Expired owners release their permits after the first
+                    // scheduler lock is dropped. Recheck admission before
+                    // sleeping so a queued task can use a just-released slot.
+                    drop(guard);
+                    continue;
+                }
                 let wait = next_deadline(&guard).map_or(Duration::from_millis(100), |deadline| {
                     deadline.saturating_duration_since(Instant::now())
                 });
@@ -1575,6 +1591,17 @@ impl AdmissionScheduler {
                 continue;
             }
             if let Some(owner) = dispatch {
+                #[cfg(test)]
+                if let Some(hook) = self
+                    .dispatch_test_hook
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                {
+                    let _ = hook.send(owner.id);
+                    drop(owner);
+                    continue;
+                }
                 spawn_task(owner);
             }
         }
@@ -1747,6 +1774,11 @@ impl AdmissionScheduler {
     fn terminal(state: ExecutionState) -> bool {
         TaskControl::is_terminal(state)
     }
+}
+
+#[cfg(feature = "execution-control")]
+fn has_dispatchable_pending(active: usize, active_limit: usize, queued: bool, ready: bool) -> bool {
+    ready || (queued && active < active_limit)
 }
 
 #[cfg(feature = "execution-control")]
@@ -2981,6 +3013,90 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         join.join().unwrap();
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn manager_rechecks_dispatchable_queue_before_deadline_wait() {
+        use std::sync::mpsc;
+
+        let scheduler =
+            AdmissionScheduler::new(AdmissionConfig::new(NonZeroUsize::new(1).unwrap(), 1));
+        let (dispatch_tx, dispatch_rx) = mpsc::channel();
+        *scheduler
+            .dispatch_test_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(dispatch_tx);
+
+        let make_owner = |id, deadline, permit| {
+            let control = Arc::new(TaskControl::new(
+                id,
+                ExecutionBackend::Subprocess,
+                Instant::now(),
+                Some(deadline),
+                ExecutionTiming::disabled(),
+                Arc::downgrade(&scheduler),
+            ));
+            TaskOwner {
+                id,
+                request: ExecutionRequest::new(".", LibdenoOptions::default()),
+                submission: SubmissionOptions::default(),
+                deadline: Some(deadline),
+                control,
+                runner: ExecutorDispatch {
+                    project_dir: PathBuf::new(),
+                    backend: ExecutionBackend::Subprocess,
+                    state: ExecutorBackend::Subprocess(PathBuf::new()),
+                    panic_on_execute: false,
+                },
+                timing: ExecutionTiming::disabled(),
+                result: ResultCell::new(),
+                permit: Some(permit),
+            }
+        };
+
+        let now = Instant::now();
+        let expired_a = make_owner(
+            1,
+            now - Duration::from_secs(1),
+            TaskPermit::Active(ActivePermit::new(scheduler.clone(), 1)),
+        );
+        expired_a.control.mark_accepted();
+        let queued_b = make_owner(
+            2,
+            now + Duration::from_secs(60),
+            TaskPermit::Queued(QueuePermit),
+        );
+        {
+            let mut state = scheduler
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.active.insert(1, expired_a.control.clone());
+            state.ready.push_back(expired_a);
+            state.queue.push_back(queued_b);
+        }
+
+        scheduler.manager_started.store(true, Ordering::Release);
+        let manager = scheduler.clone();
+        let join = std::thread::spawn(move || manager.manager_loop());
+        let dispatched = dispatch_rx.recv_timeout(Duration::from_secs(2));
+        if dispatched.is_err() {
+            // Let the old deadline-wait path drain B so the failing test does
+            // not strand its manager thread until B's far-future deadline.
+            if let Some(owner) = scheduler
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .queue
+                .front_mut()
+            {
+                owner.deadline = Some(Instant::now() - Duration::from_secs(1));
+            }
+            scheduler.wake.notify_all();
+        }
+        join.join().unwrap();
+        assert_eq!(dispatched.unwrap(), 2);
     }
 
     #[cfg(feature = "execution-control")]

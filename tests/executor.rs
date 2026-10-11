@@ -648,7 +648,7 @@ mod execution_control {
         let entry = dir.join("main.js");
         fs::write(
             &entry,
-            "console.log('supervised-prefix'); throw new Error('secret runtime text');",
+            "console.log('supervised-prefix'); throw Object.assign(new Error('secret runtime text'), { name: 'NotCapable' });",
         )
         .unwrap();
         let executor = build(

@@ -9,6 +9,8 @@
 use libdeno::{run, LibdenoError, LibdenoOptions};
 
 fn main() {
+    // SAFETY: a host launching this binary must exclusively transfer its IPC handle.
+    unsafe { libdeno::initialize_node_ipc_from_env() }.unwrap();
     // Service `run_in_subprocess` child requests (spawned with
     // LIBDENO_CHILD_MODE=1). In child mode this executes the script and exits
     // with its code, so the host process stays alive on `Deno.exit(n)`.

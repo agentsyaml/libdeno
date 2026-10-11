@@ -12,12 +12,9 @@
 //!   `PackageJsonCache` seams, which cache CJS analysis and node resolution
 //!   results.
 //!
-//! These caches are process-global singletons (see [`module_info_cache`] /
-//! [`node_analysis_cache`]): they survive across runs of the same process on
-//! *every* entry point — `run` builds a fresh `SharedServices` per call, so
-//! an instance stored on the services would be rebuilt (and emptied) with it.
-//! Content-hash keying makes process-global sharing safe: a changed source
-//! hashes differently and never hits a stale entry. All are size-capped (env
+//! `ModuleInfoCache` is process-global; CJS analysis is resolver-owned because
+//! upstream's CJS key omits package metadata such as `type`. The caches remain
+//! memory-only and size-capped (env
 //! `LIBDENO_ANALYSIS_CACHE_ENTRIES`, default 8192; on overflow the cache
 //! clears — a simple reset is cheaper and more predictable than an LRU for
 //! this hot path, and a clear only costs the next run one rebuild).
@@ -181,12 +178,11 @@ impl MemoryNodeAnalysisCache {
     }
 }
 
-/// Process-global CJS analysis cache (see module docs).
+/// Creates a CJS analysis cache for one resolver stack. Its lifetime must
+/// match the resolver because package `type` affects analysis but is not part
+/// of the upstream cache key.
 pub fn node_analysis_cache() -> Arc<MemoryNodeAnalysisCache> {
-    static CACHE: OnceLock<Arc<MemoryNodeAnalysisCache>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| Arc::new(MemoryNodeAnalysisCache::new()))
-        .clone()
+    Arc::new(MemoryNodeAnalysisCache::new())
 }
 
 impl deno_resolver::cjs::analyzer::NodeAnalysisCache for MemoryNodeAnalysisCache {
@@ -268,6 +264,32 @@ mod tests {
         }
         assert!(cache
             .get_cjs_analysis(&specifier, cache.compute_source_hash("changed"))
+            .is_none());
+    }
+
+    #[test]
+    fn old_resolver_package_type_analysis_does_not_reach_new_resolver() {
+        let old_resolver_cache = node_analysis_cache();
+        let new_resolver_cache = node_analysis_cache();
+        let specifier = ModuleSpecifier::parse("file:///pkg/index.js").unwrap();
+        let source = "module.exports = { value: 1 };";
+        let hash = old_resolver_cache.compute_source_hash(source);
+        let old_module_analysis = DenoCjsAnalysis::EsmAnalysis(ModuleExportsAndReExports {
+            exports: vec!["value".to_string()],
+            reexports: vec![],
+            member_reexports: vec![],
+        });
+
+        // This complete result was produced under the old resolver's package
+        // type. A new resolver must not see it for the same URL and bytes.
+        old_resolver_cache.set_cjs_analysis(&specifier, hash, &old_module_analysis);
+
+        assert_eq!(
+            old_resolver_cache.get_cjs_analysis(&specifier, hash),
+            Some(old_module_analysis)
+        );
+        assert!(new_resolver_cache
+            .get_cjs_analysis(&specifier, hash)
             .is_none());
     }
 }

@@ -141,8 +141,8 @@ pub(crate) fn build_main_worker(
         location: Some(main_module.clone()),
         args: options.args.clone(),
         unstable_features: unstable_ids,
-        // fork() IPC pipe; gated on the marker captured at run() entry (limits.rs).
-        node_ipc_init: crate::limits::node_ipc_init(),
+        // Keep the IPC value absent from this bootstrap and the factory clone.
+        node_ipc_init: None,
         ..Default::default()
     };
 
@@ -171,10 +171,24 @@ pub(crate) fn build_main_worker(
         ..Default::default()
     };
 
+    // This is the final handoff point: all fallible resolver, feature, and
+    // worker-factory setup has completed, and the factory clone had no IPC.
+    let worker_options = after_fallible_worker_setup(Ok(worker_options), |mut options| {
+        options.bootstrap.node_ipc_init = crate::limits::node_ipc_init();
+        options
+    })?;
+
     let mut worker =
         MainWorker::bootstrap_from_options(main_module, worker_services, worker_options);
     let isolate_handle = worker.js_runtime.v8_isolate().thread_safe_handle();
     Ok((worker, isolate_handle))
+}
+
+fn after_fallible_worker_setup<T>(
+    setup: Result<T, LibdenoError>,
+    handoff: impl FnOnce(T) -> T,
+) -> Result<T, LibdenoError> {
+    setup.map(handoff)
 }
 
 /// The default unstable runtime surface. Keep this as the only default list;
@@ -202,4 +216,27 @@ fn static_feature_names(features: &[String]) -> Result<Vec<&'static str>, String
         }
     }
     Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::after_fallible_worker_setup;
+    use crate::LibdenoError;
+
+    #[test]
+    fn failed_worker_setup_does_not_take_startup_ipc() {
+        // Inject an error at the final local-setup boundary; the callback is
+        // the only operation that can consume the stored channel.
+        let mut owned_channel_available = true;
+        let result = after_fallible_worker_setup::<()>(
+            Err(LibdenoError::Configuration(
+                "injected worker setup failure".into(),
+            )),
+            |_| {
+                owned_channel_available = false;
+            },
+        );
+        assert!(result.is_err());
+        assert!(owned_channel_available);
+    }
 }

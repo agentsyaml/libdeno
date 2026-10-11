@@ -146,7 +146,9 @@ impl deno_graph::source::NpmResolver for GraphResolver {
         // `NpmDenoGraphResolver`).
         #[cfg(feature = "npm")]
         if let Some(npm_resolver) = &self.npm_resolver {
-            return npm_resolver.resolve_pkg_reqs(package_reqs).await;
+            let mut result = npm_resolver.resolve_pkg_reqs(package_reqs).await;
+            propagate_dep_graph_error(&mut result);
+            return result;
         }
         let _ = package_reqs;
         // npm support disabled in this build: fail fast with a clear error
@@ -179,5 +181,80 @@ impl deno_graph::source::NpmResolver for GraphResolver {
                 )))
             },
         }
+    }
+}
+
+/// deno_graph 0.110.1 stores `dep_graph_result` on the graph but uses each
+/// per-request result to populate npm module slots. Associate an overall
+/// install failure with only this batch, preserving existing request errors.
+#[cfg(any(feature = "npm", test))]
+pub(crate) fn propagate_dep_graph_error(result: &mut NpmResolvePkgReqsResult) {
+    let Err(error) = &result.dep_graph_result else {
+        return;
+    };
+    for request_result in &mut result.results {
+        if request_result.is_ok() {
+            *request_result = Err(deno_graph::NpmLoadError::PackageReqResolution(Arc::clone(
+                error,
+            )));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overall_npm_failure_reaches_only_ok_requests_and_preserves_causes() {
+        let overall_error: Arc<dyn deno_error::JsErrorClass> =
+            Arc::new(JsErrorBox::generic("controlled install failure"));
+        let individual_error: Arc<dyn deno_error::JsErrorClass> =
+            Arc::new(JsErrorBox::generic("controlled request failure"));
+        let mut result = NpmResolvePkgReqsResult {
+            results: vec![
+                Ok(()),
+                Err(deno_graph::NpmLoadError::PackageReqResolution(
+                    individual_error.clone(),
+                )),
+                Ok(()),
+            ],
+            dep_graph_result: Err(overall_error.clone()),
+        };
+
+        propagate_dep_graph_error(&mut result);
+
+        assert!(Arc::ptr_eq(
+            result.dep_graph_result.as_ref().unwrap_err(),
+            &overall_error
+        ));
+        for index in [0, 2] {
+            match &result.results[index] {
+                Err(deno_graph::NpmLoadError::PackageReqResolution(error)) => {
+                    assert!(Arc::ptr_eq(error, &overall_error));
+                    assert_eq!(error.to_string(), "controlled install failure");
+                }
+                other => panic!("overall error was not attached to request: {other:?}"),
+            }
+        }
+        match &result.results[1] {
+            Err(deno_graph::NpmLoadError::PackageReqResolution(error)) => {
+                assert!(Arc::ptr_eq(error, &individual_error));
+            }
+            other => panic!("individual request error was replaced: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn successful_npm_batch_is_unchanged() {
+        let mut result = NpmResolvePkgReqsResult {
+            results: vec![Ok(())],
+            dep_graph_result: Ok(()),
+        };
+
+        propagate_dep_graph_error(&mut result);
+
+        assert!(result.results[0].is_ok());
+        assert!(result.dep_graph_result.is_ok());
     }
 }

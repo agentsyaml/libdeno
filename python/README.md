@@ -1,7 +1,7 @@
 # libdeno Python API
 
 This is a private alpha Python binding for the Rust `libdeno` runtime. The
-Python distribution and core Rust crate are both versioned at `0.3.3`. The
+Python distribution and core Rust crate are both versioned at `0.3.4`. The
 contract is deliberately small, synchronous, and fail-closed:
 
 ```python
@@ -46,13 +46,24 @@ runtime's permission model.
   8 MiB are rejected with `ConfigurationError`; the value does not cap native
   allocations, external memory, host memory, RSS, CPU, or child processes.
   It is not an OS/process isolation boundary.
+- HTTP body limits apply to reqwest-returned, transport-decoded response-body
+  bytes, not wire bytes; upstream decoding may allocate before the limit is
+  checked. The explicit npm `.tgz` path has the same 1 GiB response-body cap.
+  For a gzip response, the final four body bytes are checked as an `ISIZE` hint
+  (the final member's size modulo 2^32); this threshold is not a decompressed-
+  output budget and does not identify the first consumed member or total
+  extraction. Fallback extraction has no hard output budget, so this is not a
+  decompression or RSS cap.
 
 ## Exceptions
 
 The facade exports `LibdenoError` and these subclasses:
 
 - `EntryError` — entry resolution failed.
-- `DenoPermissionError` — invalid/denied permission access.
+- `DenoPermissionError` — invalid permission flags or denials carrying typed
+  Rust permission provenance. JavaScript exception names/classes/causes are
+  not trusted as denial evidence; a JS failure, including a denial whose typed
+  provenance was lost, is reported as `DenoRuntimeError`.
 - `ConfigurationError` — options cannot form a valid run, including empty
   permissions without an explicit opt-in, invalid deadlines, or an undersized
   heap value.

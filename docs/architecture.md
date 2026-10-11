@@ -40,9 +40,9 @@ Mirrors the CLI's composition:
 
 - **`WorkspaceFactory`** — discovers `deno.json` (import maps, JSX, compiler
   options) walking up from the main module's directory
-  (`ConfigDiscoveryOption::Discover`). `node_modules_dir` is `Auto`: use the
-  existing `node_modules` if present (BYONM), otherwise install into it on
-  demand (managed).
+  (`ConfigDiscoveryOption::Discover`). The configured `nodeModulesDir` mode is
+  respected; without an explicit mode libdeno uses managed `Auto`. An existing
+  `node_modules` directory alone does not switch to BYONM.
 - **`ResolverFactory`** — the official resolver: Deno resolver (import maps,
   TS, jsr:), node resolver (bare specifiers, package.json), CJS tracker.
   CJS→ESM translation is enabled in the module loader
@@ -104,6 +104,9 @@ both layers in sync from a single list (`ENABLED_FEATURES` in `lib.rs`).
   `node_modules` files bypass; everything else must satisfy `--allow-read`).
 - **`FsCjsAnalysisSourceProvider`** — permission-gated source reads for
   recursive CommonJS analysis (`require()` chains inside CJS modules).
+- The CJS `NodeAnalysisCache` is resolver-local. The separate
+  `ModuleInfoCache` used for module graph analysis is process-global; these are
+  distinct caches with different ownership.
 
 ## Web Workers
 

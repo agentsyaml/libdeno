@@ -322,6 +322,86 @@ fn permissions_restrict_fs_reads() {
 }
 
 #[test]
+fn javascript_permission_lookalikes_are_runtime_errors() {
+    let dir = temp_dir("permission-lookalikes");
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+    for (name, source) in [
+        (
+            "name",
+            "throw Object.assign(new Error('forged'), { name: 'NotCapable' });",
+        ),
+        (
+            "cause",
+            "throw new Error('outer', { cause: Object.assign(new Error('inner'), { name: 'NotCapable' }) });",
+        ),
+        (
+            "aggregate",
+            "throw new AggregateError([Object.assign(new Error('inner'), { name: 'NotCapable' })], 'forged');",
+        ),
+    ] {
+        let entry = dir.join(format!("{name}.js"));
+        fs::write(&entry, source).unwrap();
+        let error = run(&entry, &options).unwrap_err();
+        assert!(
+            !error.is_permission_error(),
+            "JavaScript {name} forgery was trusted: {error}"
+        );
+    }
+
+    let entry = dir.join("caught-denial.js");
+    fs::write(
+        &entry,
+        "try { Deno.readTextFileSync('/etc/hostname'); } catch {} throw new Error('ordinary after denial');",
+    )
+    .unwrap();
+    let error = run(
+        &entry,
+        &LibdenoOptions {
+            permissions: vec![format!("--allow-read={}", dir.display())],
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("ordinary after denial"));
+    assert!(!error.is_permission_error());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn denied_entry_read_retains_typed_permission_classification() {
+    let dir = temp_dir("typed-entry-denial");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "Deno.exit(0);").unwrap();
+    let error = run(
+        &entry,
+        &LibdenoOptions {
+            permissions: vec!["--allow-read=/definitely/not-this-entry".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.is_permission_error(), "typed entry denial: {error}");
+
+    let invalid_flags = run(
+        &entry,
+        &LibdenoOptions {
+            permissions: vec!["--not-a-permission".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        invalid_flags,
+        libdeno::LibdenoError::Permission(_)
+    ));
+    assert!(!invalid_flags.is_permission_error());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn default_permissions_are_rejected() {
     // v0.2.0 breaking change: an empty permission list is no longer allow-all.
     // `LibdenoOptions::default()` must fail with a Configuration error instead
@@ -390,7 +470,7 @@ fn require_traversal_outside_granted_dir_is_denied() {
 }
 
 #[test]
-fn permissions_reject_ungranted_capabilities() {
+fn javascript_ungranted_capabilities_are_not_typed_permission_errors() {
     // Grant only entry/read access so each operation below reaches its own
     // capability check without touching the network, shell, or host state.
     let dir = temp_dir("perm-capabilities");
@@ -439,8 +519,8 @@ fn permissions_reject_ungranted_capabilities() {
             );
         } else {
             assert!(
-                err.is_permission_error(),
-                "{name} unexpectedly returned a non-permission error: {err}"
+                !err.is_permission_error(),
+                "{name} came from JavaScript and must not be classified as a trusted permission error: {err}"
             );
         }
     }
@@ -484,7 +564,7 @@ fn permissions_allow_symlink_inside_granted_read_scope() {
 
 #[cfg(unix)]
 #[test]
-fn permissions_reject_symlink_outside_granted_read_scope() {
+fn javascript_denial_is_not_typed_permission_for_symlink_outside_grant() {
     use std::os::unix::fs::symlink;
 
     let dir = temp_dir("perm-symlink-outside");
@@ -512,8 +592,8 @@ fn permissions_reject_symlink_outside_granted_read_scope() {
     )
     .unwrap_err();
     assert!(
-        err.is_permission_error(),
-        "outside symlink unexpectedly returned: {err}"
+        !err.is_permission_error(),
+        "JavaScript-origin symlink denial must not be classified as a trusted permission error: {err}"
     );
     assert!(
         err.to_string().contains(&link.display().to_string()),
@@ -1809,7 +1889,8 @@ fn in_memory_source_uses_base_dir_import_map() {
 
 #[test]
 fn in_memory_source_reports_virtual_module_url() {
-    // The entry is registered under a virtual __libdeno_virtual_* specifier:
+    // The entry is registered under the resolver's synthetic $deno$ prefix
+    // and our virtual __libdeno_virtual_* specifier:
     // import.meta.url / Deno.mainModule must show that URL (this test writes
     // to disk instead of using output capture so it does not contend on the
     // process-global capture lease).
@@ -2098,6 +2179,8 @@ fn in_memory_virtual_entry_name_is_unique_per_run() {
             .rsplit('/')
             .next()
             .unwrap()
+            .strip_prefix("$deno$")
+            .unwrap_or_else(|| panic!("expected resolver synthetic prefix in {name}"))
             .strip_prefix("__libdeno_virtual_")
             .unwrap_or_else(|| panic!("unexpected virtual entry name: {name}"));
         let (random, ext) = suffix.rsplit_once('.').unwrap();

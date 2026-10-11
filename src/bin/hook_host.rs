@@ -4,6 +4,8 @@
 use std::sync::Arc;
 
 fn main() {
+    // SAFETY: this test host is launched only by the trusted libdeno test harness.
+    unsafe { libdeno::initialize_node_ipc_from_env() }.unwrap();
     let deny = std::env::var("LIBDENO_TEST_HOOK_DENY").as_deref() == Ok("1");
     libdeno::install_permission_hook(Arc::new(move |_req| !deny)).unwrap();
     libdeno::maybe_handle_child_mode();
