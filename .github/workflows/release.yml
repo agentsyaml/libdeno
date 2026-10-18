@@ -243,9 +243,18 @@ jobs:
         working-directory: source
         run: cargo test --all-targets --locked
 
+      - name: Prepare execution-control feature test
+        working-directory: source
+        run: |
+          df -h .
+          cargo clean -p libdeno
+          df -h .
+
       - name: Test execution-control feature
         working-directory: source
         run: cargo test --all-targets --features execution-control,phase-diagnostics --locked
+        env:
+          CARGO_BUILD_JOBS: 1
 
       - name: Record resources and reclaim libdeno test artifacts
         working-directory: source

@@ -53,8 +53,16 @@ jobs:
         # publish is --locked too, so lockfile drift fails here, not at tag).
         run: cargo test --all-targets --locked
 
+      - name: Prepare execution-control feature test
+        run: |
+          df -h .
+          cargo clean -p libdeno
+          df -h .
+
       - name: Test execution-control feature
         run: cargo test --all-targets --features execution-control,phase-diagnostics --locked
+        env:
+          CARGO_BUILD_JOBS: 1
 
       - name: Check docs.rs mode
         run: DOCS_RS=1 cargo check --no-default-features --lib --locked
