@@ -367,12 +367,22 @@ fn dropped_async_subprocess_future_does_not_stop_started_child() {
     let entry = dir.join("main.js");
     let started = dir.join("started.marker");
     let completed = dir.join("completed.marker");
+    let release = dir.join("release.marker");
+    let started_tmp = dir.join("started.tmp");
+    let completed_tmp = dir.join("completed.tmp");
+    let release_tmp = dir.join("release.tmp");
     fs::write(
         &entry,
         format!(
-            "Deno.writeTextFileSync({started:?}, 'started');\n\
-             await new Promise((resolve) => setTimeout(resolve, 100));\n\
-             Deno.writeTextFileSync({completed:?}, 'completed');"
+            "Deno.writeTextFileSync({started_tmp:?}, 'started');\n\
+             Deno.renameSync({started_tmp:?}, {started:?});\n\
+             const deadline = Date.now() + 30000;\n\
+             while (!(await Deno.stat({release:?}).then(() => true, () => false))) {{\n\
+               if (Date.now() >= deadline) throw new Error('parent did not release child');\n\
+               await new Promise((resolve) => setTimeout(resolve, 5));\n\
+             }}\n\
+             Deno.writeTextFileSync({completed_tmp:?}, 'completed');\n\
+             Deno.renameSync({completed_tmp:?}, {completed:?});"
         ),
     )
     .unwrap();
@@ -414,7 +424,9 @@ fn dropped_async_subprocess_future_does_not_stop_started_child() {
         drop(future);
     });
 
-    let completion_deadline = Instant::now() + Duration::from_secs(5);
+    fs::write(&release_tmp, "resume").unwrap();
+    fs::rename(&release_tmp, &release).unwrap();
+    let completion_deadline = Instant::now() + Duration::from_secs(15);
     while !completed.exists() {
         assert!(
             Instant::now() < completion_deadline,
