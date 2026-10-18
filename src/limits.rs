@@ -962,6 +962,41 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn node_ipc_rejects_unconnected_listener_and_closes_it() {
+        const CHILD: &str = "LIBDENO_NODE_IPC_UNCONNECTED_LISTENER_TEST";
+        if std::env::var(CHILD).ok().as_deref() != Some("1") {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "limits::tests::node_ipc_rejects_unconnected_listener_and_closes_it",
+                ])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        status.success(),
+                        "isolated fd-close test failed: {output:?}"
+                    );
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    assert!(
+                        stdout.contains("running 1 test") && stdout.contains("1 passed; 0 failed"),
+                        "unexpected child test output: {stdout}"
+                    );
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated fd-close test timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         use std::os::fd::IntoRawFd;
         let path =
             std::env::temp_dir().join(format!("libdeno-ipc-listener-{}", std::process::id()));

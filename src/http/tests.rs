@@ -39,21 +39,21 @@ fn serve_many_bytes(responses: Vec<Vec<u8>>) -> String {
 }
 
 #[cfg(feature = "npm")]
+// Test scheduling under parallel CI can delay the client after fixture creation.
+const HTTP_FIXTURE_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(feature = "npm")]
 fn serve_redirect_with_etag_target() -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
         let (mut first, _) = accept_with_timeout(&listener).unwrap();
-        first
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        first.set_read_timeout(Some(HTTP_FIXTURE_TIMEOUT)).unwrap();
         read_request_headers(&mut first).unwrap();
         first.write_all(b"HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
         let (mut second, _) = accept_with_timeout(&listener).unwrap();
-        second
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        second.set_read_timeout(Some(HTTP_FIXTURE_TIMEOUT)).unwrap();
         let request = read_request_headers(&mut second).unwrap();
         let response = if String::from_utf8_lossy(&request)
             .to_ascii_lowercase()
@@ -73,7 +73,7 @@ fn serve_redirect_with_etag_target() -> (String, std::thread::JoinHandle<()>) {
 fn accept_with_timeout(
     listener: &TcpListener,
 ) -> std::io::Result<(TcpStream, std::net::SocketAddr)> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + HTTP_FIXTURE_TIMEOUT;
     loop {
         match listener.accept() {
             Ok((stream, addr)) => {
