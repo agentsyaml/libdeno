@@ -17,6 +17,8 @@ libdeno runs scripts inside your process and provides file-based and in-memory e
 - File and in-memory JavaScript/TypeScript entry points.
 - Module resolution for local files, `npm:`, `jsr:`, remote URLs, `node:` built-ins, JSON, and WASM, subject to permissions and runtime support.
 - Reusable project resolver state through `LibdenoRuntime`.
+- Native Rust extensions through per-runtime `ExtensionFactory` values; see the
+  [native extension guide](docs/native-extensions.md).
 - Optional output capture and child-process execution.
 - npm lifecycle scripts are disabled by default. The `npm` Cargo feature can be disabled at build time; see [Build](#build).
 
@@ -152,6 +154,7 @@ existing local dependency tree can use `{"nodeModulesDir":"manual"}`.
 - [English docs](docs/):
   - [Getting Started](docs/getting-started.md)
   - [API Reference](docs/api.md)
+  - [Native Rust extensions](docs/native-extensions.md)
   - [Architecture](docs/architecture.md)
   - [npm & Module Resolution](docs/npm-support.md)
   - [Permissions](docs/permissions.md)

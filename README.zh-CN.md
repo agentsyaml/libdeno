@@ -13,6 +13,8 @@ English: [README.md](README.md)
 - 文件和内存中的 JavaScript/TypeScript 入口。
 - 本地文件、`npm:`、`jsr:`、远程 URL、`node:` 内置模块、JSON 和 WASM 模块解析，具体能力受权限与运行时支持限制。
 - 使用 `LibdenoRuntime` 复用项目解析状态。
+- 通过 `ExtensionFactory` 为每个 runtime 注册原生 Rust 扩展，见
+  [原生扩展指南](docs/native-extensions.md)。
 - 可选输出捕获和子进程执行。
 - npm 生命周期脚本默认关闭；构建时也可关闭 `npm` Cargo feature，见[构建](#构建)。
 
@@ -140,6 +142,7 @@ Tokio 宿主可使用 `run_async` / `run_with_output_async`；future 是 `!Send`
 - [英文文档](docs/)：
   - [Getting Started](docs/getting-started.md)
   - [API Reference](docs/api.md)
+  - [Native Rust extensions](docs/native-extensions.md)
   - [Architecture](docs/architecture.md)
   - [npm & Module Resolution](docs/npm-support.md)
   - [Permissions](docs/permissions.md)

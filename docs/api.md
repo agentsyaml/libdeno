@@ -246,6 +246,7 @@ pub struct LibdenoOptions {
   pub capture_stderr: bool,
   pub max_capture_bytes: Option<usize>,
   pub features: Option<Vec<String>>,
+  pub extensions: Option<ExtensionFactory>,
 }
 ```
 
@@ -336,6 +337,16 @@ namespace IDs and feature checks are wired into the runtime. `None` (default)
 enables the default set. An embedder running untrusted plugins can shrink the
 surface (e.g. `Some(vec!["ffi".into()])`); the ops themselves stay
 permission-gated regardless.
+
+### `extensions`
+
+An optional `ExtensionFactory` that creates fresh native `deno_core::Extension`
+values for the main runtime and each web worker, including nested workers. The
+factory runs on the runtime thread; each runtime has its own `OpState`, though
+the factory may deliberately capture shared host state. Native ops are not
+automatically permission-gated. Extension factories cannot cross subprocess or
+supervisor boundaries; runs with a factory are rejected before spawning. See
+the [native extension guide](native-extensions.md) for initialization examples.
 
 ## Resource and supervision boundaries
 

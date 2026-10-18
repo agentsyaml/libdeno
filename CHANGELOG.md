@@ -7,6 +7,22 @@ breaking changes are highlighted per release with migration notes.
 
 ## Unreleased
 
+### Added
+
+- Native Rust extension factories for main and web-worker runtimes. See the
+  [native extension guide](docs/native-extensions.md) for setup and permission
+  requirements.
+- Updated the embedded runtime to Deno 2.9.7 (`deno_runtime` 0.267.0,
+  `deno_core` 0.412.0), with improved worker lifecycle cancellation and npm
+  module import reliability.
+
+### Security and CI
+
+- Added a temporary CI-only exception for three Rustls advisories while the Deno
+  stack pins Rustls 0.23.40. It expires on 2026-11-17; see [SECURITY.md](SECURITY.md).
+- Reduced CI link-time disk pressure by cleaning crate artifacts between large
+  feature test runs and serializing the execution-control feature test.
+
 ## 0.3.4
 
 ### Corrected contracts and limits
