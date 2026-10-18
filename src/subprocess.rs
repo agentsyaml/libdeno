@@ -1326,6 +1326,36 @@ impl SupervisedSubprocessError {
 }
 
 #[cfg(feature = "execution-control")]
+fn collection_deadline_error(
+    collection_deadline_won: bool,
+    cancellation: &SupervisorCancellation,
+    partial_output: Option<SupervisorPartialOutput>,
+    transport_status: crate::supervisor::SupervisorTransportStatus,
+) -> Option<SupervisedSubprocessError> {
+    if !collection_deadline_won {
+        return None;
+    }
+    Some(match cancellation.requested_reason() {
+        Some(reason @ (CancelReason::User | CancelReason::Shutdown)) => {
+            SupervisedSubprocessError::with_metadata_and_partial(
+                supervisor_cancel_error(reason),
+                partial_output,
+                Some(CleanupStrength::DirectChild),
+                Some(transport_status),
+            )
+        }
+        Some(CancelReason::Deadline) | None => {
+            SupervisedSubprocessError::with_category_and_partial(
+                SupervisorFailureCategory::Timeout,
+                partial_output,
+                Some(CleanupStrength::DirectChild),
+                Some(transport_status),
+            )
+        }
+    })
+}
+
+#[cfg(feature = "execution-control")]
 struct SupervisorControlWorker {
     stop: mpsc::Sender<()>,
     terminal_seen: Arc<AtomicBool>,
@@ -2368,24 +2398,13 @@ pub(crate) fn run_supervised_subprocess_with_executable_observed_and_started(
         cancellation_before_terminal,
     ) {
         Ok(_output) if collection_deadline_won => {
-            return Err(match cancellation.requested_reason() {
-                Some(reason @ (CancelReason::User | CancelReason::Shutdown)) => {
-                    SupervisedSubprocessError::with_metadata_and_partial(
-                        supervisor_cancel_error(reason),
-                        partial_output.clone(),
-                        Some(CleanupStrength::DirectChild),
-                        Some(transport_status),
-                    )
-                }
-                Some(CancelReason::Deadline) | None => {
-                    SupervisedSubprocessError::with_category_and_partial(
-                        SupervisorFailureCategory::Timeout,
-                        partial_output.clone(),
-                        Some(CleanupStrength::DirectChild),
-                        Some(transport_status),
-                    )
-                }
-            });
+            return Err(collection_deadline_error(
+                collection_deadline_won,
+                &cancellation,
+                partial_output.clone(),
+                transport_status,
+            )
+            .expect("collection deadline branch must produce a failure"));
         }
         Ok(output) => output,
         Err(error) => {
@@ -2868,6 +2887,13 @@ mod tests {
     use super::MAX_CHILD_REQUEST_BYTES;
     #[cfg(feature = "execution-control")]
     use super::{
+        collection_deadline_error, read_supervisor_terminal,
+        read_supervisor_terminal_with_duplicate_grace, start_supervisor_child_control,
+        start_supervisor_child_control_observed, SupervisorCancellation, SupervisorParentSession,
+        SupervisorPartialOutput, SupervisorTerminalReadContext,
+    };
+    #[cfg(feature = "execution-control")]
+    use super::{
         drive_supervisor_session, effective_supervisor_deadline, encode_payload, supervisor_request,
     };
     #[cfg(feature = "execution-control")]
@@ -2876,18 +2902,12 @@ mod tests {
         SupervisorTerminal,
     };
     #[cfg(feature = "execution-control")]
-    use super::{
-        read_supervisor_terminal, read_supervisor_terminal_with_duplicate_grace,
-        start_supervisor_child_control, start_supervisor_child_control_observed,
-        SupervisorCancellation, SupervisorParentSession, SupervisorTerminalReadContext,
-    };
-    #[cfg(feature = "execution-control")]
     use crate::limits::CancellationContext;
     #[cfg(feature = "execution-control")]
     use crate::supervisor::{
-        prepare_supervisor_stream, read_frame, write_frame, CancelReason, FrameDirection,
-        FrameKind, SupervisorFailureCategory, SupervisorFrame, SupervisorOutcome, SupervisorToken,
-        SupervisorTransportStatus, SUPERVISOR_CAPTURE_BYTES_PER_STREAM,
+        prepare_supervisor_stream, read_frame, write_frame, CancelReason, CleanupStrength,
+        FrameDirection, FrameKind, SupervisorFailureCategory, SupervisorFrame, SupervisorOutcome,
+        SupervisorToken, SupervisorTransportStatus, SUPERVISOR_CAPTURE_BYTES_PER_STREAM,
         SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM, SUPERVISOR_VERSION,
     };
     #[cfg(feature = "execution-control")]
@@ -2936,11 +2956,10 @@ mod tests {
     fn read_test_terminal_with_duplicate_grace(
         stream: &mut std::net::TcpStream,
         state: &std::sync::Arc<std::sync::Mutex<SupervisorParentSession>>,
+        cancellation: &SupervisorCancellation,
         duplicate_grace: Duration,
         on_duplicate_deadline_started: impl FnOnce(),
     ) -> std::io::Result<SupervisorTerminal> {
-        let cancellation =
-            SupervisorCancellation::new(CancellationContext::new(), CancelReason::User);
         read_supervisor_terminal_with_duplicate_grace(
             stream,
             SupervisorTerminalReadContext {
@@ -2948,7 +2967,7 @@ mod tests {
                 effective_deadline: None,
                 started_phase_deadline: Instant::now() + Duration::from_secs(2),
                 cancel_grace_deadline: None,
-                cancellation: &cancellation,
+                cancellation,
                 read_cancellation: None,
                 on_started: None,
             },
@@ -2961,14 +2980,14 @@ mod tests {
     fn terminal_fixture(
         send: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
     ) -> std::io::Result<SupervisorTerminal> {
-        terminal_fixture_with_duplicate_grace(send, Duration::from_millis(100), || {})
+        terminal_fixture_with_duplicate_grace(send, Duration::from_millis(100), |_| {})
     }
 
     #[cfg(feature = "execution-control")]
     fn terminal_fixture_with_duplicate_grace(
         send: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
         duplicate_grace: Duration,
-        on_duplicate_deadline_started: impl FnOnce(),
+        on_duplicate_deadline_started: impl FnOnce(&SupervisorCancellation),
     ) -> std::io::Result<SupervisorTerminal> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2981,11 +3000,14 @@ mod tests {
         });
         let mut stream = std::net::TcpStream::connect(address).unwrap();
         prepare_supervisor_stream(&stream).unwrap();
+        let cancellation =
+            SupervisorCancellation::new(CancellationContext::new(), CancelReason::User);
         let result = read_test_terminal_with_duplicate_grace(
             &mut stream,
             &terminal_test_state(),
+            &cancellation,
             duplicate_grace,
-            on_duplicate_deadline_started,
+            || on_duplicate_deadline_started(&cancellation),
         );
         let _ = done_tx.send(());
         peer.join().unwrap();
@@ -3115,10 +3137,28 @@ mod tests {
                 stream.shutdown(std::net::Shutdown::Write).unwrap();
             },
             Duration::from_secs(1),
-            move || deadline_started.send(()).unwrap(),
+            move |_| deadline_started.send(()).unwrap(),
         )
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn post_terminal_cancellation_keeps_completed_child_outcome() {
+        for reason in [CancelReason::User, CancelReason::Shutdown] {
+            let frame = terminal_frame(&completed_test_terminal());
+            let terminal = terminal_fixture_with_duplicate_grace(
+                move |stream| {
+                    write_frame(stream, &frame).unwrap();
+                    stream.shutdown(std::net::Shutdown::Write).unwrap();
+                },
+                Duration::ZERO,
+                move |cancellation| cancellation.request(reason),
+            )
+            .unwrap();
+            assert_eq!(terminal.outcome, SupervisorOutcome::Completed);
+        }
     }
 
     #[test]
@@ -3246,6 +3286,45 @@ mod tests {
         .collect(Some(std::time::Instant::now()));
         assert_eq!(capture.stdout, b"AB");
         assert!(capture.incomplete && capture.deadline_won && !capture.reader_error);
+        #[cfg(feature = "execution-control")]
+        {
+            let partial = SupervisorPartialOutput {
+                stdout: capture.stdout.clone(),
+                stderr: capture.stderr.clone(),
+                truncated: capture.truncated,
+                incomplete: capture.incomplete,
+                reader_error: capture.reader_error,
+            };
+            let cancellation =
+                SupervisorCancellation::new(CancellationContext::new(), CancelReason::User);
+            cancellation.request(CancelReason::User);
+            let failure = collection_deadline_error(
+                capture.deadline_won,
+                &cancellation,
+                Some(partial.clone()),
+                SupervisorTransportStatus::Failed,
+            )
+            .unwrap();
+            assert!(matches!(failure.error, LibdenoError::Runtime(_)));
+            assert!(failure.category.is_none());
+            assert_eq!(failure.partial_output, Some(partial.clone()));
+            assert_eq!(failure.cleanup_strength, Some(CleanupStrength::DirectChild));
+            assert_eq!(
+                failure.transport_status,
+                Some(SupervisorTransportStatus::Failed)
+            );
+
+            let no_cancellation =
+                SupervisorCancellation::new(CancellationContext::new(), CancelReason::User);
+            let timeout = collection_deadline_error(
+                capture.deadline_won,
+                &no_cancellation,
+                Some(partial),
+                SupervisorTransportStatus::Failed,
+            )
+            .unwrap();
+            assert_eq!(timeout.category, Some(SupervisorFailureCategory::Timeout));
+        }
         drop(tx);
 
         let (tx, rx) = std::sync::mpsc::channel();

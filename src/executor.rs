@@ -2782,6 +2782,44 @@ mod tests {
         assert!(matches!(failure.error(), ExecutionError::Cancelled));
         assert_eq!(failure.partial_output(), Some(&expected));
 
+        for (id, reason) in [(6, CancelReason::User), (7, CancelReason::Shutdown)] {
+            let task = control(&scheduler, id, ExecutionBackend::Subprocess);
+            task.mark_accepted();
+            assert!(task.begin_start());
+            assert!(task.mark_started());
+            assert_eq!(task.request_cancel(reason), CancelOutcome::Requested);
+            let partial = ExecutionOutput {
+                stdout: b"partial-output".to_vec(),
+                incomplete: true,
+                ..Default::default()
+            };
+            let mut report = result(ExecutionBackend::Subprocess).report;
+            report.cleanup_strength = Some(ExecutionCleanupStrength::DirectChild);
+            report.transport_status = Some(ExecutionTransportStatus::Failed);
+            let incoming = ExecutionFailure::new(
+                ExecutionError::Libdeno(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+                    "supervisor execution cancelled"
+                ))),
+                report,
+                Some(partial.clone()),
+            );
+            let (state, result) = task
+                .resolve_backend_result(Err(incoming), ExecutionBackend::Subprocess)
+                .unwrap();
+            assert_eq!(state, ExecutionState::Terminated);
+            let failure = result.unwrap_err();
+            assert!(matches!(failure.error(), ExecutionError::Cancelled));
+            assert_eq!(failure.partial_output(), Some(&partial));
+            assert_eq!(
+                failure.report().cleanup_strength(),
+                Some(ExecutionCleanupStrength::DirectChild)
+            );
+            assert_eq!(
+                failure.report().transport_status(),
+                Some(ExecutionTransportStatus::Failed)
+            );
+        }
+
         let prestart = control(&scheduler, 3, ExecutionBackend::Subprocess);
         prestart.mark_accepted();
         assert!(prestart.begin_start());
