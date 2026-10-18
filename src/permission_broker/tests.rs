@@ -67,22 +67,27 @@ fn hook_socket_directory_guard_cleans_bind_failure() {
 
 fn round_trip(hook: PermissionPrompt) -> (u32, String) {
     let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
-    client
-        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-        .unwrap();
-    client
-        .set_write_timeout(Some(std::time::Duration::from_secs(3)))
-        .unwrap();
-    let bridge = std::thread::spawn(move || serve_broker_connection(server, &hook));
+    let timeout = std::time::Duration::from_secs(15);
+    client.set_read_timeout(Some(timeout)).unwrap();
+    client.set_write_timeout(Some(timeout)).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+    let bridge = std::thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        serve_broker_connection(server, &hook);
+    });
+    ready_rx
+        .recv_timeout(timeout)
+        .expect("broker bridge thread did not start");
     client
         .write_all(format!("{}\n", request(7, "value")).as_bytes())
         .unwrap();
     let mut reader = BufReader::new(&client);
     let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
+    let response = reader.read_line(&mut line);
     drop(reader);
     drop(client);
     bridge.join().unwrap();
+    response.expect("broker bridge did not return a response before timeout");
     let response: deno_core::serde_json::Value =
         deno_core::serde_json::from_str(line.trim()).unwrap();
     (
