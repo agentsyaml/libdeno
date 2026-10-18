@@ -8,6 +8,9 @@ use deno_core::ResourceId;
 use deno_core::ToV8;
 use deno_error::JsErrorBox;
 
+#[path = "runtime_guards/require.rs"]
+mod require_guards;
+
 #[cfg(test)]
 static TEST_ROUTE_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -306,6 +309,9 @@ pub(crate) fn extensions(
     let tls_guard = op_net_listen_tls_guard();
     let mut extension = runtime_guards_ext::init();
     let mut ops = extension.ops.into_owned();
+    let require_ops = require_guards::declarations();
+    ops.extend(require_ops.iter().copied());
+    ops.extend(require_guards::alias_ops());
     push_alias(
         &mut ops,
         tcp,
@@ -338,6 +344,17 @@ pub(crate) fn extensions(
     extension.middleware_fn = Some(Box::new(move |op| {
         if let Some(replacement) = thread_ops.iter().find(|decl| decl.name == op.name) {
             return replace_op(op, *replacement);
+        }
+        if let Some(guard) = require_ops.iter().find(|decl| {
+            matches!(
+                op.name,
+                "op_require_stat"
+                    | "op_require_real_path"
+                    | "op_require_package_imports_resolve"
+                    | "op_require_read_package_scope"
+            ) && decl.name == require_guards::guard_name(op.name)
+        }) {
+            return replace_op(op, *guard);
         }
         let guard = match op.name {
             "op_net_listen_tcp" => Some(tcp_guard),

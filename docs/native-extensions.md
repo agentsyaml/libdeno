@@ -34,11 +34,10 @@ the entry point can import `core` from `ext:core/mod.js` and assign
 `core.ops.op_host_greeting` to a global. See `examples/native_extension/` for a
 runnable example. The `#[op2]` and `extension!` macros refer to `deno_core`
 directly in generated code, so downstream hosts must declare it as a direct
-dependency as well as using libdeno. Native extension support is unreleased;
-published `libdeno` 0.3.4 does not provide this API. Point `libdeno` at the
-source checkout when building this revision, and keep `deno_core` aligned with
-its Deno stack (currently 0.412.0). For example, with the checkout at
-`../libdeno`:
+dependency as well as using libdeno. This API is available in libdeno 0.3.5. To
+build a local checkout from source, point `libdeno` at the checkout and keep
+`deno_core` aligned with its Deno stack (currently 0.412.0). For example, with
+the checkout at `../libdeno`:
 
 ```toml
 [dependencies]

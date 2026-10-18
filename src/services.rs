@@ -724,6 +724,10 @@ pub struct RuntimeServices {
     /// Run-local communication identities; never cached in the reusable resolver stack.
     pub(crate) thread_messaging: ThreadMessagingDomain,
     pub(crate) worker_lifecycle: WorkerLifecycleRegistry,
+    /// Store transferred buffers among this run's isolates, never across runs.
+    pub(crate) shared_array_buffer_store: deno_core::SharedArrayBufferStore,
+    /// Store cloned WebAssembly modules among this run's isolates.
+    pub(crate) compiled_wasm_module_store: deno_core::CompiledWasmModuleStore,
 }
 
 impl RuntimeServices {
@@ -840,6 +844,8 @@ impl RuntimeServices {
             timing,
             thread_messaging: ThreadMessagingDomain::new(),
             worker_lifecycle: WorkerLifecycleRegistry::new(),
+            shared_array_buffer_store: Default::default(),
+            compiled_wasm_module_store: Default::default(),
         })
     }
 }

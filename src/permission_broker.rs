@@ -57,6 +57,10 @@ pub type PermissionPrompt = Arc<dyn Fn(&PermissionRequest) -> bool + Send + Sync
 /// a second install — a concurrent double-install must not reach that assert.
 static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+pub(crate) fn is_installed() -> bool {
+    has_broker()
+}
+
 /// Installs an external permission broker process at `socket_path` (raw
 /// deno_permissions capability): a Unix socket (or Windows named pipe) serving
 /// the JSON-line protocol — a request `{v, pid, id, datetime, permission,

@@ -20,12 +20,34 @@ use deno_runtime::snapshot::create_runtime_snapshot;
 #[cfg(feature = "snapshot")]
 use deno_runtime::snapshot::LazyExtensionFileKind;
 
+#[cfg(feature = "snapshot")]
+#[path = "build_support/snapshot_arch.rs"]
+mod snapshot_arch;
+
 fn main() {
+    #[cfg(feature = "snapshot")]
+    ensure_snapshot_architecture();
+
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
     #[cfg(feature = "snapshot")]
     {
         println!("cargo:rerun-if-env-changed=DENO_SNAPSHOT_MINIFY_SOURCES");
+        // The integration smoke test invokes this exact build-script binary.
+        let marker = out_dir.join("SNAPSHOT_BUILD_SCRIPT_PATH");
+        std::fs::write(
+            &marker,
+            env::current_exe()
+                .unwrap()
+                .as_os_str()
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .unwrap();
+        println!(
+            "cargo:rustc-env=LIBDENO_SNAPSHOT_BUILD_SCRIPT_MARKER={}",
+            marker.display()
+        );
         let snapshot_path = out_dir.join("CLI_SNAPSHOT.bin");
         let residual_path = out_dir.join("EXTENSION_RESIDUAL_SOURCES.rs");
         create_cli_snapshot(&snapshot_path, &residual_path, &out_dir);
@@ -69,6 +91,17 @@ fn main() {
         )
         .unwrap();
     }
+}
+
+#[cfg(feature = "snapshot")]
+fn ensure_snapshot_architecture() {
+    let host = env::var("HOST").expect("Cargo must provide HOST to the snapshot build script");
+    let target =
+        env::var("TARGET").expect("Cargo must provide TARGET to the snapshot build script");
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH")
+        .expect("Cargo must provide CARGO_CFG_TARGET_ARCH to the snapshot build script");
+    snapshot_arch::ensure_compatible(env::consts::ARCH, &target_arch, &host, &target)
+        .unwrap_or_else(|error| panic!("{error}"));
 }
 
 #[cfg(feature = "snapshot")]

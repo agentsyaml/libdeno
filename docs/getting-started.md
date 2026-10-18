@@ -22,6 +22,11 @@ cargo build --example demo
 This produces `target/debug/examples/demo`, a small host binary that parses
 `--allow-*` permission flags, an entry path, and script arguments.
 
+The V8 snapshot is created by the build-host process. A build whose target CPU
+architecture differs from the host is rejected; build natively for the target.
+Prebuilt snapshot inputs are not supported. Matching architecture alone does
+not certify cross-OS or ABI snapshot compatibility.
+
 ## Run the demo
 
 ```bash

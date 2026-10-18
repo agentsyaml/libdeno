@@ -127,6 +127,8 @@ Tokio 宿主可使用 `run_async` / `run_with_output_async`；future 是 `!Send`
 ## 构建
 
 - 需要 Rust 1.95 或更新版本，crate 使用 edition 2021。首次构建会编译依赖并生成 V8 快照。
+- V8 快照在构建宿主上生成；跨 CPU 架构构建会被拒绝，请在目标架构上原生构建。
+  不支持预编译快照；CPU 架构相同也不代表跨操作系统或 ABI 兼容。
 - 加载 `.node` 插件的宿主需要导出 `napi_*` 符号；链接配置见英文[入门文档](docs/getting-started.md)。
 
 ### Cargo feature：`npm`

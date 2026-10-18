@@ -139,6 +139,9 @@ See the [full API reference](docs/api.md) or the
 ## Build
 
 - Requires Rust 1.95 or newer; the crate uses edition 2021. The first build compiles the dependencies and V8 snapshot.
+- V8 snapshots are created on the build host. Cross-architecture builds are
+  rejected; build natively for the target. Prebuilt snapshots are unsupported,
+  and matching CPU architecture does not certify OS/ABI compatibility.
 - Hosts that load `.node` addons must export `napi_*` symbols; see [`docs/getting-started.md`](docs/getting-started.md) for linker setup.
 
 ### Cargo feature: `npm`

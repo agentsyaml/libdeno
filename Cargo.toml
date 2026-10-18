@@ -1,6 +1,6 @@
 [package]
 name = "libdeno"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 # Workflow toolchain actions are authoritative for compatibility: stable CI
 # plus an explicit MSRV 1.95.0 check. No rust-toolchain.toml is checked in;

@@ -22,7 +22,7 @@ fn tcp_guard_blocks_fatal_feature_exit_and_preserves_permission_checks() {
     let blocked = r#"
 try { Deno.listen({ hostname: "127.0.0.1", port: 0, reusePort: true }); throw Error("unexpected success"); }
 catch (error) { if (!error.message.includes("requires the net feature")) throw error; }
-try { const ops = await import("ext:core/ops"); if ("op_libdeno_net_listen_tcp_alias" in ops) throw Error("alias import leaked"); }
+try { const ops = await import("ext:core/ops"); if (["op_libdeno_net_listen_tcp_alias", "op_libdeno_require_stat_alias", "op_libdeno_require_real_path_alias", "op_libdeno_require_package_scope_alias", "op_libdeno_require_package_imports_alias", "op_libdeno_install_require_delegates"].some(name => name in ops)) throw Error("alias import leaked"); }
 catch (error) { if (error.message.includes("alias import leaked")) throw error; }
 "#;
     assert_eq!(run_js(&dir, "blocked.js", blocked, options(&dir, None)), 0);

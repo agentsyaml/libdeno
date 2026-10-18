@@ -57,9 +57,11 @@ is an error.
 
 `install_permission_broker(path)` and `install_permission_hook(hook)` are
 process-global, install-once authorities for all permission checks. They
-replace local flag grants and are mutually exclusive. The broker uses a Unix
-socket or Windows named pipe; the in-process hook is Unix-only. See the
-[API reference](api.md) for their setup and failure behavior.
+decide resource-access checks even when local flags grant access; installing
+one does not revoke those grants or change the permission state reported by
+`Deno.permissions.query()` and `request()`. They are mutually exclusive. The
+broker uses a Unix socket or Windows named pipe; the in-process hook is
+Unix-only. See the [API reference](api.md) for setup and failure behavior.
 
 Decision priority: broker/hook (if installed) → flag grants → interactive
 prompt when `prompt: true` → deny.

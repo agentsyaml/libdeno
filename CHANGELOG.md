@@ -7,17 +7,36 @@ breaking changes are highlighted per release with migration notes.
 
 ## Unreleased
 
+## 0.3.5
+
 ### Added
 
 - Native Rust extension factories for main and web-worker runtimes. See the
-  [native extension guide](docs/native-extensions.md) for setup and permission
-  requirements.
+  [native extension guide](docs/native-extensions.md) for `#[op2]` setup,
+  per-runtime state, subprocess limitations, and permission requirements.
 - Updated the embedded runtime to Deno 2.9.7 (`deno_runtime` 0.267.0,
-  `deno_core` 0.412.0), with improved worker lifecycle cancellation and npm
-  module import reliability.
+  `deno_core` 0.412.0).
+
+### Fixed
+
+- Reject cross-architecture snapshot builds before creating snapshot outputs;
+  build libdeno natively for the target architecture.
+- Cancel in-flight worker module preloads during runtime shutdown and preserve
+  dynamic `npm:`/`jsr:` imports from managed npm package referrers without
+  bypassing import maps for other referrers.
+- Isolate worker thread messaging between runs and harden runtime feature
+  guards, permission error classification, HTTP loading, and output cleanup.
+- Stabilize supervisor deadline and worker cleanup regression tests across
+  macOS and Windows.
+- Enforce installed broker decisions for CommonJS source reads, resolver
+  metadata, and CJS analysis across main and worker isolates without revoking
+  local permission state.
+- Enable cross-isolate ArrayBuffer transfer and SharedArrayBuffer sharing, plus
+  compiled WebAssembly module cloning, with stores scoped to each run.
 
 ### Security and CI
 
+- Update `quinn-proto` to 0.11.19 to address upstream security advisories.
 - Added a temporary CI-only exception for three Rustls advisories while the Deno
   stack pins Rustls 0.23.40. It expires on 2026-11-17; see [SECURITY.md](SECURITY.md).
 - Reduced CI link-time disk pressure by cleaning crate artifacts between large

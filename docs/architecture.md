@@ -57,9 +57,9 @@ and `worker-options`.
 ## Node compat (`node_loader.rs`)
 
 - **`SimpleNodeRequireLoader`** — CJS detection delegates to the official CJS
-  tracker (package.json `"type"` aware); read permission checks mirror
-  deno_lib's npm permission checker (fully granted reads and
-  `node_modules` files bypass; everything else must satisfy `--allow-read`).
+  tracker (package.json `"type"` aware). Without a broker, fully granted reads
+  and npm-managed `node_modules` files bypass local checks; with a broker,
+  source reads and require resolver metadata are checked at each op boundary.
 - **`FsCjsAnalysisSourceProvider`** — permission-gated source reads for
   recursive CommonJS analysis (`require()` chains inside CJS modules).
 - The CJS `NodeAnalysisCache` is resolver-local. The separate

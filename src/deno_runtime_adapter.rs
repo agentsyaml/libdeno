@@ -54,7 +54,7 @@ pub(crate) fn build_main_worker(
         .in_npm_package_checker()?
         .clone();
     let node_require_loader: deno_runtime::deno_node::NodeRequireLoaderRc = Rc::new(
-        SimpleNodeRequireLoader::new(cjs_tracker, in_npm_pkg_checker),
+        SimpleNodeRequireLoader::new(cjs_tracker, in_npm_pkg_checker, permissions.clone()),
     );
     let node_sys = services.shared.sys.clone();
     let node_services = Some(NodeExtInitServices {
@@ -63,7 +63,6 @@ pub(crate) fn build_main_worker(
         pkg_json_resolver: pkg_json_resolver.clone(),
         sys: node_sys.clone(),
     });
-
     let blob_store = services.blob_store.clone();
     let broadcast_channel = InMemoryBroadcastChannel::default();
     // Default: "everything enabled" like `deno run --unstable` — an embedded
@@ -119,8 +118,8 @@ pub(crate) fn build_main_worker(
         permissions,
         root_cert_store_provider: None,
         fetch_dns_resolver: deno_runtime::deno_fetch::dns::Resolver::default(),
-        shared_array_buffer_store: None,
-        compiled_wasm_module_store: None,
+        shared_array_buffer_store: Some(services.shared_array_buffer_store.clone()),
+        compiled_wasm_module_store: Some(services.compiled_wasm_module_store.clone()),
         // Deno's eval-context source hash collides for long CJS scripts.
         v8_code_cache: None,
         bundle_provider: None,

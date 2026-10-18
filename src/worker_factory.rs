@@ -192,28 +192,32 @@ fn build_web_worker_factory(
                 worker_file_fetcher,
                 worker_graph_loader,
             ));
-        let node_require_loader: deno_runtime::deno_node::NodeRequireLoaderRc = Rc::new(
-            SimpleNodeRequireLoader::new(cjs_tracker.clone(), in_npm_pkg_checker.clone()),
-        );
+        let node_require_loader: deno_runtime::deno_node::NodeRequireLoaderRc =
+            Rc::new(SimpleNodeRequireLoader::new(
+                cjs_tracker.clone(),
+                in_npm_pkg_checker.clone(),
+                worker_permissions.clone(),
+            ));
         let node_resolver = node_resolver.clone();
         let pkg_json_resolver = pkg_json_resolver.clone();
         let sys = runtime.shared.sys.clone();
+        let node_services = Some(NodeExtInitServices {
+            node_require_loader,
+            node_resolver,
+            pkg_json_resolver,
+            sys,
+        });
         let (mut worker, sendable_handle) = WebWorker::bootstrap_from_options(
             WebWorkerServiceOptions {
                 blob_store: blob_store.clone(),
                 broadcast_channel: broadcast_channel.clone(),
                 deno_rt_native_addon_loader: None,
-                compiled_wasm_module_store: None,
+                compiled_wasm_module_store: Some(runtime.compiled_wasm_module_store.clone()),
                 feature_checker: feature_checker.clone(),
                 fs: fs.clone(),
                 main_inspector_session_tx: main_inspector_session_tx.clone(),
                 module_loader,
-                node_services: Some(NodeExtInitServices {
-                    node_require_loader,
-                    node_resolver,
-                    pkg_json_resolver,
-                    sys,
-                }),
+                node_services,
                 npm_process_state_provider: Some(runtime.shared.npm_process_state_provider.clone()),
                 // Op-level checks use the worker's own permissions container
                 // (args.permissions), as deno_runtime expects. The worker's
@@ -227,7 +231,7 @@ fn build_web_worker_factory(
                 // main/parent graph entries are not reused.
                 permissions: args.permissions,
                 root_cert_store_provider: None,
-                shared_array_buffer_store: None,
+                shared_array_buffer_store: Some(runtime.shared_array_buffer_store.clone()),
                 bundle_provider: None,
             },
             WebWorkerOptions {

@@ -474,8 +474,9 @@ pub fn install_permission_broker(path: impl AsRef<Path>) -> Result<(), LibdenoEr
 
 Installs an external permission broker at `path` (Unix socket or Windows named
 pipe). It is process-global and install-once; after installation it decides
-every permission check, replacing local flag grants. Checks block until the
-broker responds.
+resource-access checks even when local flags grant access. It does not revoke
+local grants or change permission state reported by `Deno.permissions.query()`
+and `request()`. Checks block until the broker responds.
 
 The upstream constructor may call `process::exit(87)` if the initial connection
 fails; later bridge failures may also terminate the process. These exits cannot

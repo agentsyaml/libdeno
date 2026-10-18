@@ -1,6 +1,6 @@
 # libdeno Python API
 
-The Python distribution and Rust crate are versioned at `0.3.4`. The Python
+The Python distribution and Rust crate are versioned at `0.3.5`. The Python
 API is alpha and provides synchronous access to the runtime:
 
 ```python
