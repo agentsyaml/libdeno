@@ -30,6 +30,7 @@ mod npm_cache;
 mod output;
 mod permission_broker;
 mod permissions;
+mod runtime_guards;
 // Public so `libdeno::runtime::run_with_output` (capture on a reusable
 // resolver stack) is reachable; the root re-exports `run_with` /
 // `LibdenoRuntime` for the common paths.
@@ -38,8 +39,10 @@ mod services;
 mod subprocess;
 #[cfg(feature = "execution-control")]
 mod supervisor;
+mod thread_messaging;
 mod timing;
 mod worker_factory;
+mod worker_lifecycle;
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -51,6 +54,7 @@ use deno_resolver::loader::MemoryFiles;
 use deno_runtime::deno_fs::FileSystem;
 use deno_runtime::deno_fs::RealFs;
 
+pub use deno_core;
 #[cfg(feature = "phase-diagnostics")]
 #[doc(hidden)]
 pub use executor::PhaseDiagnostics;
@@ -103,11 +107,9 @@ use timing::{ExecutionTiming, Phase};
 /// capture belongs in the subprocess model, where each process has its own
 /// fds.
 ///
-/// State machine in one atomic: `0` idle, `usize::MAX` captured-run
-/// exclusive, `n` (1..MAX-1) ordinary runs active. Ordinary runs CAS-count
-/// up (rejected while a captured run holds the marker); a captured run
-/// CAS-swaps 0 → MAX (rejected otherwise). Lock-free, no spurious
-/// serialization.
+/// `RUN_STATE` tracks ordinary runs and the capture marker. A second live-worker
+/// count keeps capture exclusive even if an async caller drops its run future
+/// while a child worker is still terminating.
 const CAPTURE_MARKER: usize = usize::MAX;
 static RUN_STATE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -121,17 +123,18 @@ impl RunLease {
     fn acquire(captured: bool) -> Result<Self, LibdenoError> {
         use std::sync::atomic::Ordering::*;
         if captured {
+            if crate::worker_lifecycle::active_worker_count() != 0 {
+                return Err(capture_blocked_by_worker());
+            }
             if RUN_STATE
                 .compare_exchange(0, CAPTURE_MARKER, AcqRel, Relaxed)
                 .is_err()
             {
-                return Err(LibdenoError::Configuration(
-                    "output capture is process-global (fd-level redirection) \
-                     and cannot coexist with any other run — use \
-                     run_in_subprocess_with_output instead, where the \
-                     child's own fds are piped and runs stay parallel"
-                        .to_string(),
-                ));
+                return Err(capture_blocked_by_worker());
+            }
+            if crate::worker_lifecycle::active_worker_count() != 0 {
+                RUN_STATE.store(0, Release);
+                return Err(capture_blocked_by_worker());
             }
         } else {
             loop {
@@ -155,6 +158,12 @@ impl RunLease {
         }
         Ok(Self { captured })
     }
+}
+
+fn capture_blocked_by_worker() -> LibdenoError {
+    LibdenoError::Configuration(
+        "output capture is process-global and cannot coexist with an active run or worker; use run_in_subprocess_with_output instead".into(),
+    )
 }
 
 impl Drop for RunLease {
@@ -373,6 +382,33 @@ pub struct LibdenoOptions {
     /// worker options terminates the host process, which a plugin must never
     /// be able to trigger.
     pub features: Option<Vec<String>>,
+    /// Creates fresh Deno extensions for each main and web worker runtime.
+    /// Extensions are appended after Deno's built-ins and libdeno guards. The
+    /// factory runs on the runtime thread. OpState is isolated per runtime;
+    /// captured `Arc`s may deliberately share host state. Native ops are not
+    /// automatically permission-gated; extensions must enforce host policy.
+    pub extensions: Option<ExtensionFactory>,
+}
+
+/// Cloneable factory for per-runtime native Deno extensions.
+#[derive(Clone)]
+pub struct ExtensionFactory(Arc<dyn Fn() -> Vec<deno_core::Extension> + Send + Sync>);
+
+impl ExtensionFactory {
+    /// Creates a factory. It must return new extension values on every call.
+    pub fn new(factory: impl Fn() -> Vec<deno_core::Extension> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(factory))
+    }
+
+    pub(crate) fn create(&self) -> Vec<deno_core::Extension> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for ExtensionFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExtensionFactory(..)")
+    }
 }
 
 /// The result of a [`run_with_output`] invocation.
@@ -1143,6 +1179,8 @@ pub(crate) async fn run_inner_with_cancellation(
         let main_module = resolve_main_module(&services.memory_files, entry, &cwd)?;
         (permissions, services, main_module)
     };
+    let _worker_lifecycle_owner =
+        crate::worker_lifecycle::WorkerLifecycleOwner::new(services.worker_lifecycle.clone());
     cancellation_checkpoint(cancellation.as_ref())?;
     // The file fetcher permission-checks the same virtual path via
     // validate_fetch, so for in-memory entries this early check should agree
@@ -1197,16 +1235,23 @@ pub(crate) async fn run_inner_with_cancellation(
             isolate_handle.clone(),
         ));
 
-    let run_result = match limits::run_worker_cancellable(
+    let run_result = limits::run_worker_cancellable(
         &mut worker,
         &main_module,
         options.execution_deadline,
         isolate_handle.clone(),
         timing.clone(),
         cancellation,
+        services.worker_lifecycle.clone(),
     )
-    .await
-    {
+    .await;
+    let workers_cleaned = services.worker_lifecycle.close_and_wait().await;
+    if !workers_cleaned {
+        return Err(LibdenoError::Runtime(deno_core::anyhow::anyhow!(
+            "worker lifecycle cleanup ended before all workers stopped"
+        )));
+    }
+    let run_result = match run_result {
         Ok(result) => result,
         // Deadline fired: isolate terminated; the run lease releases on return.
         Err(limits::ExecutionTermination::Deadline(deadline)) => {

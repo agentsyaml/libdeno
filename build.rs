@@ -73,12 +73,12 @@ fn main() {
 
 #[cfg(feature = "snapshot")]
 fn create_cli_snapshot(snapshot_path: &Path, residual_path: &Path, out_dir: &Path) {
-    // The TypeScript version bundled in deno_runtime 0.265.0's snapshot.
+    // The TypeScript version bundled in deno_runtime 0.267.0's snapshot.
     // No crate in the dep tree exposes the bundled TypeScript compiler
     // version (deno_ast::VERSION is the deno_ast crate version, not the TS
     // compiler's), so it cannot be machine-verified against a dependency.
     // Source of truth: the deno repo's cli/snapshot/shared.rs TS_VERSION at
-    // the tag for deno_runtime 0.265.0 (v2.9.5) — update in lockstep with the
+    // the tag for deno_runtime 0.267.0 (v2.9.7) — update in lockstep with the
     // deno_runtime bump (see the format assertion below).
     //
     // There is no public constant to machine-check this against. The checked-in

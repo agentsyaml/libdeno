@@ -1,0 +1,10 @@
+[package]
+name = "native-extension-consumer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libdeno = { path = "../../.." }
+deno_core = "0.412.0"
+
+[workspace]

@@ -5,17 +5,13 @@ libdeno's permission model mirrors the Deno CLI: capability strings in
 
 ## Default stance
 
-Since v0.2.0 the model is **explicit opt-in**: an **empty** `permissions`
-list is a **construction error** (`LibdenoError::Configuration`) — it grants
-nothing. To run with every capability, either set
-`LibdenoOptions.allow_all_permissions = true` (the `-A` equivalent) or pass
-`-A`/`--allow-all` in the `permissions` list. Use the allow-all escape hatch
-only for code you trust (see SECURITY.md).
+An empty `permissions` list is a configuration error unless `prompt: true` or
+`allow_all_permissions: true` is set. `allow_all_permissions` and `-A`/
+`--allow-all` grant every capability; use them only for trusted code.
 
-Passing **any** other entry restricts the runtime to the declared
-capabilities. A flag without a value allows that capability globally
-(`--allow-read` == read anywhere); with a comma-separated value only the
-listed descriptors are allowed (`--allow-read=./src,./public`).
+Permission flags grant only the declared capabilities. A flag without a value
+grants the capability globally; comma-separated values scope it, e.g.
+`--allow-read=./src,./public`.
 
 ## Supported flags
 
@@ -31,116 +27,46 @@ listed descriptors are allowed (`--allow-read=./src,./public`).
 | `--allow-sys` | system API names | `--allow-sys=getpid` |
 | `-A` / `--allow-all` | — | allow everything (same as `allow_all_permissions: true`) |
 
-`--allow-import` gates **remote module loading** (`https:`/`jsr:` specifiers)
-exactly like the CLI: there is **no `--allow-net` fallback** for module
-fetches, so `--allow-net` alone does not enable them. A value is an import
-host descriptor in `--allow-net` style (`deno.land`, `jsr.io`); full URLs
-(`https://…`) are rejected by the upstream parser, as in the CLI. Without a
-value, import access is granted globally.
+`--allow-import` gates remote module loading (`https:` and `jsr:`); `--allow-net`
+does not grant module-import permission. Values are host descriptors, such as
+`deno.land` or `jsr.io`.
 
-**File imports** (`import ... from "./x.js"` or a `file://` URL, static and
-dynamic) are gated by `--allow-read`: the graph loader checks each file
-against the declared read scope (and the broker/hook), so a static import
-outside the scope fails with a `NotCapable` error. This documents libdeno's
-loader behavior; do not treat it as a claim that every entry path is exactly
-interchangeable with the CLI's broader compatibility behavior.
+File imports, including static and dynamic imports, require `--allow-read` for
+each file. The entry file is checked too; a read grant on its directory covers
+the entry and its imports.
 
-Deny/ignore forms (`--deny-*`, `--ignore-*`) are not currently exposed, and
-any unrecognized flag is rejected with a permission error rather than silently
-ignored (an unknown flag must never silently widen the granted scope).
+Unknown flags are rejected. `--deny-*` and `--ignore-*` are not supported.
 
-Rust callers can use `LibdenoError::is_permission_error()` to recognize
-permission denials only when typed Rust denial provenance is preserved. A JS
-exception's `name`, class label, `cause`, aggregate members, or message is not
-trusted evidence of a denial. Runtime denials that lose this provenance remain
-ordinary execution errors: the Rust wrapper may produce either
-`LibdenoError::Runtime` or `LibdenoError::Core`, and `is_permission_error()` is
-false for both without typed denial evidence. Python reports either as
-`DenoRuntimeError`. Invalid permission flag syntax remains a typed
-permission/configuration error.
+`LibdenoError::is_permission_error()` recognizes typed Rust permission denials.
+JavaScript names, classes, causes, and messages are not denial evidence. A JS
+failure without typed provenance is reported as `Runtime` or `Core` in Rust and
+`DenoRuntimeError` in Python. Invalid permission flags retain their typed error.
 
 ## Interactive prompting (`prompt`)
 
-By default `prompt` is off: anything not granted is denied. Set
-`LibdenoOptions.prompt = true` to mirror `deno run`'s default interactive
-behavior: a non-granted check prints to stderr and reads allow/deny from
-stdin, blocking the run while it waits. The upstream prompter requires a
-terminal stdin (`is_terminal()`); a headless host without one sees every such
-query denied without reading.
+`prompt` is off by default, so ungranted access is denied. Set
+`LibdenoOptions.prompt = true` to ask on terminal stdin; without a terminal,
+checks are denied. With flags and prompting enabled, flags grant their listed
+capabilities and the prompt handles the rest.
 
-Three combinations:
-
-| `permissions` | `prompt` | Behavior |
-|---|---|---|
-| empty | `false` | construction error (the v0.2.0 default) |
-| empty | `true` | every access is asked interactively |
-| flags | `true` | flags grant, everything else is asked |
-| flags | `false` | flags grant, everything else is denied |
-
-In subprocess mode (`run_in_subprocess`) the child's stdin is a pipe (consumed
-by the request JSON), so the prompter's terminal check denies without reading —
-`prompt: true` in a child is equivalent to fail-closed deny; real interaction
-only makes sense for in-process `run`.
-
-Repeated flags accumulate like the CLI: `--allow-read=./a --allow-read=./b`
-grants both paths. A flag with an empty value (`--allow-read=`) is an error,
-not a silent grant.
+Subprocess stdin carries the run request, not interactive input, so prompting
+there denies ungranted access. Repeated flags accumulate; an empty flag value
+is an error.
 
 ## Broker hooks
 
-`install_permission_broker(path)` and `install_permission_hook(hook)` install a
-process-global, install-once permission decision hook (see
-[docs/api.md](api.md)). Once installed, the broker/hook is the **sole
-authority** for every permission check in the process — including
-already-granted capabilities — so local flags are no longer consulted (upstream
-deno semantics). `install_permission_broker` talks to an external process over
-a Unix socket / Windows named pipe (the JSON-line protocol deno uses for
-jupyter/LSP); `install_permission_hook` serves an in-process closure the same
-way (Unix only). The two are mutually exclusive, and neither can be installed
-more than once per process.
+`install_permission_broker(path)` and `install_permission_hook(hook)` are
+process-global, install-once authorities for all permission checks. They
+replace local flag grants and are mutually exclusive. The broker uses a Unix
+socket or Windows named pipe; the in-process hook is Unix-only. See the
+[API reference](api.md) for their setup and failure behavior.
 
 Decision priority: broker/hook (if installed) → flag grants → interactive
 prompt when `prompt: true` → deny.
 
-The external broker has an upstream process-lifetime limitation: its
-`PermissionBroker::new` constructor is not fallible and may call
-`process::exit(87)` when the initial connection fails. Later broker/bridge
-communication failures may also terminate the host through the upstream error
-path; these exits cannot be caught as `LibdenoError`. Do not use
-`install_permission_broker` with an untrusted or unreliable endpoint, or where
-the host must remain alive after broker failure. The in-process hook has the
-same synchronous/blocking semantics; a blocking hook stalls permission checks,
-while an unwinding panic is caught at the bridge boundary and fails closed as
-deny. A `panic = "abort"` build or a panic hook that aborts/exits cannot be
-caught by `catch_unwind` and may terminate the host. A blocked hook can still
-prevent `execution_deadline` from interrupting the run; the external broker's
-upstream constructor/communication exits remain uncatchable.
-
-## How it works
-
-`build_permissions` (`src/permissions.rs`) splits each flag on `=`, parses the
-comma-separated value, and fills a `PermissionsOptions` struct. If
-`LibdenoOptions.allow_all_permissions` is set (or the `-A`/`--allow-all`
-string appears), it returns `PermissionsContainer::allow_all` immediately.
-If no `--allow-*` flag was seen, it returns a configuration error — an empty
-list no longer silently grants everything. Otherwise it constructs a
-`Permissions` from the options and wraps it.
-
-The parsed container is:
-
-- handed to the file fetcher (`DenoGraphLoaderOptions.permissions`) for
-  module fetching,
-- handed to `WorkerServiceOptions.permissions` for the main worker,
-- cloned (shallow — the container wraps an `Arc`, so the clone is live, not
-  a snapshot) into `RuntimeServices` and passed to web workers via
-  `CreateWebWorkerArgs.permissions`. Permission revocations stay honored in
-  the workers; do not deep-clone here.
-
-The `CjsAnalysisSourceProvider` and `SimpleNodeRequireLoader` enforce the
-same read permissions as `Deno.readTextFile`: a fully-granted read
-(`query_read_all`) skips the check, npm-managed files under `node_modules`
-are trusted, and everything else must satisfy the declared `--allow-read`
-scope. `require()` cannot bypass the restrictions.
+The same permission container guards module fetches, file imports, and worker
+loads. Workers receive the live container, so permission revocations apply to
+them as well. `require()` follows the same read rules.
 
 ## Relative paths
 

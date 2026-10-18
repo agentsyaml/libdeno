@@ -319,8 +319,10 @@ fn manifest_from_workspace(
     normalize_semantic_fingerprints(&mut configs);
 
     let mut external_configs = Vec::new();
+    let mut external_config_probe_paths = Vec::new();
     for config in workspace.resolver_deno_jsons() {
         if let Some(path) = config.to_import_map_path()? {
+            external_config_probe_paths.push(absolute_path(&path));
             let path = canonical_path(&path);
             let Some((_, value)) = config.to_import_map_value(&RealSys)? else {
                 continue;
@@ -357,10 +359,13 @@ fn manifest_from_workspace(
     normalize_paths(&mut members);
     normalize_paths(&mut links);
 
-    let lockfile = workspace
-        .resolve_lockfile_path()?
-        .map(|path| canonical_path(&path));
-    let lockfile_present = lockfile.as_ref().is_some_and(|path| path.exists());
+    let lockfile_probe_path = workspace.resolve_lockfile_path()?;
+    let lockfile = lockfile_probe_path
+        .as_ref()
+        .map(|path| canonical_path(path));
+    let lockfile_present = lockfile_probe_path
+        .as_ref()
+        .is_some_and(|path| path.exists());
     let mut scope_dirs = vec![workspace_directory.dir_path(), workspace.root_dir_path()];
     scope_dirs.extend(discovery_candidate_dirs(&initial_cwd, &config_start_paths));
     scope_dirs.extend(members.iter().cloned());
@@ -380,11 +385,13 @@ fn manifest_from_workspace(
     let mut files = Vec::new();
     for path in configs
         .iter()
-        .chain(external_configs.iter())
         .chain(packages.iter())
         .map(|entry| &entry.path)
     {
         files.push(file_probe(path.clone(), FileProbeKind::Content));
+    }
+    for path in external_config_probe_paths {
+        files.push(file_probe(path, FileProbeKind::Content));
     }
     let npmrc_probe_kind = if npmrc_has_auth {
         FileProbeKind::Metadata
@@ -405,7 +412,7 @@ fn manifest_from_workspace(
     if let Some(path) = &global_npmrc {
         files.push(file_probe(path.clone(), npmrc_probe_kind));
     }
-    if let Some(path) = &lockfile {
+    if let Some(path) = &lockfile_probe_path {
         files.push(file_probe(path.clone(), FileProbeKind::Content));
     }
     normalize_file_probes(&mut files);
@@ -2059,6 +2066,59 @@ mod tests {
             baseline.fingerprint,
             "retargeting an existing symlink target must invalidate the probe"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_probes_external_import_map_and_lockfile_symlink_paths() {
+        use std::os::unix::fs::symlink;
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("libdeno-manifest-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("deno.json"),
+            r#"{"importMap":"./map.json","lock":true}"#,
+        )
+        .unwrap();
+        for name in ["map-a.json", "map-b.json"] {
+            std::fs::write(dir.join(name), r##"{"imports":{"#local":"./local.js"}}"##).unwrap();
+        }
+        for name in ["lock-a.json", "lock-b.json"] {
+            std::fs::write(
+                dir.join(name),
+                r#"{"version":"5","specifiers":{},"packages":{}}"#,
+            )
+            .unwrap();
+        }
+        symlink(dir.join("map-a.json"), dir.join("map.json")).unwrap();
+        symlink(dir.join("lock-a.json"), dir.join("deno.lock")).unwrap();
+        let factory = new_workspace_factory(dir.clone(), vec![dir.clone()]).unwrap();
+        let resolver = new_resolver_factory(
+            factory.clone(),
+            crate::analysis_cache::node_analysis_cache(),
+        );
+        let manifest =
+            resolver_input_manifest(dir.clone(), vec![dir.clone()], &factory, &resolver).unwrap();
+        assert!(manifest.is_current().unwrap());
+        std::fs::remove_file(dir.join("map.json")).unwrap();
+        symlink(dir.join("map-b.json"), dir.join("map.json")).unwrap();
+        assert!(
+            !manifest.is_current().unwrap(),
+            "external import-map symlink retarget was missed"
+        );
+        assert!(!manifest.is_reusable().unwrap());
+        let manifest =
+            resolver_input_manifest(dir.clone(), vec![dir.clone()], &factory, &resolver).unwrap();
+        std::fs::remove_file(dir.join("deno.lock")).unwrap();
+        symlink(dir.join("lock-b.json"), dir.join("deno.lock")).unwrap();
+        assert!(
+            !manifest.is_current().unwrap(),
+            "lockfile symlink retarget was missed"
+        );
+        assert!(!manifest.is_reusable().unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 

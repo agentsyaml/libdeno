@@ -47,6 +47,7 @@ type WebWorkerFactoryShared = (
     BootstrapOptions,
     // V8 heap cap (bytes) inherited from the main worker's LibdenoOptions.
     Option<usize>,
+    Option<crate::ExtensionFactory>,
     CjsTrackerRc<DenoInNpmPackageChecker, RealSys>,
     NodeResolverRc<
         DenoInNpmPackageChecker,
@@ -76,6 +77,8 @@ pub fn create_web_worker_factory(
     main_inspector_session_tx: MainInspectorSessionChannel,
     bootstrap_base: BootstrapOptions,
     max_heap_bytes: Option<usize>,
+    extensions: Option<crate::ExtensionFactory>,
+    parent_thread_id: u32,
 ) -> deno_core::anyhow::Result<Arc<deno_runtime::ops::worker_host::CreateWebWorkerCb>> {
     // All fallible resolver init runs up front so the factory construction
     // itself can fail cleanly; the per-spawn callback below stays infallible.
@@ -101,13 +104,14 @@ pub fn create_web_worker_factory(
         main_inspector_session_tx,
         bootstrap_base,
         max_heap_bytes,
+        extensions,
         cjs_tracker,
         node_resolver,
         pkg_json_resolver,
         in_npm_pkg_checker,
     ));
 
-    Ok(build_web_worker_factory(shared))
+    Ok(build_web_worker_factory(shared, parent_thread_id))
 }
 
 /// Infallible half of the factory. All fallible resolver init already ran
@@ -117,6 +121,7 @@ pub fn create_web_worker_factory(
 /// reachable `new Worker(...)` path therefore has no error to panic on.
 fn build_web_worker_factory(
     shared: Arc<WebWorkerFactoryShared>,
+    parent_thread_id: u32,
 ) -> Arc<deno_runtime::ops::worker_host::CreateWebWorkerCb> {
     Arc::new(move |args: CreateWebWorkerArgs| {
         // Worker's own permissions container: each worker carries the
@@ -133,6 +138,7 @@ fn build_web_worker_factory(
             main_inspector_session_tx,
             bootstrap_base,
             max_heap_bytes,
+            extensions,
             cjs_tracker,
             node_resolver,
             pkg_json_resolver,
@@ -142,7 +148,14 @@ fn build_web_worker_factory(
         // same per-run state and the same already-initialized resolvers, while
         // each callback invocation creates a fresh worker graph. This call
         // cannot fail (no script-reachable error path, no panic).
-        let nested_cb = build_web_worker_factory(shared.clone());
+        let worker_id = args.worker_id.as_u32();
+        let registration = runtime
+            .worker_lifecycle
+            .reserve(worker_id, parent_thread_id);
+        let registration_id = registration
+            .as_ref()
+            .map(|registration| registration.registration_id());
+        let nested_cb = build_web_worker_factory(shared.clone(), worker_id);
         // The worker's static imports must be adjudicated by the worker's OWN
         // permissions container, not the main run's: the shared
         // `runtime.graph_loader` carries the main run's container (built in
@@ -185,7 +198,7 @@ fn build_web_worker_factory(
         let node_resolver = node_resolver.clone();
         let pkg_json_resolver = pkg_json_resolver.clone();
         let sys = runtime.shared.sys.clone();
-        WebWorker::bootstrap_from_options(
+        let (mut worker, sendable_handle) = WebWorker::bootstrap_from_options(
             WebWorkerServiceOptions {
                 blob_store: blob_store.clone(),
                 broadcast_channel: broadcast_channel.clone(),
@@ -227,7 +240,18 @@ fn build_web_worker_factory(
                     close_on_idle: args.close_on_idle,
                     ..bootstrap_base.clone()
                 },
-                extensions: vec![],
+                extensions: {
+                    let mut worker_extensions = crate::runtime_guards::extensions(
+                        feature_checker.clone(),
+                        runtime.thread_messaging.clone(),
+                        runtime.worker_lifecycle.clone(),
+                        registration,
+                    );
+                    if let Some(factory) = extensions {
+                        worker_extensions.extend(factory.create());
+                    }
+                    worker_extensions
+                },
                 startup_snapshot: Some(STARTUP_SNAPSHOT),
                 residual_lazy_js_sources: RESIDUAL_LAZY_JS,
                 residual_lazy_esm_sources: RESIDUAL_LAZY_ESM,
@@ -250,6 +274,28 @@ fn build_web_worker_factory(
                 wait_for_debugger_on_start: false,
                 wait_for_page_wait_for_debugger: false,
             },
-        )
+        );
+        let isolate = worker.js_runtime.v8_isolate().thread_safe_handle();
+        let tasks = worker
+            .js_runtime
+            .op_state()
+            .borrow()
+            .borrow::<deno_core::V8CrossThreadTaskSpawner>()
+            .clone();
+        if let Some(registration_id) = registration_id {
+            runtime
+                .worker_lifecycle
+                .attach(worker_id, registration_id, isolate, tasks);
+        } else {
+            let mut internal = worker
+                .js_runtime
+                .op_state()
+                .borrow()
+                .borrow::<deno_runtime::web_worker::WebWorkerInternalHandle>()
+                .clone();
+            internal.terminate();
+            isolate.terminate_execution();
+        }
+        (worker, sendable_handle)
     })
 }

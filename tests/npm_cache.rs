@@ -343,6 +343,50 @@ fn write_project(dir: &Path) {
     write_project_with_expected(dir, "hello-from-mock-pkg");
 }
 
+struct NotModifiedRegistry {
+    url: String,
+    stop: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl NotModifiedRegistry {
+    fn new(metadata_ok: bool) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}/", address.port());
+        let packument = make_named_package(&url, "mock-pkg", "unused").0;
+        let (stop, stopped) = std::sync::mpsc::channel();
+        listener.set_nonblocking(true).unwrap();
+        let thread = std::thread::spawn(move || loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let path = String::from_utf8_lossy(&read_request(&mut stream)).into_owned();
+                    let response = if metadata_ok && path.starts_with("GET /mock-pkg ") {
+                        http_response(200, "application/json", packument.as_bytes())
+                    } else {
+                        b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                    };
+                    let _ = stream.write_all(&response);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stopped.try_recv().is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        });
+        Self { url, stop, thread }
+    }
+
+    fn shutdown(self) {
+        let _ = self.stop.send(());
+        let _ = self.thread.join();
+    }
+}
+
 fn write_project_with_expected(dir: &Path, expected: &str) {
     std::fs::write(
         dir.join("package.json"),
@@ -449,6 +493,35 @@ fn first_run_requires_the_registry() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&deno_dir);
     let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn cold_npm_304_responses_return_errors_from_public_run() {
+    let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::new(&["HOME", "DENO_DIR", "NPM_CONFIG_REGISTRY"]);
+    for (name, metadata_ok) in [("cold-metadata-304", false), ("tarball-304", true)] {
+        let dir = temp_dir(name);
+        let home = temp_dir(&format!("{name}-home"));
+        let deno_dir = temp_dir(&format!("{name}-deno"));
+        write_project(&dir);
+        let registry = NotModifiedRegistry::new(metadata_ok);
+        std::env::set_var("HOME", &home);
+        std::env::set_var("DENO_DIR", &deno_dir);
+        std::env::set_var("NPM_CONFIG_REGISTRY", &registry.url);
+        let _error = run(
+            dir.join("main.js"),
+            &LibdenoOptions {
+                cwd: Some(dir.clone()),
+                allow_all_permissions: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        registry.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(deno_dir);
+    }
 }
 
 #[test]
@@ -1015,4 +1088,57 @@ fn reusable_runtime_first_managed_npm_use_concurrent_calls_share_cold_rebuild() 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&deno_dir);
     let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn managed_npm_scheme_import_from_npm_package_referrer_is_graph_resolved() {
+    let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard::new(&["NPM_CONFIG_REGISTRY", "DENO_DIR", "HOME"]);
+    let dir = temp_dir("npm-scheme-referrer");
+    let deno_dir = temp_dir("npm-scheme-referrer-deno");
+    let home = temp_dir("npm-scheme-referrer-home");
+    std::env::set_var("HOME", &home);
+    std::env::set_var("DENO_DIR", &deno_dir);
+    let registry = MockRegistry::with_marker("dynamic-inner");
+    std::env::set_var("NPM_CONFIG_REGISTRY", registry.url());
+    std::fs::write(
+        dir.join("deno.json"),
+        r#"{"lock":false,"nodeModulesDir":"auto"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"proj","type":"module"}"#,
+    )
+    .unwrap();
+    let outer = dir.join("node_modules/outer");
+    std::fs::create_dir_all(&outer).unwrap();
+    std::fs::write(
+        outer.join("package.json"),
+        r#"{"name":"outer","version":"1.0.0","type":"module"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        outer.join("index.js"),
+        "export async function check(){const scheme='npm';const {default:value}=await import(`${scheme}:mock-pkg@1.0.0`);if(value!=='dynamic-inner')throw Error('wrong dynamic npm module');}",
+    )
+    .unwrap();
+    let entry = dir.join("main.js");
+    std::fs::write(
+        &entry,
+        "import {check} from './node_modules/outer/index.js'; await check();",
+    )
+    .unwrap();
+    let result = run(
+        &entry,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            ..Default::default()
+        },
+    );
+    registry.shutdown();
+    assert_eq!(result.unwrap(), 0);
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(deno_dir);
+    let _ = std::fs::remove_dir_all(home);
 }

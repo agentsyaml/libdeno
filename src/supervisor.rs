@@ -249,6 +249,48 @@ fn read_frame_with_magic(
     })
 }
 
+pub(crate) fn read_optional_frame_until(
+    stream: &mut TcpStream,
+    expected_direction: FrameDirection,
+    deadline: Instant,
+) -> io::Result<Option<SupervisorFrame>> {
+    let mut magic = [0u8; 4];
+    match read_until(stream, &mut magic[..1], Some(deadline), None) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    }
+    if let Err(error) = read_until(stream, &mut magic[1..], Some(deadline), None) {
+        return if matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::TimedOut
+        ) {
+            Err(invalid_data("truncated duplicate supervisor frame"))
+        } else {
+            Err(error)
+        };
+    }
+    match read_frame_with_magic(stream, expected_direction, magic, Some(deadline), None) {
+        Ok(frame) => Ok(Some(frame)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err(invalid_data("truncated duplicate supervisor frame"))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn write_frame(stream: &mut TcpStream, frame: &SupervisorFrame) -> io::Result<()> {
     let deadline = Instant::now()
         .checked_add(SUPERVISOR_FRAME_TIMEOUT)
@@ -1626,6 +1668,63 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || listener.accept().unwrap().0);
+        let client = TcpStream::connect(address).unwrap();
+        let peer = peer.join().unwrap();
+        prepare_supervisor_stream(&client).unwrap();
+        prepare_supervisor_stream(&peer).unwrap();
+        (client, peer)
+    }
+
+    #[test]
+    fn optional_frame_only_treats_empty_eof_as_clean() {
+        let (mut client, peer) = tcp_pair();
+        drop(peer);
+        assert!(read_optional_frame_until(
+            &mut client,
+            FrameDirection::ChildToParent,
+            Instant::now() + Duration::from_millis(50)
+        )
+        .unwrap()
+        .is_none());
+
+        let (mut client, peer) = tcp_pair();
+        let started = Instant::now();
+        assert!(read_optional_frame_until(
+            &mut client,
+            FrameDirection::ChildToParent,
+            started + Duration::from_millis(30)
+        )
+        .unwrap()
+        .is_none());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        drop(peer);
+    }
+
+    #[test]
+    fn optional_frame_rejects_partial_magic_header_and_payload() {
+        use std::io::Write;
+        for bytes in [
+            &b"L"[..],
+            &b"LDSV\x02\x07\0"[..],
+            &b"LDSV\x02\x07\0\0\0\0\0\0\0\x01\0\0\0\x04x"[..],
+        ] {
+            let (mut client, mut peer) = tcp_pair();
+            peer.write_all(bytes).unwrap();
+            drop(peer);
+            let error = read_optional_frame_until(
+                &mut client,
+                FrameDirection::ChildToParent,
+                Instant::now() + Duration::from_millis(200),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
 
     #[cfg(unix)]
     fn shrink_socket_buffer(stream: &TcpStream, option: libc::c_int) {

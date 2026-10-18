@@ -1476,8 +1476,25 @@ mod execution_control {
         let dir = temp_dir("control-detach");
         let entry = dir.join("main.js");
         let started = dir.join("started");
+        let release = dir.join("release");
         let completed = dir.join("completed");
-        fs::write(&entry, blocking_script(&started, &completed, 200)).unwrap();
+        fs::write(
+            &entry,
+            format!(
+                "Deno.writeTextFileSync({started:?}, 'started');\n\
+                 while (!(() => {{ try {{ Deno.statSync({release:?}); return true; }} catch {{ return false; }} }})()) {{\n\
+                   await new Promise((resolve) => setTimeout(resolve, 10));\n\
+                 }}\nDeno.writeTextFileSync({completed:?}, 'completed');"
+            ),
+        )
+        .unwrap();
+        struct ReleaseOnDrop(PathBuf);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                let _ = fs::write(&self.0, "release");
+            }
+        }
+        let release_guard = ReleaseOnDrop(release.clone());
         let executor = build_admission(&dir, 1, 0);
         let handle = executor
             .submit(
@@ -1496,7 +1513,16 @@ mod execution_control {
         let future = handle.result();
         drop(future);
         drop(handle);
+        assert!(matches!(
+            executor.submit(
+                ExecutionRequest::new(&entry, allow_all()),
+                SubmissionOptions::default()
+            ),
+            Err(SubmitError::QueueFull)
+        ));
+        fs::write(&release, "release").unwrap();
         wait_for(&completed);
+        drop(release_guard);
         let deadline = Instant::now() + Duration::from_secs(5);
         let next = loop {
             match executor.submit(
@@ -1779,7 +1805,9 @@ mod execution_control {
         fs::write(
             &entry,
             format!(
-                "console.log('deadline-prefix');\n\
+                "console.log('deadline-out-a'); console.error('deadline-err-a');\n\
+                 await new Promise((resolve) => setTimeout(resolve, 50));\n\
+                 console.log('deadline-out-b'); console.error('deadline-err-b');\n\
                  Deno.writeTextFileSync({started:?}, 'started');\n\
                  await new Promise((resolve) => setTimeout(resolve, 60000));"
             ),
@@ -1797,6 +1825,7 @@ mod execution_control {
                     &entry,
                     LibdenoOptions {
                         capture_stdout: true,
+                        capture_stderr: true,
                         execution_deadline: Some(Duration::from_secs(3)),
                         ..allow_all()
                     },
@@ -1813,9 +1842,12 @@ mod execution_control {
         let partial = failure
             .partial_output()
             .expect("supervisor deadline must preserve requested capture");
-        assert!(String::from_utf8_lossy(partial.stdout()).contains("deadline-prefix"));
+        let stdout = String::from_utf8_lossy(partial.stdout());
+        let stderr = String::from_utf8_lossy(partial.stderr());
+        assert!(stdout.contains("deadline-out-a") && stdout.contains("deadline-out-b"));
+        assert!(stderr.contains("deadline-err-a") && stderr.contains("deadline-err-b"));
         assert!(!partial.capture_truncated());
-        assert!(partial.capture_incomplete());
+        assert!(!partial.capture_incomplete());
         assert!(!partial.capture_reader_error());
         let _ = fs::remove_dir_all(dir);
     }

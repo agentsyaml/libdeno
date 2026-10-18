@@ -532,13 +532,62 @@ fn restore_target(
     saved: libc::c_int,
     flags: libc::c_int,
 ) -> Result<(), std::io::Error> {
-    if unsafe { libc::dup2(saved, target) } < 0 {
-        return Err(std::io::Error::last_os_error());
+    loop {
+        #[cfg(test)]
+        if let Some(error) = injected_restore_error(RestoreCall::Dup2) {
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if unsafe { libc::dup2(saved, target) } >= 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
-    if unsafe { libc::fcntl(target, libc::F_SETFD, flags) } < 0 {
-        return Err(std::io::Error::last_os_error());
+    loop {
+        #[cfg(test)]
+        if let Some(error) = injected_restore_error(RestoreCall::SetFd) {
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if unsafe { libc::fcntl(target, libc::F_SETFD, flags) } >= 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
     Ok(())
+}
+
+#[cfg(all(unix, test))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestoreCall {
+    Dup2,
+    SetFd,
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static RESTORE_FAULT: std::cell::Cell<Option<(RestoreCall, std::io::ErrorKind)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(unix, test))]
+fn injected_restore_error(call: RestoreCall) -> Option<std::io::Error> {
+    RESTORE_FAULT.with(|fault| match fault.get() {
+        Some((next, kind)) if next == call => {
+            fault.set(None);
+            Some(std::io::Error::from(kind))
+        }
+        _ => None,
+    })
 }
 
 fn abort_restore(target: libc::c_int, error: &std::io::Error) -> ! {
@@ -553,6 +602,51 @@ mod tests {
     use super::collect_blocks_until;
     use super::reserve_capture_reader;
     use super::MAX_ACTIVE_CAPTURE_READERS;
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_target_retries_dup_and_fd_flag_eintr() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let saved = unsafe { libc::fcntl(fds[1], libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(saved >= 0);
+        let flags = unsafe { libc::fcntl(fds[1], libc::F_GETFD) } | libc::FD_CLOEXEC;
+        for call in [super::RestoreCall::Dup2, super::RestoreCall::SetFd] {
+            super::RESTORE_FAULT
+                .with(|fault| fault.set(Some((call, std::io::ErrorKind::Interrupted))));
+            super::restore_target(fds[1], saved, flags).unwrap();
+            assert_eq!(unsafe { libc::fcntl(fds[1], libc::F_GETFD) }, flags);
+        }
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            libc::close(saved);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permanent_restore_failure_remains_fail_stop() {
+        const CHILD: &str = "LIBDENO_RESTORE_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let capture = super::OutputCapture::new(true, false, None).unwrap();
+            super::RESTORE_FAULT.with(|fault| {
+                fault.set(Some((super::RestoreCall::Dup2, std::io::ErrorKind::Other)))
+            });
+            let _ = capture.finish();
+            panic!("permanent fd restore failure must abort");
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "output::tests::permanent_restore_failure_remains_fail_stop",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(!status.success());
+    }
 
     static CAPTURE_READER_BUDGET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -716,7 +810,22 @@ mod tests {
                 0
             };
             assert_eq!(unsafe { libc::fcntl(1, libc::F_SETFD, original_flags) }, 0);
-            if mode == "partial-zero" {
+            if mode.contains("eintr-dup2") {
+                super::RESTORE_FAULT.with(|fault| {
+                    fault.set(Some((
+                        super::RestoreCall::Dup2,
+                        std::io::ErrorKind::Interrupted,
+                    )))
+                });
+            } else if mode.contains("eintr-setfd") {
+                super::RESTORE_FAULT.with(|fault| {
+                    fault.set(Some((
+                        super::RestoreCall::SetFd,
+                        std::io::ErrorKind::Interrupted,
+                    )))
+                });
+            }
+            if mode.starts_with("partial") {
                 std::env::set_var("LIBDENO_TEST_FAIL_CAPTURE_FD", "2");
                 assert!(super::OutputCapture::new(true, true, None).is_err());
                 assert_eq!(unsafe { libc::fcntl(1, libc::F_GETFD) }, original_flags);
@@ -741,6 +850,10 @@ mod tests {
             "drop-zero",
             "drop-cloexec",
             "partial-zero",
+            "partial-cloexec",
+            "finish-eintr-dup2-cloexec",
+            "drop-eintr-setfd-zero",
+            "partial-eintr-dup2-cloexec",
         ] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([

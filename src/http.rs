@@ -1,6 +1,4 @@
-// Minimal HTTP client for the deno_cache_dir file fetcher, used to fetch
-// remote (https/http) modules into the global cache. Deliberately does not
-// follow redirects; redirect handling belongs to the fetcher.
+// Minimal HTTP client for deno_cache_dir module and npm fetches.
 
 use deno_cache_dir::file_fetcher::HttpClient;
 use deno_cache_dir::file_fetcher::SendError;
@@ -29,18 +27,11 @@ use url::Url;
 
 use crate::LibdenoError;
 
-/// Cap on the decompressed response body we buffer for module fetches,
-/// guarding against decompression bombs. reqwest auto-decompresses
-/// gzip/brotli (enabled in Cargo.toml) at the transport layer before the body
-/// reaches us, so this counts true memory usage, not the wire size.
+/// Cap on the decompressed response body buffered for module fetches;
+/// reqwest decodes HTTP Content-Encoding before this limit is checked.
 const MAX_RESPONSE_BODY_BYTES: usize = 256 << 20;
-/// Cap for explicit npm `.tgz` downloads: some legal packages exceed 256MiB.
-/// Still bounded, so a broken/oversized response fails fast instead of OOMing
-/// the host. This is a response-body cap after any HTTP Content-Encoding
-/// decoding by reqwest, not wire-byte accounting; an npm `.tgz` response
-/// remains compressed tarball data here. The ISIZE guard below is a coarse
-/// publisher-controlled pre-check; neither boundary accounts for allocations
-/// inside upstream extraction.
+/// Bounded response-body cap for explicit npm `.tgz` downloads, whose bodies
+/// remain compressed; this and the ISIZE check do not cap extraction allocations.
 #[cfg(feature = "npm")]
 const MAX_TARBALL_BODY_BYTES: usize = 1 << 30;
 
@@ -56,14 +47,7 @@ pub struct ReqwestHttpClient {
 }
 
 impl ReqwestHttpClient {
-    /// Sole constructor: every request path (file fetcher + npm installer)
-    /// shares this builder config. reqwest::Client is Arc-backed, so `Clone`
-    /// shares the same connection pool and configuration.
-    ///
-    /// reqwest 0.12 has no client-level response body limit (`response_body_limit`
-    /// does not exist here), so the caps are enforced per read in
-    /// [`read_body_limited`]. HTTP Content-Encoding is decoded before that
-    /// helper, but an npm `.tgz` response body remains compressed tarball data.
+    /// All request paths share this client and its connection pool.
     pub fn new() -> Result<Self, LibdenoError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -76,13 +60,7 @@ impl ReqwestHttpClient {
     }
 }
 
-/// Reads the full response body as delivered by reqwest into a Vec, failing
-/// once the accumulated size exceeds the caller-supplied `limit` instead of
-/// buffering an unbounded response. HTTP Content-Encoding has already been
-/// decoded, while an npm `.tgz` response body remains compressed tarball data.
-/// The caller picks the bound: module fetches pin the module cap, while npm
-/// registry downloads use the explicit tarball-path check in `npm_body_limit`.
-/// Over-limit is an error, never a retry.
+/// Buffers the response body up to the caller-supplied limit.
 async fn read_body_limited(
     response: &mut reqwest::Response,
     limit: usize,
@@ -208,7 +186,11 @@ impl HttpClient for ReqwestHttpClient {
                     // stale cached module) is not a redirect and carries no
                     // Location header.
                     if status == http::StatusCode::NOT_MODIFIED {
-                        return Ok(SendResponse::NotModified);
+                        return if headers.contains_key(http::header::IF_NONE_MATCH) {
+                            Ok(SendResponse::NotModified)
+                        } else {
+                            Err(SendError::StatusCode(status))
+                        };
                     }
 
                     if status.is_redirection() {
@@ -306,7 +288,7 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
         &self,
         url: Url,
         maybe_auth: Option<String>,
-        maybe_etag: Option<String>,
+        mut maybe_etag: Option<String>,
         maybe_registry_config: Option<&RegistryConfig>,
     ) -> Result<NpmCacheHttpClientResponse, DownloadError> {
         // Classify only the original request path. Redirects to opaque CDN
@@ -363,7 +345,15 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
                         return Ok(NpmCacheHttpClientResponse::NotFound);
                     }
                     if status == http::StatusCode::NOT_MODIFIED {
-                        return Ok(NpmCacheHttpClientResponse::NotModified);
+                        return if maybe_etag.is_some() {
+                            Ok(NpmCacheHttpClientResponse::NotModified)
+                        } else {
+                            Err(err(
+                                Some(status.as_u16()),
+                                "npm registry returned 304 without a conditional ETag request"
+                                    .to_string(),
+                            ))
+                        };
                     }
                     if status.is_success() {
                         let etag = response
@@ -432,6 +422,9 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
                         if next.origin() != url.origin() {
                             auth = None;
                         }
+                        if next != url {
+                            maybe_etag = None;
+                        }
                         url = next;
                         attempt = 0; // a redirect is a new request, not a retry
                         continue;
@@ -493,328 +486,5 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-
-    /// Serves a single canned HTTP response on an ephemeral port and returns
-    /// the URL. The client request is drained so the server can respond.
-    fn serve(response: &'static str) -> String {
-        serve_many(vec![response])
-    }
-
-    /// Serves one canned HTTP response per accepted connection, in sequence.
-    fn serve_many(responses: Vec<&'static str>) -> String {
-        serve_many_bytes(
-            responses
-                .into_iter()
-                .map(|response| response.as_bytes().to_vec())
-                .collect(),
-        )
-    }
-
-    fn serve_many_bytes(responses: Vec<Vec<u8>>) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for response in responses {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    let mut buf = [0u8; 2048];
-                    let _ = stream.read(&mut buf); // drain the request line + headers
-                    let _ = stream.write_all(&response);
-                    let _ = stream.flush();
-                }
-            }
-        });
-        format!("http://{addr}/")
-    }
-
-    /// Like `serve_many`, but accepts two connections in sequence: the first
-    /// gets `first`, the second gets `second`. Used to simulate a redirect
-    /// followed by the real response.
-    #[cfg(feature = "npm")]
-    fn serve_then(first: &'static str, second: &'static str) -> String {
-        serve_many(vec![first, second])
-    }
-
-    #[cfg(feature = "npm")]
-    fn serve_then_bytes(first: &'static str, second: Vec<u8>) -> String {
-        serve_many_bytes(vec![first.as_bytes().to_vec(), second])
-    }
-
-    fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    }
-
-    #[test]
-    fn not_modified_is_reported_not_redirected() {
-        // Regression: is_redirection() includes 304, so the 304 branch must be
-        // checked first. A stale-cache re-validation must yield NotModified.
-        let url = serve("HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n");
-        let client = ReqwestHttpClient::new().unwrap();
-        runtime().block_on(async {
-            let resp = client
-                .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
-                .await
-                .unwrap();
-            assert!(matches!(resp, SendResponse::NotModified));
-        });
-    }
-
-    #[test]
-    fn redirect_returns_location_header() {
-        let url = serve(
-      "HTTP/1.1 301 Moved Permanently\r\nLocation: https://example.com/new\r\nContent-Length: 0\r\n\r\n",
-    );
-        let client = ReqwestHttpClient::new().unwrap();
-        runtime().block_on(async {
-            let resp = client
-                .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
-                .await
-                .unwrap();
-            match resp {
-                SendResponse::Redirect(headers) => {
-                    assert_eq!(headers.get(LOCATION).unwrap(), "https://example.com/new");
-                }
-                other => panic!("expected redirect, got {other:?}"),
-            }
-        });
-    }
-
-    #[test]
-    fn success_returns_body() {
-        let url =
-            serve("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello");
-        let client = ReqwestHttpClient::new().unwrap();
-        runtime().block_on(async {
-            let resp = client
-                .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
-                .await
-                .unwrap();
-            match resp {
-                SendResponse::Success(headers, body) => {
-                    assert_eq!(body, b"hello");
-                    assert_eq!(headers.get("content-type").unwrap(), "text/plain");
-                }
-                other => panic!("expected success, got {other:?}"),
-            }
-        });
-    }
-
-    #[test]
-    fn not_found_is_an_error() {
-        let url = serve("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-        let client = ReqwestHttpClient::new().unwrap();
-        runtime().block_on(async {
-            let err = client
-                .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
-                .await
-                .unwrap_err();
-            assert!(matches!(err, SendError::NotFound));
-        });
-    }
-
-    #[test]
-    fn other_error_status_is_reported() {
-        // A 5xx is retried up to 3 attempts; once the attempts are exhausted
-        // the status itself is reported. Connection: close forces a fresh
-        // connection per attempt so the mock serves exactly one response each.
-        let five_hundred =
-            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let url = serve_many(vec![five_hundred, five_hundred, five_hundred]);
-        let client = ReqwestHttpClient::new().unwrap();
-        runtime().block_on(async {
-            let err = client
-                .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
-                .await
-                .unwrap_err();
-            match err {
-                SendError::StatusCode(status) => {
-                    assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR)
-                }
-                other => panic!("expected status code error, got {other:?}"),
-            }
-        });
-    }
-
-    #[test]
-    fn body_over_module_cap_is_an_error() {
-        // P2: an oversized stream (unknown length, as chunked responses
-        // arrive on the wire) trips the module cap without transferring
-        // 256MiB+ over a socket. reqwest::Response::from infers
-        // content_length from a concrete Vec body, so the stream keeps the
-        // test honest about the chunked (no Content-Length) case.
-        use futures_util::stream;
-        use reqwest::Body;
-        let oversized = http::Response::builder()
-            .status(200)
-            .body(Body::wrap_stream(stream::iter([Ok::<_, std::io::Error>(
-                bytes::Bytes::from(vec![0u8; (256 << 20) + 1]),
-            )])))
-            .unwrap();
-        let mut response = reqwest::Response::from(oversized);
-        runtime().block_on(async {
-            let err = read_body_limited(&mut response, MAX_RESPONSE_BODY_BYTES)
-                .await
-                .unwrap_err();
-            assert!(err.contains("limit"), "unexpected error: {err}");
-        });
-    }
-
-    #[cfg(feature = "npm")]
-    #[test]
-    fn body_budget_requires_explicit_tgz_path() {
-        // A `.tgz` path is the only evidence that permits the larger budget;
-        // Content-Length is deliberately ignored for tier selection.
-        let large = Some(u64::MAX);
-        assert_eq!(npm_body_limit(true, large), MAX_TARBALL_BODY_BYTES);
-        assert_eq!(npm_body_limit(false, large), MAX_RESPONSE_BODY_BYTES);
-        assert_eq!(
-            npm_body_limit(false, Some((256 << 20) as u64 + 1)),
-            MAX_RESPONSE_BODY_BYTES
-        );
-        // An explicitly named tarball remains eligible even when chunked.
-        assert_eq!(npm_body_limit(true, None), MAX_TARBALL_BODY_BYTES);
-    }
-
-    #[test]
-    fn read_body_limited_respects_the_passed_limit() {
-        // The limit is a caller-provided parameter now (module fetches and npm
-        // downloads diverge): a small custom limit must trip on a small body.
-        let small = http::Response::builder()
-            .status(200)
-            .body(reqwest::Body::from(vec![0u8; 16]))
-            .unwrap();
-        let mut response = reqwest::Response::from(small);
-        runtime().block_on(async {
-            let err = read_body_limited(&mut response, 4).await.unwrap_err();
-            assert!(err.contains("limit"), "unexpected error: {err}");
-        });
-    }
-
-    #[cfg(feature = "npm")]
-    #[test]
-    fn npm_download_follows_redirect() {
-        // A registry 302 to a relative Location must be followed to the target
-        // and yield the final body (the client itself uses Policy::none).
-        let url = serve_then(
-            "HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: application/octet-stream\r\n\r\nhello",
-        );
-        let client = ReqwestHttpClient::new().unwrap();
-        runtime().block_on(async {
-            let resp = client
-                .download_with_retries_on_any_tokio_runtime(
-                    Url::parse(&url).unwrap(),
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-            match resp {
-                NpmCacheHttpClientResponse::Bytes(bytes) => assert_eq!(bytes.bytes, b"hello"),
-                _ => panic!("expected npm registry bytes response"),
-            }
-        });
-    }
-
-    #[cfg(feature = "npm")]
-    #[test]
-    fn npm_download_preserves_tarball_identity_through_opaque_redirect() {
-        let mut body = vec![0x1f, 0x8b]; // gzip magic
-        body.extend_from_slice(&[0u8; 8]);
-        body.extend_from_slice(&((1u32 << 30) + 1).to_le_bytes()); // inflated ISIZE
-        let mut response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        response.extend_from_slice(&body);
-        let url = serve_then_bytes(
-            "HTTP/1.1 302 Found\r\nLocation: /cdn/opaque\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            response,
-        );
-        let client = ReqwestHttpClient::new().unwrap();
-        let original_url = Url::parse(&format!("{url}pkg/-/pkg-1.0.0.tgz")).unwrap();
-        runtime().block_on(async {
-            let result = client
-                .download_with_retries_on_any_tokio_runtime(original_url, None, None, None)
-                .await;
-            let err = match result {
-                Err(err) => err,
-                Ok(_) => panic!("expected the inflated tarball trailer to be rejected"),
-            };
-            let message = err.to_string();
-            assert!(
-                message.contains("decompressed bytes") && message.contains("budget"),
-                "unexpected error: {message}"
-            );
-        });
-    }
-
-    #[cfg(feature = "npm")]
-    #[test]
-    fn isize_guard_rejects_inflated_trailer() {
-        // A small tarball whose gzip ISIZE trailer claims ~4 GiB must be
-        // rejected at download time (upstream extraction would try_reserve
-        // that much from a publisher-controlled header).
-        let mut bytes = vec![0x1f, 0x8b]; // gzip magic
-        bytes.extend_from_slice(&[0u8; 100]);
-        bytes.extend_from_slice(&((1u32 << 30) + 1).to_le_bytes()); // ISIZE > 1 GiB budget
-        let err = guard_tarball_isize(true, bytes).unwrap_err();
-        assert!(
-            err.contains("decompressed bytes") && err.contains("budget"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[cfg(feature = "npm")]
-    #[test]
-    fn isize_guard_passes_small_trailer() {
-        let mut bytes = vec![0x1f, 0x8b];
-        bytes.extend_from_slice(&[0u8; 100]);
-        bytes.extend_from_slice(&1024u32.to_le_bytes());
-        assert!(guard_tarball_isize(true, bytes).is_ok());
-    }
-
-    #[cfg(feature = "npm")]
-    #[test]
-    fn isize_guard_checks_the_last_member_of_a_multi_member_tarball() {
-        // ISIZE is a per-member trailer. Keep this pre-check deliberately
-        // coarse (the extractor remains responsible for full gzip parsing),
-        // but make sure an inflated final member still trips it.
-        let mut bytes = vec![0x1f, 0x8b];
-        bytes.extend_from_slice(&[0u8; 100]);
-        bytes.extend_from_slice(&1024u32.to_le_bytes());
-        bytes.extend_from_slice(&[0x1f, 0x8b]);
-        bytes.extend_from_slice(&[0u8; 100]);
-        bytes.extend_from_slice(&((1u32 << 30) + 1).to_le_bytes());
-        assert!(guard_tarball_isize(true, bytes).is_err());
-    }
-
-    #[cfg(feature = "npm")]
-    #[test]
-    fn isize_guard_ignores_non_tarball_paths() {
-        // Registry metadata (JSON) must never be size-checked: its trailer
-        // bytes are not an ISIZE and would spuriously fail.
-        let mut bytes = vec![0x1f, 0x8b];
-        bytes.extend_from_slice(&[0u8; 100]);
-        bytes.extend_from_slice(&((1u32 << 30) + 1).to_le_bytes());
-        assert!(
-            guard_tarball_isize(false, bytes).is_ok(),
-            "non-.tgz responses must pass through"
-        );
-    }
-
-    #[cfg(feature = "npm")]
-    #[test]
-    fn isize_guard_ignores_non_gzip_bytes() {
-        let bytes = vec![0u8; 64]; // no gzip magic
-        assert!(guard_tarball_isize(true, bytes).is_ok());
-    }
-}
+#[path = "http/tests.rs"]
+mod tests;

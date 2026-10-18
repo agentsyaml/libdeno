@@ -388,6 +388,109 @@ fn frozen_lockfile_rejects_new_remote_without_changing_lock_bytes() {
 }
 
 #[test]
+fn frozen_failures_do_not_pollute_the_same_run_graph() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new();
+    let _env = EnvGuard::isolated_deno_dir(&fixture.0.join("deno-cache"));
+    let server = LocalModuleServer::start("export const value = 42;".to_string());
+    let original = lockfile(&server.url, None);
+    setup_lock(
+        &fixture,
+        r#"{"lock":{"path":"deno.lock","frozen":true}}"#,
+        &original,
+    );
+    std::fs::write(fixture.0.join("local.js"), "export const local = true;").unwrap();
+    let source = format!(
+        r#"
+const remote = [{:?}, ''].join('');
+for (let attempt = 0; attempt < 2; attempt++) {{
+  try {{ await import(remote); throw new Error('frozen import unexpectedly succeeded'); }}
+  catch (error) {{ if (!String(error).toLowerCase().includes('lockfile')) throw error; }}
+}}
+const local = await import('./local.js');
+if (!local.local) throw new Error('local import was poisoned by failed frozen graph');
+"#,
+        server.url
+    );
+    assert_eq!(
+        run_source(
+            source,
+            SourceLang::JavaScript,
+            &fixture.0,
+            &LibdenoOptions {
+                allow_all_permissions: true,
+                ..Default::default()
+            }
+        )
+        .unwrap_or_else(|error| panic!("{error}; server={}", server.diagnostics())),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.0.join("deno.lock")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn frozen_graph_candidates_are_isolated_between_concurrent_runs() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let a = Fixture::new();
+    let b = Fixture::new();
+    let _env = EnvGuard::isolated_deno_dir(&a.0.join("shared-cache"));
+    let server_a = LocalModuleServer::start("export const value = 'a';".to_string());
+    let server_b = LocalModuleServer::start("export const value = 'b';".to_string());
+    let checksum = deno_graph::source::LoaderChecksum::r#gen(b"export const value = 'a';");
+    let lock_a = lockfile(&server_a.url, Some(&checksum));
+    let lock_b = lockfile(&server_b.url, None);
+    setup_lock(
+        &a,
+        r#"{"lock":{"path":"deno.lock","frozen":true}}"#,
+        &lock_a,
+    );
+    setup_lock(
+        &b,
+        r#"{"lock":{"path":"deno.lock","frozen":true}}"#,
+        &lock_b,
+    );
+    let spawn = |fixture: PathBuf, url: String| {
+        std::thread::spawn(move || {
+            let source = format!(
+                "import {url:?}; Deno.writeTextFileSync(new URL('./ran', import.meta.url), 'yes');"
+            );
+            run_source(
+                source,
+                SourceLang::JavaScript,
+                &fixture,
+                &LibdenoOptions {
+                    allow_all_permissions: true,
+                    ..Default::default()
+                },
+            )
+            .map(|code| code == 0)
+            .map_err(|error| error.to_string())
+        })
+    };
+    let run_a = spawn(a.0.clone(), server_a.url.clone());
+    let run_b = spawn(b.0.clone(), server_b.url.clone());
+    assert!(run_a.join().unwrap().unwrap());
+    let error = run_b.join().unwrap().unwrap_err();
+    assert!(
+        error.to_lowercase().contains("lockfile"),
+        "unexpected frozen error: {error}"
+    );
+    assert!(a.0.join("ran").exists());
+    assert!(!b.0.join("ran").exists());
+    assert_eq!(
+        std::fs::read_to_string(a.0.join("deno.lock")).unwrap(),
+        lock_a
+    );
+    assert_eq!(
+        std::fs::read_to_string(b.0.join("deno.lock")).unwrap(),
+        lock_b
+    );
+}
+
+#[test]
 fn lock_false_does_not_apply_remote_checksum_gate() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();

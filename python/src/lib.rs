@@ -38,7 +38,7 @@ fn run(
     args: Py<PyAny>,
     cwd: Option<Bound<'_, PyAny>>,
     max_heap_bytes: Option<Bound<'_, PyAny>>,
-    execution_deadline: Option<f64>,
+    execution_deadline: Option<Bound<'_, PyAny>>,
     features: Option<Py<PyAny>>,
 ) -> PyResult<i32> {
     let entry = path_from_python(entry, "entry")?;
@@ -51,7 +51,7 @@ fn run(
         args,
         cwd.as_ref(),
         max_heap_bytes.as_ref(),
-        execution_deadline,
+        execution_deadline.as_ref(),
         features,
     )?;
     let result = py.detach(|| libdeno::run(entry, &options));
@@ -102,7 +102,7 @@ impl Runtime {
         allow_all_permissions: bool,
         args: Py<PyAny>,
         max_heap_bytes: Option<Bound<'_, PyAny>>,
-        execution_deadline: Option<f64>,
+        execution_deadline: Option<Bound<'_, PyAny>>,
         features: Option<Py<PyAny>>,
     ) -> PyResult<i32> {
         let entry = path_from_python(entry, "entry")?;
@@ -115,7 +115,7 @@ impl Runtime {
             args,
             None,
             max_heap_bytes.as_ref(),
-            execution_deadline,
+            execution_deadline.as_ref(),
             features,
         )?;
         let result = py.detach(|| libdeno::run_with(&self.inner, entry, &options));
@@ -189,7 +189,7 @@ fn options_from_python(
     args: &Bound<'_, PyAny>,
     cwd: Option<&Bound<'_, PyAny>>,
     max_heap_bytes: Option<&Bound<'_, PyAny>>,
-    execution_deadline: Option<f64>,
+    execution_deadline: Option<&Bound<'_, PyAny>>,
     features: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<libdeno::LibdenoOptions> {
     let max_heap_bytes = max_heap_bytes
@@ -202,7 +202,12 @@ fn options_from_python(
         })
         .transpose()?;
     let execution_deadline = execution_deadline
-        .map(|seconds| {
+        .map(|value| {
+            let seconds = value.extract::<f64>().map_err(|error| {
+                ConfigurationError::new_err(format!(
+                    "execution_deadline must be a number: {error}"
+                ))
+            })?;
             if seconds.is_finite() && seconds >= 0.0 {
                 std::time::Duration::try_from_secs_f64(seconds).map_err(|_| {
                     ConfigurationError::new_err(

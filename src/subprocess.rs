@@ -30,14 +30,14 @@ use crate::supervisor::poll_readable;
 #[cfg(feature = "execution-control")]
 use crate::supervisor::{
     decode_payload, encode_payload, prepare_supervisor_stream, read_frame,
-    read_frame_after_first_byte, read_frame_with_cancellation, validate_supervisor_terminal_shape,
-    write_frame_until, CancelReason, CleanupStrength, FrameDirection, FrameKind,
-    SupervisorCancellation, SupervisorChildSession, SupervisorFailureCategory, SupervisorFrame,
-    SupervisorFrameEvent, SupervisorParentSession, SupervisorRequest, SupervisorTerminal,
-    SupervisorToken, SUPERVISOR_CANCEL_GRACE, SUPERVISOR_CAPTURE_BYTES_PER_STREAM,
-    SUPERVISOR_CHILD_EXIT_GRACE, SUPERVISOR_CONNECT_TIMEOUT, SUPERVISOR_ENDPOINT_ENV,
-    SUPERVISOR_FRAME_TIMEOUT, SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM, SUPERVISOR_MODE_ENV,
-    SUPERVISOR_TOKEN_ENV,
+    read_frame_after_first_byte, read_frame_with_cancellation, read_optional_frame_until,
+    validate_supervisor_terminal_shape, write_frame_until, CancelReason, CleanupStrength,
+    FrameDirection, FrameKind, SupervisorCancellation, SupervisorChildSession,
+    SupervisorFailureCategory, SupervisorFrame, SupervisorFrameEvent, SupervisorParentSession,
+    SupervisorRequest, SupervisorTerminal, SupervisorToken, SUPERVISOR_CANCEL_GRACE,
+    SUPERVISOR_CAPTURE_BYTES_PER_STREAM, SUPERVISOR_CHILD_EXIT_GRACE, SUPERVISOR_CONNECT_TIMEOUT,
+    SUPERVISOR_ENDPOINT_ENV, SUPERVISOR_FRAME_TIMEOUT, SUPERVISOR_MAX_CAPTURE_BYTES_PER_STREAM,
+    SUPERVISOR_MODE_ENV, SUPERVISOR_TOKEN_ENV,
 };
 
 /// The request writer is detached because a blocking `write_all` cannot be
@@ -251,6 +251,11 @@ fn spawn_child_request(
     stdout: std::process::Stdio,
     stderr: std::process::Stdio,
 ) -> Result<(Vec<u8>, std::process::Child), LibdenoError> {
+    if options.extensions.is_some() {
+        return Err(LibdenoError::Configuration(
+            "native extension factories are not supported by subprocess execution".into(),
+        ));
+    }
     let token = child_token()?;
     let cwd = crate::effective_cwd(options)?;
     let request = ChildRunRequest {
@@ -778,6 +783,11 @@ fn supervisor_request(
     options: &LibdenoOptions,
     cwd: PathBuf,
 ) -> Result<SupervisorRequest, LibdenoError> {
+    if options.extensions.is_some() {
+        return Err(LibdenoError::Configuration(
+            "native extension factories are not supported by subprocess execution".into(),
+        ));
+    }
     let max_capture_bytes = supervisor_capture_limit(
         options.capture_stdout,
         options.capture_stderr,
@@ -1125,6 +1135,12 @@ impl SubprocessOutputStream {
     }
 }
 
+fn drain_queued_output(streams: &mut [Option<SubprocessOutputStream>; 2]) {
+    for stream in streams.iter_mut().flatten() {
+        while !stream.done && stream.try_receive() {}
+    }
+}
+
 impl SubprocessOutputReaders {
     fn take(
         child: &mut std::process::Child,
@@ -1183,6 +1199,9 @@ impl SubprocessOutputReaders {
                 break;
             }
             if deadline <= std::time::Instant::now() {
+                if effective_deadline.is_some() {
+                    drain_queued_output(&mut streams);
+                }
                 break;
             }
             if !progress {
@@ -1688,29 +1707,18 @@ fn read_supervisor_terminal(
     let duplicate_deadline = supervisor_deadline_after(Duration::from_millis(100));
     let duplicate_deadline =
         cancel_grace_deadline.map_or(duplicate_deadline, |grace| duplicate_deadline.min(grace));
-    loop {
-        match read_frame(stream, FrameDirection::ChildToParent, duplicate_deadline) {
-            Ok(frame) => {
-                let event = state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .receive_child_frame(&frame)?;
-                if !matches!(event, SupervisorFrameEvent::Terminal) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "supervisor frame follows TERMINAL",
-                    ));
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                break
-            }
-            Err(error) => return Err(error),
+    while let Some(frame) =
+        read_optional_frame_until(stream, FrameDirection::ChildToParent, duplicate_deadline)?
+    {
+        let event = state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .receive_child_frame(&frame)?;
+        if !matches!(event, SupervisorFrameEvent::Terminal) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "supervisor frame follows TERMINAL",
+            ));
         }
     }
     Ok(terminal)
@@ -2708,6 +2716,7 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
         capture_stderr: false,
         max_capture_bytes: None,
         features: request.features,
+        extensions: None,
     };
     let runtime_result = {
         let _user_execution = ExecutionTiming::disabled().span(Phase::UserExecution);
@@ -2827,6 +2836,7 @@ mod tests {
     use super::active_handshake_writers;
     use super::active_subprocess_output_readers;
     use super::drain_pipe;
+    use super::drain_queued_output;
     use super::reserve_handshake_writer;
     use super::reserve_subprocess_output_reader;
     use super::token_matches;
@@ -2837,6 +2847,7 @@ mod tests {
     use super::SubprocessOutputReader;
     use super::SubprocessOutputReaderMessage;
     use super::SubprocessOutputReaders;
+    use super::SubprocessOutputStream;
     use super::MAX_ACTIVE_HANDSHAKE_WRITERS;
     use super::MAX_CHILD_REQUEST_BYTES;
     #[cfg(feature = "execution-control")]
@@ -2855,6 +2866,8 @@ mod tests {
         SupervisorTerminalReadContext,
     };
     #[cfg(feature = "execution-control")]
+    use crate::limits::CancellationContext;
+    #[cfg(feature = "execution-control")]
     use crate::supervisor::{
         prepare_supervisor_stream, read_frame, write_frame, CancelReason, FrameDirection,
         FrameKind, SupervisorFailureCategory, SupervisorFrame, SupervisorOutcome, SupervisorToken,
@@ -2869,6 +2882,200 @@ mod tests {
     static HANDSHAKE_WRITER_BUDGET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static SUBPROCESS_OUTPUT_READER_BUDGET_TEST_LOCK: std::sync::Mutex<()> =
         std::sync::Mutex::new(());
+
+    #[cfg(feature = "execution-control")]
+    fn terminal_test_state() -> std::sync::Arc<std::sync::Mutex<SupervisorParentSession>> {
+        let token = SupervisorToken::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let mut state = SupervisorParentSession::new(1);
+        state
+            .accept_hello(
+                &SupervisorFrame::new(FrameKind::Hello, 0, token.as_bytes().to_vec()).unwrap(),
+                &token,
+            )
+            .unwrap();
+        state.send_request().unwrap();
+        state
+            .receive_child_frame(&SupervisorFrame::new(FrameKind::Accepted, 1, Vec::new()).unwrap())
+            .unwrap();
+        state.send_start().unwrap();
+        state
+            .receive_child_frame(&SupervisorFrame::new(FrameKind::Started, 1, Vec::new()).unwrap())
+            .unwrap();
+        std::sync::Arc::new(std::sync::Mutex::new(state))
+    }
+
+    #[cfg(feature = "execution-control")]
+    fn completed_test_terminal() -> SupervisorTerminal {
+        SupervisorTerminal {
+            outcome: SupervisorOutcome::Completed,
+            exit_code: Some(0),
+            category: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    #[cfg(feature = "execution-control")]
+    fn read_test_terminal(
+        stream: &mut std::net::TcpStream,
+        state: &std::sync::Arc<std::sync::Mutex<SupervisorParentSession>>,
+    ) -> std::io::Result<SupervisorTerminal> {
+        let cancellation =
+            SupervisorCancellation::new(CancellationContext::new(), CancelReason::User);
+        read_supervisor_terminal(
+            stream,
+            SupervisorTerminalReadContext {
+                state,
+                effective_deadline: None,
+                started_phase_deadline: Instant::now() + Duration::from_secs(2),
+                cancel_grace_deadline: None,
+                cancellation: &cancellation,
+                read_cancellation: None,
+                on_started: None,
+            },
+        )
+    }
+
+    #[cfg(feature = "execution-control")]
+    fn terminal_fixture(
+        send: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
+    ) -> std::io::Result<SupervisorTerminal> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            prepare_supervisor_stream(&stream).unwrap();
+            send(&mut stream);
+            let _ = done_rx.recv_timeout(Duration::from_secs(2));
+        });
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        prepare_supervisor_stream(&stream).unwrap();
+        let result = read_test_terminal(&mut stream, &terminal_test_state());
+        let _ = done_tx.send(());
+        peer.join().unwrap();
+        result
+    }
+
+    #[cfg(feature = "execution-control")]
+    fn terminal_frame(terminal: &SupervisorTerminal) -> SupervisorFrame {
+        SupervisorFrame::new(FrameKind::Terminal, 1, encode_payload(terminal).unwrap()).unwrap()
+    }
+
+    #[cfg(feature = "execution-control")]
+    fn terminal_wire(frame: &SupervisorFrame) -> Vec<u8> {
+        let mut wire = b"LDSV".to_vec();
+        wire.extend_from_slice(&[SUPERVISOR_VERSION, 7]);
+        wire.extend_from_slice(&frame.request_id.to_be_bytes());
+        wire.extend_from_slice(&(frame.payload.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&frame.payload);
+        wire
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn terminal_duplicate_protocol_accepts_only_identical_complete_frames() {
+        let terminal = completed_test_terminal();
+        let frame = terminal_frame(&terminal);
+        let expected = terminal.clone();
+        let result = terminal_fixture(move |stream| {
+            write_frame(stream, &frame).unwrap();
+            write_frame(stream, &frame).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        })
+        .unwrap();
+        assert_eq!(result, expected);
+
+        let first = terminal_frame(&terminal);
+        let mut conflict = terminal;
+        conflict.stdout.push(b'x');
+        let conflict = terminal_frame(&conflict);
+        let error = terminal_fixture(move |stream| {
+            write_frame(stream, &first).unwrap();
+            write_frame(stream, &conflict).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let terminal = terminal_frame(&completed_test_terminal());
+        let other = SupervisorFrame::new(FrameKind::Started, 1, Vec::new()).unwrap();
+        let error = terminal_fixture(move |stream| {
+            write_frame(stream, &terminal).unwrap();
+            write_frame(stream, &other).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn terminal_no_tail_timeout_is_bounded_and_partial_tail_is_invalid() {
+        use std::io::Write;
+        let terminal = completed_test_terminal();
+        let frame = terminal_frame(&terminal);
+        let expected = terminal.clone();
+        assert_eq!(
+            terminal_fixture(move |stream| {
+                write_frame(stream, &frame).unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+            })
+            .unwrap(),
+            expected
+        );
+
+        let terminal = completed_test_terminal();
+        let frame = terminal_frame(&terminal);
+        let started = Instant::now();
+        let result = terminal_fixture(move |stream| write_frame(stream, &frame).unwrap()).unwrap();
+        assert_eq!(result, terminal);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_millis(300));
+
+        let terminal = terminal_frame(&completed_test_terminal());
+        let started = Instant::now();
+        let error = terminal_fixture(move |stream| {
+            write_frame(stream, &terminal).unwrap();
+            stream.write_all(b"L").unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(started.elapsed() < Duration::from_millis(300));
+
+        let first = terminal_frame(&completed_test_terminal());
+        let error = terminal_fixture(move |stream| {
+            write_frame(stream, &first).unwrap();
+            stream.write_all(b"LDSV\x02\x07\0").unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let first = terminal_frame(&completed_test_terminal());
+        let partial = terminal_wire(&terminal_frame(&completed_test_terminal()));
+        let error = terminal_fixture(move |stream| {
+            write_frame(stream, &first).unwrap();
+            stream.write_all(&partial[..partial.len() - 1]).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn duplicate_terminal_frames_share_one_partial_frame_deadline() {
+        use std::io::Write;
+        let frame = terminal_frame(&completed_test_terminal());
+        let started = Instant::now();
+        let error = terminal_fixture(move |stream| {
+            write_frame(stream, &frame).unwrap();
+            write_frame(stream, &frame).unwrap();
+            std::thread::sleep(Duration::from_millis(70));
+            stream.write_all(b"L").unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(started.elapsed() < Duration::from_millis(160));
+    }
 
     #[test]
     fn child_request_size_accepts_small_payload() {
@@ -2941,6 +3148,86 @@ mod tests {
         let error = capture.error.unwrap();
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert!(error.to_string().contains("synthetic pipe failure"));
+    }
+
+    #[test]
+    fn supervised_deadline_drain_keeps_queued_blocks_and_terminal_state() {
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        for (tx, a, b) in [
+            (&out_tx, b"out-a".to_vec(), b"out-b".to_vec()),
+            (&err_tx, b"err-a".to_vec(), b"err-b".to_vec()),
+        ] {
+            tx.send(SubprocessOutputReaderMessage::Data(a)).unwrap();
+            tx.send(SubprocessOutputReaderMessage::Data(b)).unwrap();
+            tx.send(SubprocessOutputReaderMessage::Finished).unwrap();
+        }
+        let stream = |receiver: std::sync::mpsc::Receiver<SubprocessOutputReaderMessage>,
+                      name: &'static str| SubprocessOutputStream {
+            receiver,
+            overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            name,
+            output: Vec::new(),
+            error: None,
+            done: false,
+        };
+        let mut streams = [
+            Some(stream(out_rx, "stdout")),
+            Some(stream(err_rx, "stderr")),
+        ];
+        drain_queued_output(&mut streams);
+        assert_eq!(streams[0].as_ref().unwrap().output, b"out-aout-b");
+        assert_eq!(streams[1].as_ref().unwrap().output, b"err-aerr-b");
+        assert!(streams
+            .iter()
+            .flatten()
+            .all(|stream| stream.done && stream.error.is_none()));
+    }
+
+    #[test]
+    fn supervised_deadline_drain_preserves_incomplete_and_reader_failure() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(SubprocessOutputReaderMessage::Data(b"A".to_vec()))
+            .unwrap();
+        tx.send(SubprocessOutputReaderMessage::Data(b"B".to_vec()))
+            .unwrap();
+        let reader = super::SubprocessOutputReader {
+            receiver: rx,
+            overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let capture = SubprocessOutputReaders {
+            stdout: Some(reader),
+            stderr: None,
+        }
+        .collect(Some(std::time::Instant::now()));
+        assert_eq!(capture.stdout, b"AB");
+        assert!(capture.incomplete && capture.deadline_won && !capture.reader_error);
+        drop(tx);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(SubprocessOutputReaderMessage::Data(b"A".to_vec()))
+            .unwrap();
+        tx.send(SubprocessOutputReaderMessage::Failed(
+            std::io::Error::other("synthetic failure"),
+        ))
+        .unwrap();
+        let reader = super::SubprocessOutputReader {
+            receiver: rx,
+            overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let capture = SubprocessOutputReaders {
+            stdout: Some(reader),
+            stderr: None,
+        }
+        .collect(Some(std::time::Instant::now()));
+        assert!(
+            capture.reader_error
+                && capture
+                    .error
+                    .unwrap()
+                    .to_string()
+                    .contains("synthetic failure")
+        );
     }
 
     #[test]

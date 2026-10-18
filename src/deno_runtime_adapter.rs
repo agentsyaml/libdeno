@@ -121,14 +121,14 @@ pub(crate) fn build_main_worker(
         fetch_dns_resolver: deno_runtime::deno_fetch::dns::Resolver::default(),
         shared_array_buffer_store: None,
         compiled_wasm_module_store: None,
-        // In-process V8 code cache, keyed by specifier + source hash (limits.rs).
-        v8_code_cache: Some(crate::limits::in_process_code_cache()),
+        // Deno's eval-context source hash collides for long CJS scripts.
+        v8_code_cache: None,
         bundle_provider: None,
     };
 
     // Must match deno_runtime's release tag: scripts feature-detect
-    // Deno.version.deno. deno_runtime 0.265.0 == Deno v2.9.5.
-    const DENO_VERSION: &str = "2.9.5";
+    // Deno.version.deno. deno_runtime 0.267.0 == Deno v2.9.7.
+    const DENO_VERSION: &str = "2.9.7";
 
     let main_bootstrap = BootstrapOptions {
         deno_version: DENO_VERSION.to_string(),
@@ -152,18 +152,31 @@ pub(crate) fn build_main_worker(
         create_web_worker_factory(
             blob_store,
             broadcast_channel,
-            feature_checker,
+            feature_checker.clone(),
             worker_fs,
             services.clone(),
             MainInspectorSessionChannel::default(),
             main_bootstrap.clone(),
             options.max_heap_bytes,
+            options.extensions.clone(),
+            0,
         )?;
 
     let worker_options = WorkerOptions {
         bootstrap: main_bootstrap,
         create_web_worker_cb,
-        extensions: vec![],
+        extensions: {
+            let mut extensions = crate::runtime_guards::extensions(
+                feature_checker.clone(),
+                services.thread_messaging.clone(),
+                services.worker_lifecycle.clone(),
+                None,
+            );
+            if let Some(factory) = &options.extensions {
+                extensions.extend(factory.create());
+            }
+            extensions
+        },
         startup_snapshot: Some(crate::STARTUP_SNAPSHOT),
         residual_lazy_js_sources: crate::RESIDUAL_LAZY_JS,
         residual_lazy_esm_sources: crate::RESIDUAL_LAZY_ESM,

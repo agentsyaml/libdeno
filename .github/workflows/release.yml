@@ -286,11 +286,15 @@ jobs:
 
       - name: Audit root lockfile
         working-directory: source
-        run: cargo audit --deny warnings
+        run: python ../control/.github/workflows/audit-with-temporary-rustls-exceptions.py Cargo.lock
 
       - name: Audit Python lockfile
         working-directory: source
-        run: cargo audit --file python/Cargo.lock --deny warnings
+        run: python ../control/.github/workflows/audit-with-temporary-rustls-exceptions.py python/Cargo.lock
+
+      - name: Test temporary audit exception
+        working-directory: control
+        run: python .github/workflows/test_audit_temporary_rustls_exceptions.py
 
   python-build:
     name: build Python wheels

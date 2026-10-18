@@ -5,18 +5,15 @@ libdeno.
 
 ## Prerequisites
 
-- Rust toolchain (edition 2021). A recent stable toolchain is required to
-  build the Deno dependency stack.
-- Linux / macOS / Windows. Windows support is intended; release validation for
-  the current in-progress changes still requires a real Windows runner (the
-  local SDK check may not be available).
+- A recent stable Rust toolchain (edition 2021).
+- Linux, macOS, or Windows.
 - Network access on the first build (crates.io) and, at runtime, whenever a
   remote module or npm package needs to be fetched.
 
 ## Build the demo
 
-The first build is the slow one: `build.rs` compiles a V8 snapshot and the
-full Deno dependency tree is compiled. Subsequent builds are incremental.
+The first build compiles V8 and the Deno dependency tree. Later builds are
+incremental.
 
 ```bash
 cargo build --example demo
@@ -71,16 +68,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `run` blocks until the script finishes and returns the exit code the script
-requested. Each call builds its own current-thread tokio runtime and worker,
-so multiple invocations are fully independent.
+requested. Each call gets a fresh worker and module graph; independent runs can
+execute in parallel.
 
 ## Platform notes
 
-Windows supports the Rust main API and the subprocess execution paths.
-In-process output capture is the exception: fd-level capture is not supported on
-Windows because Rust's standard output handles bypass the redirected CRT fd.
-Use `run_in_subprocess_with_output` for per-process stdout/stderr capture; its
-child pipes are supported on Windows.
+In-process output capture is not supported on Windows. Use
+`run_in_subprocess_with_output` to capture a child's stdout and stderr.
 
 ## Entry resolution
 
@@ -93,29 +87,19 @@ child pipes are supported on Windows.
 | `./my-app/package.json` | The package itself; `main` field is used. |
 
 Relative paths resolve against `LibdenoOptions.cwd`, which defaults to the
-process current directory.
-
-Since v0.3.0 `cwd` is a **resolution base only**: the process cwd is never
-switched, so the script itself observes the host's cwd — `Deno.cwd()` and
-relative filesystem operations inside the script resolve against the host
-process's cwd, not `options.cwd`. Scripts that need a specific working
-directory should use absolute paths, or run through `run_in_subprocess` /
-`run_in_subprocess_with_output`, where the child's cwd is pinned at spawn.
+process current directory. In-process runs do not change the host process cwd;
+the script sees that host cwd through `Deno.cwd()`. Use absolute paths or a
+subprocess API when the script needs a different process cwd.
 
 ## Writing your own host binary
 
-The demo host doubles as the napi symbol carrier for `.node` native addons
-(see `build.rs`). A real host must export the same symbols; in your own
-`build.rs`:
+For `.node` native addons, your host must export the N-API symbols:
 
 ```rust
 fn main() {
   deno_napi::print_linker_flags("<your-host-binary-name>");
 }
 ```
-
-The dev-only `.cargo/config.toml` in this repository does this via rustflags
-so `cargo run --example demo` works out of the box.
 
 ## Next steps
 

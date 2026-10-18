@@ -1,9 +1,7 @@
 # npm & Module Resolution
 
 libdeno composes the official Deno module-graph and resolver crates for
-`npm:`, `jsr:`, remote modules, import maps, CJS packages, WASM, and JSON.
-These crate-provided features do not imply complete Deno CLI loader behavior
-equivalence; the supported behavior and boundaries are described below.
+`npm:`, `jsr:`, remote modules, import maps, CJS, WASM, and JSON imports.
 
 ## Optional `npm` Cargo feature
 
@@ -16,126 +14,58 @@ default = ["snapshot", "npm"]
 npm = ["dep:deno_npm_installer", "dep:deno_npm_cache"]
 ```
 
-Building with `--no-default-features --features snapshot` removes
-`deno_npm_installer` and `deno_npm_cache` (and the npm lifecycle-script
-executor) from the dependency graph. In such a build, `npm:` imports fail with
-a clear `npm support is disabled in this build (enable the \`npm\` feature)`
-error instead of attempting an install.
-
-The same clear error covers a **managed** project with the feature off: a
-`package.json` dependency imported by bare specifier (`import chalk from
-"chalk"`) is rewritten by the resolver to `npm:chalk@5` and then rejected by
-`GraphResolver::resolve_pkg_reqs` with the message above, even though
-`initialize_npm_resolution_if_managed` never runs. A bare specifier that is *not*
-in `package.json` keeps the accurate `Import "x" not a dependency` error
-instead — with npm compiled out there is nothing it could resolve to, but
-blaming npm there would be wrong (deno does not auto-add undeclared
-dependencies with npm support enabled either).
-
-Caveats:
-
-- `deno_npm` and `deno_npmrc` are unconditional `deno_resolver` dependencies and
-  cannot be removed; `node_modules` / BYONM resolution keeps working.
-- This is a dependency / compile-surface reduction, not a binary-size win — the
-  statically linked V8 runtime dominates binary size.
-- Consumers building with `default-features = false` must add `"npm"` to keep
-  `npm:` install support.
+Build with `--no-default-features --features snapshot` to omit managed npm
+installation. In that build, `npm:` imports fail; bare imports from a local
+`node_modules` tree still work in `manual` mode. Add `npm` to
+`default-features = false` builds to enable managed installs.
 
 ## npm modes
 
-The configured `nodeModulesDir` mode is respected: `manual` uses the local
-`node_modules` tree, `auto` uses managed npm resolution, and `none` disables
-`node_modules` handling. JSON `null` means no mode was configured; it is not a
-mode value. Merely having a `node_modules` directory does not
-select BYONM. When no mode is configured, libdeno preserves its managed `Auto`
-default; the first run of `examples/demo-app/index.js` installs `chalk` into
-`examples/demo-app/node_modules`.
+`nodeModulesDir` selects `manual` (use local `node_modules`), `auto` (managed
+resolution), or `none` (disable `node_modules`). Without a setting, libdeno uses
+managed `auto`; an existing `node_modules` directory does not select `manual`.
 
-When building without the `npm` Cargo feature, configure
-`deno.json` as `{"nodeModulesDir":"manual"}` to use an existing local
-dependency tree. A missing package is a local resolution error; there is no
-automatic installer. Unconfigured projects remain in managed `auto` mode, and
-declared npm dependencies require the `npm` feature.
-
-npm lifecycle scripts (`preinstall`/`install`/`postinstall`) are currently
-disabled. There is no claim that an explicit opt-in causes them to run through
-the system shell. Packages that need a build step at install time (e.g.
-`esbuild`) will not work out of the box.
-
-The npm resolution snapshot is initialized before the module graph starts
-requesting packages
-(`initialize_npm_resolution_if_managed`).
-
-When present, `deno.lock` is read as resolver input. Available checksums and
-integrity data are checked, and frozen-lockfile settings reject changes.
-Without frozen mode, a lockfile change is not necessarily an error. libdeno
-always skips lockfile writes and never persists updates.
+If present, `deno.lock` supplies and validates npm checksums. Frozen mode rejects
+changes; libdeno never writes lockfile updates.
 
 ## Bare imports vs `npm:` specifiers
 
-- **Bare imports** (`import chalk from "chalk"`): resolved by the node
-  resolver against `package.json` dependencies, then loaded from the
-  installed package.
-- **`npm:` specifiers** (`import chalk from "npm:chalk@5"`): pass through the
-  module loader and are resolved to the installed package file
-  (`resolve_non_workspace_npm_req_ref_to_file`), with the npm: URL registered
-  as a redirect alias for the concrete file URL.
+- **Bare imports** (`import chalk from "chalk"`) resolve package names from
+  `package.json` dependencies.
+- **`npm:` imports** (`import chalk from "npm:chalk@5"`) select a package
+  version directly.
 
 ## CJS support
 
-- CJS packages are detected via the official CJS tracker, which is
-  `package.json` `"type"` aware. User files outside npm packages are treated
-  as ESM (`IsCjsResolutionMode::Disabled` — the CLI default; only `deno node`
-  enables implicit CJS).
-- CJS→ESM translation is enabled in the module loader
-  (`NodeCodeTranslatorMode::ModuleLoader`).
-- `require()` chains inside CJS modules that reference further CJS files are
-  analyzed with `FsCjsAnalysisSourceProvider` (recursive CJS analysis).
+- npm packages use package.json `"type"` to detect CJS and load through the
+  CJS-to-ESM translator. Files outside npm packages default to ESM.
+- Recursive `require()` chains inside CJS packages are analyzed.
 
 ## Lifecycle scripts
 
-Lifecycle execution is currently fixed disabled. This documentation does not
-promise system-shell execution, lifecycle environment variables, or lifecycle
-child supervision.
+Lifecycle scripts are disabled.
 
 ## `child_process.fork`
 
-The npm process-state provider serializes the current resolution snapshot (or
-BYONM marker and `node_modules` path) for deno_process's private inherited state
-file descriptor/handle, exposed through
-`DENO_DONT_USE_INTERNAL_NODE_COMPAT_STATE_FD`. This is separate from Node's
-`NODE_CHANNEL_FD` IPC channel. This release has no trusted child-startup
-receiver that adopts and restores the inherited state, so automatic npm
-snapshot restoration in forked children is unsupported. libdeno does not read,
-seek, adopt, or close an unknown inherited state descriptor/handle. A fork
-child may still resolve packages from its local `node_modules` or lockfile;
-that is ordinary resolution, not proof that the inherited snapshot was
-restored. Node IPC is separate: fork hosts that need `NODE_CHANNEL_FD` must
-explicitly invoke unsafe `initialize_node_ipc_from_env()` during trusted startup,
-before creating threads. It claims a connected raw endpoint with exclusive
-ownership; an attempt is consumed even on error, and a claimed endpoint closes
-on later validation failure. Ordinary `run()` neither changes the marker nor
-automatically claims a live channel. Do not supply untrusted environment input
-as authority for raw handle adoption. See
-[the API contract](api.md#initialize_node_ipc_from_env). Supporting npm-state
-restoration remains a separate host-owned startup handoff contract.
+Forked children do not restore deno_process's inherited npm snapshot. They may
+still resolve packages from local `node_modules` or `deno.lock`.
+`DENO_DONT_USE_INTERNAL_NODE_COMPAT_STATE_FD` is deno_process's private npm
+state handle; it is separate from Node's `NODE_CHANNEL_FD`.
+
+Hosts that need Node IPC must call unsafe
+`initialize_node_ipc_from_env()` during trusted startup, before creating
+threads, and transfer exclusive ownership of a valid connected raw handle.
+Initialization is one-shot, including failure; a claimed handle is closed if
+later validation fails. Ordinary `run()` does not inspect or claim the live
+environment channel. See the [API contract](api.md#initialize_node_ipc_from_env).
 
 ## Module graph
 
-- The main run owns a `ModuleGraph` (guarded by a mutex), built on demand:
-  `prepare_load` builds the tree rooted at the requested specifier;
-  `load` reads from it. Already-loaded specifiers are not rebuilt within that
-  graph. Each web worker has its own graph and permission-bound loader/fetcher;
-  workers share resolver and cache state, not the main worker's graph.
-- Graph building uses the official `deno_graph::ModuleGraph::build` with the
-  `GraphResolver` (resolver + npm resolver) and the `DenoGraphLoader` (file
-  fetcher).
-- Remote modules are fetched into the HTTP cache; redirects are handled by
-  the file fetcher (the HTTP client does not follow redirects).
-- Dynamic Blob imports use the run's Blob store. Blob-backed workers receive
-  their captured root Blob locally, so that root can finish loading after URL
-  revocation; revoked dependencies are not restored and the root is not
-  reintroduced into the shared Blob store for that run.
+The main run builds its module graph on demand. Each web worker has a separate
+graph and permission-bound loader; resolver and cache state are shared. Remote
+modules use the HTTP cache, with redirects handled by the file fetcher. Blob
+workers receive their root Blob for loading; revoked dependencies are not
+restored.
 
 ## JSON imports
 

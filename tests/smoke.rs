@@ -3,6 +3,8 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use libdeno::{run, run_source, LibdenoOptions, SourceLang};
 
@@ -1569,12 +1571,32 @@ fn missing_host_exe_returns_io_error() {
 
 #[test]
 fn prompt_denies_outside_grants_without_a_terminal() {
-    // prompt: true asks interactively only when stdin AND stderr are
-    // terminals. Under cargo test both are pipes, so the prompter must deny
-    // immediately (no blocking stdin read, no deadlock) and the run must fail
-    // with a NotCapable error — the fail-closed headless behavior.
+    const CHILD: &str = "LIBDENO_PROMPT_NON_TTY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("prompt_denies_outside_grants_without_a_terminal")
+            .env(CHILD, "1")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "non-tty child failed: {status}");
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("non-tty prompt test child timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     // The entry sits inside the grant so the module load passes; the runtime
-    // read of /etc/hostname (outside the grant) is the Prompt-state check.
+    // read of /etc/hostname (outside the grant) must be denied.
     let dir = temp_dir("prompt");
     let entry = dir.join("main.js");
     fs::write(&entry, "Deno.readTextFileSync('/etc/hostname');").unwrap();

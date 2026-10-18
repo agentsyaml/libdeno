@@ -236,6 +236,19 @@ class ApiTests(unittest.TestCase):
         with self.assertRaises(libdeno.DenoRuntimeError):
             libdeno.run(permission_marker, allow_all_permissions=True)
 
+    def test_deadline_conversion_is_configuration_error_for_both_entrypoints(self):
+        missing = self.root / "missing.js"
+        runtime = libdeno.Runtime(self.root)
+        invalid = (10**400, -(10**400), 1e100, float("inf"), float("nan"), -0.1)
+        for binding in (libdeno.run, runtime.run):
+            for deadline in invalid:
+                with self.subTest(binding=binding, deadline=deadline):
+                    with self.assertRaises(libdeno.ConfigurationError):
+                        binding(missing, execution_deadline=deadline)
+        entry = self.write("deadline.js", "const ok = true;")
+        self.assertEqual(libdeno.run(entry, allow_all_permissions=True, execution_deadline=1), 0)
+        self.assertEqual(runtime.run(entry, allow_all_permissions=True, execution_deadline=0.1), 0)
+
     def test_invalid_heap_size_numbers_raise_configuration_error(self):
         entry = self.write("heap.js", "while (true) {}")
         runtime = libdeno.Runtime(self.root)

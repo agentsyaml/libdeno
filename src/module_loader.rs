@@ -30,9 +30,13 @@ use deno_core::ModuleType;
 use deno_core::RequestedModuleType;
 use deno_core::ResolutionKind;
 use deno_error::JsErrorBox;
+use deno_graph::source::HashMapLocker;
+use deno_graph::source::LoaderChecksum;
+use deno_graph::source::Locker;
 use deno_graph::BuildOptions;
 use deno_graph::CheckJsOption;
 use deno_graph::GraphKind;
+#[cfg(test)]
 use deno_graph::ModuleEntryRef;
 use deno_graph::ModuleGraph;
 use deno_graph::WalkOptions;
@@ -40,12 +44,15 @@ use deno_media_type::MediaType;
 use deno_resolver::loader::LoadedModuleOrAsset;
 use deno_resolver::loader::LoadedModuleSource;
 use deno_resolver::loader::RequestedModuleType as ResolverRequestedModuleType;
+use deno_semver::package::PackageNv;
+use node_resolver::InNpmPackageChecker;
 use node_resolver::NodeResolutionKind;
 use node_resolver::ResolutionMode;
 use url::Url;
 
 use deno_runtime::deno_permissions::PermissionsContainer;
 
+use crate::graph::GraphResolver;
 use crate::node_loader::FsCjsAnalysisSourceProvider;
 use crate::services::{RealFileFetcher, RealGraphLoader, RuntimeServices, SharedServices};
 use crate::timing::{ExecutionTiming, Phase};
@@ -61,10 +68,72 @@ pub struct GraphModuleLoader {
     graph: Arc<tokio::sync::Mutex<ModuleGraph>>,
     /// Canonical runtime cwd used when deno_core supplies no referrer.
     cwd: PathBuf,
+    /// Cancels graph preloads when the owning runtime shuts down.
+    lifecycle_closing: tokio::sync::watch::Receiver<bool>,
     /// Live permissions container (shallow clone) used for permission-gated
     /// reads during CJS analysis — revocations stay honored; do NOT deep-clone.
     permissions: PermissionsContainer,
     timing: ExecutionTiming,
+}
+
+struct FrozenGraphLocker<'a> {
+    lockfile: &'a deno_resolver::lockfile::LockfileLock<sys_traits::impls::RealSys>,
+    changes: HashMapLocker,
+    changed: bool,
+}
+
+impl<'a> FrozenGraphLocker<'a> {
+    fn new(
+        lockfile: &'a deno_resolver::lockfile::LockfileLock<sys_traits::impls::RealSys>,
+    ) -> Self {
+        Self {
+            lockfile,
+            changes: HashMapLocker::default(),
+            changed: false,
+        }
+    }
+
+    fn has_changes(&self) -> bool {
+        self.changed
+    }
+}
+
+impl Locker for FrozenGraphLocker<'_> {
+    fn get_remote_checksum(&self, specifier: &ModuleSpecifier) -> Option<LoaderChecksum> {
+        self.changes.get_remote_checksum(specifier).or_else(|| {
+            self.lockfile
+                .as_deno_graph_locker()
+                .get_remote_checksum(specifier)
+        })
+    }
+
+    fn has_remote_checksum(&self, specifier: &ModuleSpecifier) -> bool {
+        self.get_remote_checksum(specifier).is_some()
+    }
+
+    fn set_remote_checksum(&mut self, specifier: &ModuleSpecifier, checksum: LoaderChecksum) {
+        if self.get_remote_checksum(specifier).as_ref() != Some(&checksum) {
+            self.changed = true;
+        }
+        self.changes.set_remote_checksum(specifier, checksum);
+    }
+
+    fn get_pkg_manifest_checksum(&self, package_nv: &PackageNv) -> Option<LoaderChecksum> {
+        self.changes
+            .get_pkg_manifest_checksum(package_nv)
+            .or_else(|| {
+                self.lockfile
+                    .as_deno_graph_locker()
+                    .get_pkg_manifest_checksum(package_nv)
+            })
+    }
+
+    fn set_pkg_manifest_checksum(&mut self, package_nv: &PackageNv, checksum: LoaderChecksum) {
+        if self.get_pkg_manifest_checksum(package_nv).as_ref() != Some(&checksum) {
+            self.changed = true;
+        }
+        self.changes.set_pkg_manifest_checksum(package_nv, checksum);
+    }
 }
 
 struct RuntimeJsrUrlProvider<'a>(&'a Url);
@@ -148,6 +217,7 @@ impl GraphModuleLoader {
             graph_loader,
             graph,
             cwd,
+            lifecycle_closing: runtime.worker_lifecycle.closing_signal(),
             permissions,
             timing: runtime.timing.clone(),
         }
@@ -187,13 +257,29 @@ impl GraphModuleLoader {
             }
         }
 
-        // jsr: and npm: specifiers are handled by the graph; pass them through.
-        if specifier.starts_with("jsr:") || specifier.starts_with("npm:") {
-            return ModuleSpecifier::parse(specifier)
-                .map_err(|e| JsErrorBox::generic(format!("Invalid module specifier: {e}")));
-        }
-
         let referrer_url = Self::resolve_referrer(referrer, &self.cwd)?;
+
+        let is_graph_scheme = specifier.starts_with("npm:") || specifier.starts_with("jsr:");
+        let is_managed_npm_package = if is_graph_scheme {
+            self.shared
+                .resolver_factory
+                .npm_resolver()
+                .map_err(|error| JsErrorBox::generic(error.to_string()))?
+                .is_managed()
+                && self
+                    .shared
+                    .resolver_factory
+                    .in_npm_package_checker()
+                    .map_err(|error| JsErrorBox::generic(error.to_string()))?
+                    .in_npm_package(&referrer_url)
+        } else {
+            false
+        };
+        if is_managed_npm_package {
+            return ModuleSpecifier::parse(specifier).map_err(|error| {
+                JsErrorBox::generic(format!("Invalid module specifier: {error}"))
+            });
+        }
 
         let mode = ResolutionMode::Import;
 
@@ -211,6 +297,17 @@ impl GraphModuleLoader {
             Self::normalize_node_builtin(resolved)
         } else {
             Ok(resolved)
+        }
+    }
+}
+
+async fn wait_for_lifecycle_close(mut closing: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *closing.borrow_and_update() {
+            return;
+        }
+        if closing.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -237,19 +334,25 @@ impl ModuleLoader for GraphModuleLoader {
         let graph = self.graph.clone();
         let specifier = module_specifier.clone();
         let timing = self.timing.clone();
+        let lifecycle_closing = self.lifecycle_closing.clone();
         Box::pin(async move {
             if matches!(specifier.scheme(), "node") {
                 Self::validate_node_builtin_identity(&specifier)?;
                 return Ok(());
             }
-            build_graph(
-                &services,
-                graph_loader.as_ref(),
-                &graph,
-                &specifier,
-                &timing,
-            )
-            .await
+            tokio::select! {
+                biased;
+                _ = wait_for_lifecycle_close(lifecycle_closing) => Err(JsErrorBox::generic(
+                    "module graph load cancelled during runtime shutdown",
+                )),
+                result = build_graph(
+                    &services,
+                    graph_loader.as_ref(),
+                    &graph,
+                    &specifier,
+                    &timing,
+                ) => result,
+            }
         })
     }
 
@@ -431,10 +534,6 @@ async fn build_graph_with_npm_resolver(
     npm_resolver: &dyn deno_graph::source::NpmResolver,
 ) -> Result<(), JsErrorBox> {
     let _graph_build = timing.span(Phase::GraphBuild);
-    let jsr_version_resolver = shared
-        .resolver_factory
-        .jsr_version_resolver()
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
     let jsr_url_provider = RuntimeJsrUrlProvider(&shared.jsr_url);
     let graph_resolver = shared.graph_resolver.clone();
     // ponytail: the graph lock covers the whole build below, including the
@@ -448,9 +547,50 @@ async fn build_graph_with_npm_resolver(
     // serializes concurrent builds of *other* roots; revisit only if deno_graph
     // gains a lock-free incremental build API.
     let mut graph = graph.lock().await;
+    if shared.frozen_lockfile {
+        let mut candidate = graph.clone();
+        build_graph_attempt(
+            shared,
+            graph_loader,
+            &mut candidate,
+            specifier,
+            npm_resolver,
+            &jsr_url_provider,
+            &graph_resolver,
+        )
+        .await?;
+        *graph = candidate;
+    } else {
+        build_graph_attempt(
+            shared,
+            graph_loader,
+            &mut graph,
+            specifier,
+            npm_resolver,
+            &jsr_url_provider,
+            &graph_resolver,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn build_graph_attempt(
+    shared: &SharedServices,
+    graph_loader: &dyn deno_graph::source::Loader,
+    graph: &mut ModuleGraph,
+    specifier: &ModuleSpecifier,
+    npm_resolver: &dyn deno_graph::source::NpmResolver,
+    jsr_url_provider: &dyn deno_graph::source::JsrUrlProvider,
+    graph_resolver: &GraphResolver,
+) -> Result<(), JsErrorBox> {
+    let jsr_version_resolver = shared
+        .resolver_factory
+        .jsr_version_resolver()
+        .map_err(|error| JsErrorBox::generic(error.to_string()))?;
     let lockfile = shared.lockfile.as_ref();
     if let Some(lockfile) = lockfile {
-        lockfile.fill_graph(&mut graph);
+        lockfile.fill_graph(graph);
         lockfile
             .error_if_changed()
             .map_err(|error| JsErrorBox::generic(error.to_string()))?;
@@ -465,7 +605,7 @@ async fn build_graph_with_npm_resolver(
     // taking the shortcut; a failure falls through to a fresh build/retry.
     if graph.get(specifier).is_some() {
         let failed = graph.module_errors().any(|e| e.specifier() == specifier);
-        if !failed && validate_root(&graph, specifier).is_ok() {
+        if !failed && validate_root(graph, specifier).is_ok() {
             if let Some(lockfile) = lockfile {
                 lockfile
                     .error_if_changed()
@@ -475,27 +615,37 @@ async fn build_graph_with_npm_resolver(
         }
     }
 
-    let mut locker = lockfile.map(|lockfile| lockfile.as_deno_graph_locker());
-    let options = BuildOptions {
+    let mut locker = lockfile
+        .filter(|_| !shared.frozen_lockfile)
+        .map(|lockfile| lockfile.as_deno_graph_locker());
+    let mut frozen_locker = lockfile
+        .filter(|_| shared.frozen_lockfile)
+        .map(|lockfile| FrozenGraphLocker::new(lockfile.as_ref()));
+    let build_options = BuildOptions {
         is_dynamic: false,
         skip_dynamic_deps: false,
         unstable_bytes_imports: false,
-        unstable_text_imports: false,
         unstable_css_imports: false,
         unstable_config_imports: false,
         executor: Default::default(),
-        locker: locker
+        locker: frozen_locker
             .as_mut()
-            .map(|locker| locker as &mut dyn deno_graph::source::Locker),
+            .map(|locker| locker as &mut dyn deno_graph::source::Locker)
+            .or_else(|| {
+                locker
+                    .as_mut()
+                    .map(|locker| locker as &mut dyn deno_graph::source::Locker)
+            }),
         file_system: &shared.sys,
-        jsr_url_provider: &jsr_url_provider,
+        jsr_url_provider,
         jsr_version_resolver: Cow::Borrowed(&**jsr_version_resolver),
         passthrough_jsr_specifiers: false,
+        prefer_cached_jsr_versions: false,
         module_analyzer: &*shared.module_info_cache,
         module_info_cacher: &*shared.module_info_cache,
         npm_resolver: Some(npm_resolver),
         reporter: None,
-        resolver: Some(&*graph_resolver),
+        resolver: Some(graph_resolver),
         jsr_metadata_store: None,
     };
     let mut retry = vec![specifier.clone()];
@@ -510,17 +660,15 @@ async fn build_graph_with_npm_resolver(
                     prefer_fast_check_graph: false,
                 },
             )
-            .filter(|(_, entry)| matches!(entry, ModuleEntryRef::Err(_)))
-            .map(|(url, _)| url.clone()),
+            .errors()
+            .filter_map(|error| match error {
+                deno_graph::ModuleGraphError::ModuleError(error) => Some(error.specifier().clone()),
+                deno_graph::ModuleGraphError::ResolutionError(error) => {
+                    Some(error.range().specifier.clone())
+                }
+                deno_graph::ModuleGraphError::TypesResolutionError(_) => None,
+            }),
     );
-    if graph.get(specifier).is_none() {
-        retry.extend(
-            graph
-                .module_errors()
-                .map(|e| e.specifier().clone())
-                .filter(|url| url == specifier),
-        );
-    }
     retry = retry
         .into_iter()
         .map(|url| graph.resolve(&url).clone())
@@ -531,10 +679,10 @@ async fn build_graph_with_npm_resolver(
         .iter()
         .any(|url| graph.get(url).is_some() || graph.module_errors().any(|e| e.specifier() == url))
     {
-        graph.reload(retry, graph_loader, options).await;
+        graph.reload(retry, graph_loader, build_options).await;
     } else {
         graph
-            .build(vec![specifier.clone()], vec![], graph_loader, options)
+            .build(vec![specifier.clone()], vec![], graph_loader, build_options)
             .await;
     }
 
@@ -542,7 +690,13 @@ async fn build_graph_with_npm_resolver(
     // instead of returning a Result. Validate only this root so unrelated
     // graph roots do not poison this prepare_load call. Keep the graph error
     // as the source error.
-    validate_root(&graph, specifier)?;
+    validate_root(graph, specifier)?;
+    if frozen_locker
+        .as_ref()
+        .is_some_and(FrozenGraphLocker::has_changes)
+    {
+        return Err(JsErrorBox::generic("frozen lockfile would change"));
+    }
     if let Some(lockfile) = lockfile {
         lockfile
             .error_if_changed()

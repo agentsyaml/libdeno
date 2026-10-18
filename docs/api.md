@@ -12,30 +12,15 @@ pub fn run(
 Runs `entry` (a file, a directory, or a `package.json`) to completion and
 returns the exit code the script requested (`0` on normal completion).
 
-Behavior notes:
+`run` blocks until the script and its event loop finish. Each call gets a fresh
+worker and module graph, so independent runs can execute in parallel. Calling
+`run` inside a tokio runtime is supported; libdeno runs it on a worker thread.
+Output capture is process-wide and exclusive; see [`run_with_output`].
 
-- Each call builds its own current-thread tokio runtime and worker. Ordinary
-  runs execute **in parallel** — each has its own thread, isolate, and graph,
-  sharing nothing mutable. The one exception: output capture (see below) is
-  exclusive, so a captured run rejects any overlapping run.
-- The call blocks until the script finishes (module execution + event loop +
-  lifecycle events: `load`, `beforeunload`, `unload`, `process.beforeExit`,
-  `process.exit`).
-- Since v0.2.0 a directory/`package.json` entry whose `main` field escapes
-  the package directory (absolute path, or `..` walking above it) is rejected
-  with `LibdenoError::Entry`; `..` that stays inside (e.g. `src/../lib/index.js`)
-  is still accepted.
-- Since v0.2.0 every remote module fetch is capped at 256 MiB regardless of
-  the declared `Content-Length`; the 1 GiB tier applies only to npm registry
-  (tarball) downloads.
-- Each HTTP operation has a 300-second wall-clock budget covering its retries,
-  backoff, redirects where applicable, and response-body reads. This transport
-  budget is separate from `execution_deadline`.
-- npm lifecycle scripts are currently disabled; there is no promise that a
-  system shell runs them by default.
-- Safe to call from inside a tokio runtime: the run executes on a fresh
-  thread (tokio forbids nested runtimes) and joins back. Same for
-  `run_with_output` and `run_with`.
+Directory and `package.json` entries resolve through their `main` field (or
+`index.js`). A `main` path that escapes the package directory is rejected.
+HTTP operations have a 300-second budget; this is separate from
+`execution_deadline`. npm lifecycle scripts are disabled by default.
 
 ## `run_with_output`
 
@@ -53,26 +38,15 @@ pub struct RunOutput {
 }
 ```
 
-If in-process capture does not observe EOF or reader disconnection within its
-500ms collection budget, the run returns `LibdenoError::Io` with
-`std::io::ErrorKind::TimedOut` and an `output capture incomplete` message rather
-than returning partial output as a success.
+Captures stdout/stderr selected by `capture_stdout` and `capture_stderr` into
+`RunOutput`. Capture redirects process file descriptors, so output from other
+host threads may also be captured. A captured run is exclusive; use
+`run_in_subprocess_with_output` to capture one child while other runs continue.
 
-Legacy subprocess capture also distinguishes incomplete pipe collection from
-successful byte truncation: if its collection deadline expires before EOF, it
-returns `LibdenoError::Io` with `ErrorKind::TimedOut`; `capture_truncated` only
-marks successful retention of a bounded prefix.
-
-Like `run`, but captures the script's stdout/stderr into `RunOutput` when
-`LibdenoOptions.capture_stdout` / `capture_stderr` are set. The capture is
-fd-level (deno_core's print op has no injectable writer), so `console.log`,
-`console.error`, `Deno.stderr.write` and direct fd writes all land in the
-buffer. Caveat: while captured, *other host threads* printing to stdout/stderr
-during the run are captured too. Capture is fd-level process-global
-redirection, so a captured run is **exclusive**: any overlapping run (captured
-or not) is rejected with `LibdenoError::Configuration`. For captured runs
-alongside parallel execution use `run_in_subprocess_with_output`, which pipes
-the child's own fds back to the parent.
+If capture ends before a pipe reaches EOF, the run returns a timed-out I/O
+error rather than reporting incomplete output as success. `capture_truncated`
+indicates that the output byte cap was reached; it is distinct from incomplete
+pipe collection.
 
 ## `run_source`
 
@@ -111,39 +85,16 @@ pub async fn run_source_with_output_async(
 ) -> Result<RunOutput, LibdenoError>
 ```
 
-Runs JS/TS **source held in memory** (`&str`, `String`, `&[u8]`, `Vec<u8>` —
-anything `AsRef<[u8]>`) without writing a temp file. The source is registered
-under a unique virtual `file:` URL inside `base_dir` and then flows through the
-normal module pipeline — graph build, TypeScript transpile, CJS, JSON,
-npm/remote imports — as a file-like module.
+Runs JS/TS bytes directly without a temporary file. `base_dir` must be an
+existing directory; relative paths resolve against `options.cwd` when set,
+otherwise the process cwd. Relative imports and config discovery start at
+`base_dir`.
 
-Behavior notes:
-
-- `base_dir` must be an existing directory; a missing path or a non-directory is
-  rejected with `LibdenoError::Configuration`. A relative `base_dir` resolves
-  against the same effective cwd a relative entry path does — `options.cwd`
-  when set, otherwise the process cwd (canonicalized) — so `run_source(code,
-  lang, "app", &options)` and `run("app/index.js", &options)` see the same
-  directory.
-- Relative imports resolve against `base_dir` (they load real files next to the
-  virtual entry), and resolver/config discovery (`deno.json` / `package.json` /
-  `node_modules`) starts there.
-- `import.meta.url` / `Deno.mainModule` show the virtual specifier
-  (`$deno$__libdeno_virtual_<16-hex-digits>.<ext>` — a fixed prefix plus a random
-  suffix, so two runs never collide), unique per call — there is no API to
-  choose a custom module name.
-- The entry's virtual path is subject to the same read-permission check as any
-  import, so granting read on `base_dir` covers both the entry and its imports.
-- The subprocess / `Executor` backends do not support in-memory sources (their
-  request payload is a filesystem path); use the in-process APIs.
-- Capture, exclusivity, deadlines, tokio re-entry and every other option behave
-  exactly as in the path-based entry points.
-- The async and reusable-stack source entry points
-  (`run_source_with_output_async`, `LibdenoRuntime::run_with_source_async`,
-  `run_with_output_source_async`, `run_with_source`, `run_with_output_source`)
-  check their preconditions before building the memory entry, so an invalid
-  `options` — async context, mismatched `cwd`, or capture flags on an
-  exit-code-only variant — is reported instead of a bad `base_dir`.
+The virtual entry gets a unique `$deno$__libdeno_virtual_` file URL under
+`base_dir`. `import.meta.url` and `Deno.mainModule` expose that URL. The entry
+uses the same read-permission check as an imported file, so a read grant on
+`base_dir` covers it and sibling imports. Subprocess and `Executor` APIs accept
+file paths only. Other options follow the corresponding path-based API.
 
 ## `run_async` / `run_with_output_async`
 
@@ -159,33 +110,15 @@ pub async fn run_with_output_async(
 ) -> Result<RunOutput, LibdenoError>
 ```
 
-Runs `entry` on the **caller's** tokio runtime. Identical semantics to
-`run` / `run_with_output`, but nothing spawns a thread: the run's async chain
-(resolver stack build, graph build, event loop) executes on the calling
-runtime. For a server host that already has a runtime this removes the
-per-run OS-thread cost of `run`'s tokio re-entry escape.
+Runs `entry` on the caller's tokio runtime instead of spawning a worker thread.
 
-Constraints:
+The future is `!Send` and must not be interleaved with another async run on the
+same thread; a V8 isolate stays on its creation thread. Await runs one at a
+time. On a multi-thread runtime, use a `LocalSet`:
 
-- Must be called from inside a tokio runtime context (`tokio::spawn`,
-  `block_on`, another `async fn`, ...). Outside one, `run_async` returns
-  `LibdenoError::Configuration` — use `run`.
-- The returned future is **not `Send`**. `run_async` futures must not be
-  **interleaved** with each other on one thread: a V8 isolate is pinned to
-  the thread that created it, so two `run_async` polled alternately abort the
-  process. This is enforced by a thread-local RAII guard that rejects a
-  second `run_async` on the same thread with `LibdenoError::Configuration`
-  (the guard clears on drop, so a cancelled future releases the slot). Await
-  them strictly one at a time; for parallel runs use `run` (each run gets its
-  own thread + isolate) or `run_in_subprocess`. A single `run_async` may be
-  awaited on a current-thread runtime directly, or on a multi-thread runtime
-  inside `tokio::task::LocalSet`.
-- `execution_deadline` runs on tokio's time driver, so the caller's runtime
-  must enable it (`enable_time()` / `enable_all()`); a bare
-  `Builder::new_current_thread().build()` has no time driver and the deadline
-  will not fire.
-- Capture, exclusivity, deadlines and every other option behave exactly as in
-  the sync entry points.
+- Call from a tokio runtime; outside one, use `run`.
+- Enable tokio's time driver when using `execution_deadline`.
+- For parallel runs, use `run` or `run_in_subprocess`.
 
 On a multi-thread runtime, pin the `!Send` future to one thread with a
 `LocalSet`:
@@ -209,20 +142,7 @@ async fn main() -> Result<(), libdeno::LibdenoError> {
 }
 ```
 
-On a current-thread runtime the future can be awaited directly:
-
-```rust
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), libdeno::LibdenoError> {
-    let out = libdeno::run_with_output_async("app.js", &LibdenoOptions {
-        allow_all_permissions: true,
-        capture_stdout: true,
-        ..Default::default()
-    }).await?;
-    println!("exit={} stdout={:?}", out.exit_code, out.stdout);
-    Ok(())
-}
-```
+On a current-thread runtime, await the future directly.
 
 ## `LibdenoRuntime` / reusable sync and async runs
 
@@ -291,64 +211,24 @@ pub fn run_with_output_source(
 ) -> Result<RunOutput, LibdenoError>
 ```
 
-`run` rebuilds the resolver stack (workspace / resolver / npm-installer
-factories, graph resolver, npm process state) on every call. For long-lived
-hosts running many scripts in the same project, `LibdenoRuntime::new(cwd)`
-builds the permission-free half of that stack once and `run_with` /
-`run_with_output` reuse it across runs:
+Use `LibdenoRuntime::new(cwd)` for repeated runs in one project. It builds the
+resolver stack once and `run_with` / `run_with_output` reuse it:
 
-- `LibdenoRuntime::new` is **async** — stack construction needs a tokio
-  context. The stack is rebuilt automatically when the config chain changes
-  (deno.json / deno.jsonc / import_map.json / package.json / `.npmrc`,
-  `deno.lock`, and `node_modules` at the project root and its ancestors):
-  `run_with` recomputes a fingerprint and swaps the stack when it diverges.
-  The npm part of the fingerprint includes the effective registry and the
-  resolver-supported global npmrc (`$HOME/.npmrc`) by canonical path and
-  content. The fingerprint also tracks the resolved `JSR_URL`. `deno_resolver`
-  0.88 does not honor `NPM_CONFIG_USERCONFIG`. Call
-  `runtime.refresh()` to force the next run to rebuild after changes below the
-  discovered chain, such as nested `node_modules`; this is an explicit bounded
-  invalidation, not a recursive watcher/hash.
-- `run_with` semantics match `run` — ordinary runs are fully parallel, tokio
-  re-entry handled automatically (fresh thread inside a tokio runtime),
-  `Deno.exit(n)` / exit codes / deadlines identical. The script runs in the
-  host's cwd and the process cwd is never switched. `LibdenoOptions.cwd` is
-  omitted by default; when provided it must match the runtime's directory
-  (canonicalize-aware comparison), otherwise a mismatched `cwd` is **rejected** with
-  `LibdenoError::Configuration` — the stack is scoped to the runtime's
-  directory, so a different base would silently resolve elsewhere. A relative
-  `base_dir` passed to the `run_with_source` family resolves against the
-  runtime's directory — the same base a relative entry path resolves against
-  here. Permissions come from `options` per run: the permission-bound file
-  fetcher / graph loader / graph are rebuilt each call, so one run's grants
-  never leak into another.
-- `run_with` **rejects** `capture_stdout` / `capture_stderr` with
-  `LibdenoError::Configuration` (it returns only the exit code). Use
-  `libdeno::runtime::run_with_output(&runtime, ...)` for capture on the reusable stack;
-  everything else matches `run_with_output` (mismatched `cwd` rejected,
-  permissions per run, fd-level capture with the same exclusivity lease,
-  Windows rejection and per-stream byte cap).
-- `LibdenoRuntime::run_async` and `run_with_output_async` execute on the
-  **caller's** tokio runtime, without a spawned or background execution
-  thread. They reuse the runtime's permission-free resolver stack and the
-  same config-fingerprint rebuild path as `run_with`, while each call still
-  creates fresh permissions, permission-bound services, a module graph, and a
-  V8 isolate. `run_async` returns only the exit code and otherwise follows the
-  root `run_async` capture semantics; use `run_with_output_async` to receive
-  captured bytes. Capture uses the same process-global `RunLease` and is
-  rejected on Windows with `LibdenoError::Configuration`.
-- Both reusable async methods return **`!Send` futures**. Await them strictly
-  one at a time on the thread that polls them: a second interleaved future is
-  rejected with `LibdenoError::Configuration`, and dropping/cancelling the
-  first future releases the guard. On a multi-thread runtime, pin the call to
-  one thread with `tokio::task::LocalSet`, just as for the root async API.
-- `LibdenoRuntime` is `Clone` + `Send` + `Sync`, so it can be shared across
-  host threads; ordinary runs through it are fully parallel (only a captured
-  run is exclusive — see `run_with_output`). It is single-threaded by design:
-  the module loader stack is `Rc<...>`-based. The sync/async split is
-  deliberate: `new` is async, synchronous `run_with` creates its own fresh
-  current-thread runtime, and the reusable async methods use the caller's
-  runtime.
+- `new` is async. The stack refreshes when tracked config, lockfile, registry,
+  or managed root `node_modules` identity changes. Call `refresh()` after
+  changes outside the discovered paths, such as nested `node_modules`.
+- Each run gets fresh permissions, a module graph, and a V8 isolate. `cwd` is a
+  resolution base and, when set, must match the runtime's directory.
+- `run_with` returns only an exit code and rejects capture flags. Use
+  `run_with_output` to capture output; capture remains process-wide and
+  exclusive.
+- `run_async` methods use the caller's tokio runtime and return `!Send`
+  futures. Do not interleave runs on one thread; use `LocalSet` on a
+  multi-thread runtime. Each call gets fresh permissions, graph, and isolate.
+- `run_async` returns only the exit code. Use `run_with_output_async` to get
+  captured bytes; capture is exclusive and unsupported on Windows.
+- The `LibdenoRuntime` handle is `Clone + Send + Sync` and can be shared across
+  threads. Ordinary runs can execute in parallel.
 
 ## `LibdenoOptions`
 
@@ -371,17 +251,11 @@ pub struct LibdenoOptions {
 
 ### `permissions`
 
-Permission capability strings in CLI `--allow-*` format.
-
-- Since v0.2.0 an **empty list is a construction error** — it grants nothing
-  and `run` returns `LibdenoError::Configuration` (the message spells out the
-  v0.2.0 semantic change and the migration options). To run with every
-  capability, either set `allow_all_permissions: true` or pass `-A`/`--allow-all`.
-- Passing any entry restricts the runtime to the declared capabilities.
-- A flag without a value allows that capability globally
-  (`--allow-read` == read anywhere).
-- A flag with a comma-separated value allows only the listed descriptors
-  (`--allow-read=./src,./public`).
+Permission capability strings use CLI `--allow-*` syntax. Any permission flag
+restricts access to the listed capabilities. A flag without a value grants
+that capability globally; comma-separated values scope it, for example
+`--allow-read=./src,./public`. An empty list requires `allow_all_permissions`
+or `prompt`.
 
 Supported flags:
 
@@ -391,42 +265,28 @@ Supported flags:
 | `--allow-write` | paths |
 | `--allow-env` | environment variable names |
 | `--allow-net` | hosts (optionally with `:port`) |
-| `--allow-import` | import hosts (e.g. `deno.land`); gates remote `https:`/`jsr:` module loading — there is no `--allow-net` fallback |
+| `--allow-import` | remote module hosts |
 | `--allow-run` | executable names |
 | `--allow-ffi` | `.so`/`.dylib` paths |
 | `--allow-sys` | system API names |
 | `-A` / `--allow-all` | — (equivalent to `allow_all_permissions`) |
 
-Static and dynamic file imports are gated by `--allow-read` (the graph loader
-checks each file against the declared scope).
+Remote `https:`/`jsr:` imports require `--allow-import`; `--allow-net` does not
+grant module-import permission.
+
+Static and dynamic file imports are checked against `--allow-read`.
 
 ### `allow_all_permissions`
 
-Grants every capability (`-A` equivalent). Required to run scripts with an
-empty `permissions` list — since v0.2.0 that is a construction error unless
-this flag is set. Use it only for code you trust (see SECURITY.md).
+Grants every capability (`-A` equivalent). Use it only for trusted code.
 
 ### `prompt`
 
-Interactive permission prompting for non-granted queries, mirroring `deno run`'s
-default behavior: a check prints to stderr and reads allow/deny from stdin,
-blocking the run while it waits. The upstream prompter requires a terminal
-stdin (`is_terminal()`); a headless host without one sees every such query
-denied without reading.
+Prompts on stdin for checks not granted by flags. Prompting requires terminal
+stdin; without a terminal, checks are denied.
 
-The three combinations:
-
-| `permissions` | `prompt` | Behavior |
-|---|---|---|
-| empty | `false` | construction error (the v0.2.0 default) |
-| empty | `true` | every access is asked interactively |
-| flags | `true` | flags grant, everything else is asked |
-| flags | `false` | flags grant, everything else is denied |
-
-In subprocess mode (`run_in_subprocess`) the child's stdin is a pipe (consumed
-by the request JSON), so the prompter's terminal check denies without reading —
-`prompt: true` in a child is equivalent to fail-closed deny; real interaction
-only makes sense for in-process `run`.
+In subprocess mode the child's stdin carries the run request, so interactive
+prompting is unavailable and non-granted checks are denied.
 
 ### `args`
 
@@ -434,60 +294,38 @@ Arguments exposed to the script via `process.argv` (after argv[0]).
 
 ### `max_heap_bytes`
 
-An in-process, best-effort constraint on the V8 old-generation heap in bytes.
-The minimum accepted value is 8 MiB; smaller values and `usize::MAX` are
-rejected with `LibdenoError::Configuration`. It does not cap native
-allocations, V8 external memory, host allocations, RSS, CPU, or child-process
-memory, and is not an OS/process memory boundary. The constraint applies to
-the main worker and web workers created with `new Worker(...)`.
+Best-effort limit for the V8 old-generation heap. Values below 8 MiB and
+`usize::MAX` are rejected. It does not limit native memory, RSS, CPU, or child
+processes.
 
 ### `execution_deadline`
 
-An in-process, best-effort execution deadline. When V8 reaches an interruptible
-stack check, the isolate is terminated and `LibdenoError::Timeout` is returned.
-It cannot interrupt a blocking system call, native code, a child-process wait,
-or a blocked permission broker/hook, so a run can exceed the requested
-duration. The deadline is not the HTTP transport budget described above.
+Best-effort in-process deadline. V8 is terminated at an interruptible stack
+check; a blocking system call, native code, child wait, or permission callback
+can make the run exceed it. The HTTP timeout is separate.
 
 ### `cwd`
 
-Resolution base that relative paths (entry, permissions, `node_modules`
-discovery) resolve against. Defaults to the process current directory.
-
-The process cwd is **never switched** (chdir is process-global and would
-serialize or corrupt concurrent runs, which are otherwise fully parallel). The
-script observes the host's cwd: `Deno.cwd()` and relative filesystem
-operations inside the script resolve against it. Scripts that need a specific
-working directory should use absolute paths or `run_in_subprocess` (the
-child's cwd is pinned at spawn).
+Resolution base for relative entry paths, permission paths, and `node_modules`
+discovery. Defaults to the process cwd. In-process runs do not change the host
+cwd; use absolute paths or a subprocess API when the script needs another cwd.
 
 ### `capture_stdout` / `capture_stderr`
 
-Redirect the script's stdout (fd 1, e.g. `console.log`) / stderr (fd 2, e.g.
-`console.error`) into `RunOutput::stdout` / `RunOutput::stderr` instead of the
-host's terminal. Off by default (output passes through). While active the
-redirection is fd-level and process-global: other host threads printing to
-stdout/stderr during the run are captured too, and the run is **exclusive** —
-any concurrent run (captured or not) is rejected with
-`LibdenoError::Configuration`. For captured runs alongside parallel execution
-use `run_in_subprocess_with_output`, which pipes the child's own fds back.
+Capture the script's stdout and/or stderr in `RunOutput`; output passes through
+by default. See [`run_with_output`] for capture exclusivity and subprocess
+capture.
 
 ### `max_capture_bytes`
 
-Per-stream cap on captured output (stdout and stderr each get this budget).
-When a stream exceeds it, capture stops, the excess is dropped, and
-`RunOutput::capture_truncated` is set — a verbose or hostile script can no
-longer grow host memory without limit. `None` (default) captures without a
-bound for legacy/in-process capture. In-process capture remains process-global
-and exclusive; subprocess capture drains the child's pipes while retaining only
-the bounded prefix. The execution-control supervisor path is separately
-bounded: `None` means 64 KiB per stream, explicit values up to 96 KiB are
-honored, and larger explicit values are rejected before the child is spawned.
-This is the retained-output policy: supervisor `TERMINAL` frames contain no
-stdout/stderr; the parent drains the child's capture pipes. The separate 1 MiB
-control-frame limit is not the reason for this output budget.
-In-process fd capture is rejected on Windows; use
-`run_in_subprocess_with_output` there.
+Per-stream byte limit. Excess bytes are drained and dropped, and
+`RunOutput::capture_truncated` is set. `None` is unbounded for legacy and
+in-process capture. The execution-control supervisor backend defaults to 64 KiB
+per stream and accepts explicit limits up to 96 KiB; these limits do not apply
+to `run_in_subprocess_with_output`, which is unbounded unless
+`max_capture_bytes` is set. The supervisor sends no output in `TERMINAL` frames:
+the parent captures from pipes. In-process capture is unsupported on Windows;
+use `run_in_subprocess_with_output`.
 
 ### `features`
 
@@ -501,31 +339,17 @@ permission-gated regardless.
 
 ## Resource and supervision boundaries
 
-- Remote module response bodies and npm metadata are capped at 256 MiB in the
-  body returned by reqwest after transport decoding, regardless of
-  `Content-Length`. This is not a wire-byte cap, and upstream decoding may
-  allocate before libdeno checks the body. An explicit `.tgz` path is capped
-  at 1 GiB of reqwest-returned, transport-decoded response-body bytes, also not
-  wire bytes. For a gzip response on that path, libdeno checks the final four
-  body bytes as an `ISIZE` hint: the final member's size modulo 2^32. The
-  default 1 GiB threshold, configurable with
-  `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`, is not a decompressed-output budget
-  and does not identify the first consumed member or total extraction.
-  Downstream fallback may read decompressed data to end; wrapper/multi-member
-  cases are not precisely accounted. This is not a decompression or RSS hard
-  limit.
-- The HTTP client allows 300 seconds per operation for retries, backoff,
-  redirects on the npm path, and body reads. Remote-module redirects are
-  handled by the file fetcher rather than followed by the HTTP client.
-- npm lifecycle scripts are currently disabled. No system-shell execution or
-  enabled-script supervision guarantee is made by this contract.
-- `run_in_subprocess` contains `Deno.exit` and hard runtime termination to the
-  direct child, but does not promise complete process-tree cleanup or a
-  cross-platform process-group/Windows Job Object boundary. Neither
-  `max_heap_bytes` nor `execution_deadline` provides an RSS or CPU hard limit.
-  Windows overlapped-write cancellation can wait past the requested deadline
-  while completion is observed to keep kernel-owned buffers alive; deadlines
-  are not hard real-time cleanup guarantees.
+- Remote module bodies and npm metadata are capped at 256 MiB; `.tgz` bodies at
+  1 GiB. These caps apply to reqwest-returned, transport-decoded bytes, and the
+  decoder may allocate before libdeno checks them. The `.tgz` gzip `ISIZE`
+  check is only a size hint, not a decompression-output limit.
+- HTTP operations have a 300-second budget. Remote redirects are handled by
+  the file fetcher; the HTTP client follows redirects only for npm downloads.
+- npm lifecycle scripts are disabled.
+- Subprocess runs supervise the direct child, not its entire process tree.
+  Heap and execution limits are not OS-level RSS or CPU limits. Windows
+  overlapped-write cancellation may finish after the requested deadline to
+  preserve buffer lifetime.
 
 ## `LibdenoError`
 
@@ -533,24 +357,19 @@ permission-gated regardless.
 #[derive(Debug, thiserror::Error)]
 pub enum LibdenoError {
   Entry(AnyError),                       // entry module resolution failed
-  Permission(String),                    // invalid permission flag strings
-  Configuration(String),                 // options cannot form a valid configuration (e.g. empty permission list without opt-in since v0.2.0)
-  Runtime(AnyError),                     // runtime startup / script failure
-  Core(deno_core::error::CoreError),     // deno_core execution/event-loop errors, including JS exceptions from that path
-  Io(std::io::Error),                    // host I/O failure (e.g. cwd, output capture setup)
-  Timeout(String),                     // deadline exceeded / subprocess handshake timed out (message explains which)
+  Permission(String),                    // invalid permission flags
+  Configuration(String),                 // invalid options
+  Runtime(AnyError),                     // runtime startup or script failure
+  Core(deno_core::error::CoreError),     // deno_core execution failure
+  Io(std::io::Error),                    // host I/O failure
+  Timeout(String),                       // deadline or subprocess handshake timeout
 }
 ```
 
-All variants implement `std::error::Error`; `Runtime`, `Core`, and `Io`
-use `#[from]` so `?` works naturally. `LibdenoError::is_permission_error()`
-recognizes concrete typed Rust permission-denial sources only. JavaScript
-`name`, class labels, `cause`, aggregate errors, and rendered text are
-untrusted and do not establish permission provenance. A JavaScript-only
-failure without typed denial evidence can be wrapped as either `Runtime` or
-`Core`, depending on the Rust error path; `is_permission_error()` is false for
-both, and Python maps both to `DenoRuntimeError`. Invalid permission flags and
-typed entry/option errors retain their dedicated error variants.
+`is_permission_error()` is true only when a typed Rust permission-denial source
+is preserved. JavaScript names, classes, causes, and messages do not establish
+denial provenance. A JS failure without typed evidence may be `Runtime` or
+`Core`; both map to `DenoRuntimeError` in Python.
 
 ## `run_in_subprocess`
 
@@ -561,37 +380,17 @@ pub fn run_in_subprocess(
 ) -> Result<i32, LibdenoError>
 ```
 
-Runs `entry` in a **child process** and returns the child's exit code.
+Runs `entry` in a child process and returns its exit code. The child contains
+`Deno.exit` and many process-level failures, but native crashes can still affect
+the host; use an OS sandbox for untrusted code.
 
-Why: the embedded `run()` shares the host process. Before executing the user
-module, it installs an exit watcher; `Deno.exit(n)` ends the run and returns
-`n` to the host rather than terminating the host process. The Python wrappers
-use the same flow. Subprocess mode is useful when process-level failures must
-be contained: FFI/native code, V8 out-of-memory failures, or aborts can still
-kill the host, and embedded execution is not a sandbox for untrusted code.
-
-Requirements:
-
-- The host binary must call `maybe_handle_child_mode()` at the very start of
-  its `main()` so child requests are serviced.
-- The child inherits stdout/stderr, so script output still appears.
-- The child's cwd is pinned to `options.cwd` at spawn (via
-  `Command::current_dir`), so the script sees it as its working directory —
-  unlike in-process runs, where the script observes the host's cwd.
-- Entry, permissions, args, and cwd are passed over the child's stdin as
-  JSON; relative entry paths resolve against `options.cwd`.
-- `features`, `max_heap_bytes`, and `execution_deadline` are forwarded to
-  the child verbatim: a host that bounds or shrinks an untrusted script gets
-  the same bounds in child mode (the child never silently runs unbounded on
-  the full unstable surface). The capture flags are not forwarded — the
-  child writes to the inherited fds; use `run_in_subprocess_with_output` to
-  pipe the child's own fds back to the parent.
-- The JSON request is capped at 1 MiB and the parent write/child read
-  handshake is bounded at 10 seconds. This protects the handshake, not the
-  lifetime or resource use of the child's descendants.
-- Only the direct child is observed and reaped. No complete process-tree,
-  RSS, or CPU hard-isolation guarantee is provided; use an OS-level supervisor
-  or sandbox when those boundaries matter.
+Call `maybe_handle_child_mode()` during startup, after any required trusted
+initialization (such as Node IPC setup or installing a broker/hook) and before
+normal host logic. The child inherits stdout/stderr and uses `options.cwd`.
+Entry, permissions, args, and cwd are sent as JSON over stdin. The request is
+capped at 1 MiB and its handshake at 10 seconds. Only the direct child is
+reaped; descendants are not fully supervised. Use `run_in_subprocess_with_output`
+to capture child output.
 
 `LIBDENO_HOST_EXE` overrides the executable spawned (defaults to
 `current_exe()`); integration tests use this to point at a dedicated host.
@@ -605,28 +404,16 @@ pub fn run_in_subprocess_with_output(
 ) -> Result<RunOutput, LibdenoError>
 ```
 
-Runs `entry` in a **child process** and returns the exit code together with
-the child's captured stdout/stderr — the subprocess answer to output capture.
+Runs `entry` in a child process and captures both stdout and stderr through
+per-child pipes. This capture works in parallel with other runs, including on
+Windows. In-process capture is exclusive and unsupported on Windows.
 
-Unlike in-process capture — which is fd-level redirection of the
-process-global stdout/stderr and therefore **exclusive** (any concurrent run
-is rejected with `Configuration`, and it does not work on Windows) — this
-capture is per-process: the child's own fds are piped back to the parent and
-read concurrently with `wait()` (a verbose child can never deadlock on a full
-pipe buffer). It runs in parallel with any other run, on every platform,
-Windows included.
-
-- `capture_stdout` / `capture_stderr` are always implied — both streams are
-  returned.
-- `max_capture_bytes` caps each stream: excess is drained and dropped (the
-  reader keeps going so the child never blocks) and
-  `RunOutput.capture_truncated` is set.
-- For the execution-control supervisor path, `None` defaults to 64 KiB per
-  stream and explicit values are limited to 96 KiB; larger values are rejected
-  before spawning. This supervisor-specific bound does not change legacy
-  subprocess capture semantics.
-- Every other option (permissions, features, `max_heap_bytes`,
-  `execution_deadline`, `cwd`) behaves exactly as in `run_in_subprocess`.
+- Both streams are returned; `capture_stdout` / `capture_stderr` are implied.
+- `max_capture_bytes` limits retained bytes per stream. Excess bytes are
+  drained and dropped; `capture_truncated` indicates truncation.
+- This helper is unbounded unless `max_capture_bytes` is set, including when
+  execution control is enabled. The 64 KiB default and 96 KiB maximum apply only
+  to the execution-control supervisor backend.
 
 ## `maybe_handle_child_mode`
 
@@ -641,7 +428,8 @@ Services a child-run request when the process was spawned by
 - Child mode: executes the requested script and exits the process with the
   script's exit code (including `Deno.exit(n)`); it does not return.
 
-Call it as the first line of `main()`:
+Call it after required trusted startup initialization and before normal host
+logic:
 
 ```rust
 fn main() {
@@ -656,21 +444,16 @@ fn main() {
 pub unsafe fn initialize_node_ipc_from_env() -> Result<(), LibdenoError>
 ```
 
-Explicitly adopts the Node IPC endpoint supplied by a trusted fork launcher.
-Call it as early as possible during startup, before creating threads; then call
-`maybe_handle_child_mode()` before ordinary host logic. The caller must ensure
-that `NODE_CHANNEL_FD` identifies a valid connected endpoint and transfer its
-raw descriptor/handle ownership exclusively to libdeno. Do not use
-untrusted environment input as authority to claim a raw OS handle.
+For a Node `child_process.fork` host, explicitly adopts the connected endpoint
+identified by `NODE_CHANNEL_FD`. Call it during trusted startup, before creating
+threads, then call `maybe_handle_child_mode()` before normal host logic. The
+caller transfers unique ownership of the raw descriptor/handle to libdeno.
 
-Initialization is one-shot: the first attempt consumes the state even if it
-fails. A parseable raw handle is claimed before later mode/validation checks;
-if those checks fail, the handle is closed and initialization cannot be
-retried. If `NODE_CHANNEL_FD` is absent, initialization records a no-IPC state;
-`LIBDENO_SPAWNED_IPC` is not consulted. Ordinary
-`run()` does not modify `NODE_CHANNEL_FD` or automatically claim a live
-environment channel. Hosts that previously relied on automatic fork IPC
-initialization must migrate to this explicit startup call.
+Initialization is one-shot, including failed attempts. A claimed endpoint is
+closed if later validation fails, so it cannot be retried. If the variable is
+absent, initialization records that no IPC channel is available. Ordinary
+`run()` neither reads nor claims a live environment channel. Do not let
+untrusted input select a raw OS handle.
 
 ## `install_permission_broker`
 
@@ -678,28 +461,16 @@ initialization must migrate to this explicit startup call.
 pub fn install_permission_broker(path: impl AsRef<Path>) -> Result<(), LibdenoError>
 ```
 
-Installs an external permission broker process at `path` (raw deno_permissions
-capability): a Unix socket (or Windows named pipe) serving the JSON-line
-protocol — a request `{v, pid, id, datetime, permission, value}` line, a
-response `{id, result: "allow"|"deny", reason}` line.
+Installs an external permission broker at `path` (Unix socket or Windows named
+pipe). It is process-global and install-once; after installation it decides
+every permission check, replacing local flag grants. Checks block until the
+broker responds.
 
-- Process-global and install-once; a second install returns
-  `LibdenoError::Permission`. Once installed, the broker is the **sole
-  authority** for every permission check in the process — granted or not — so
-  local `--allow-*` flags are no longer consulted (upstream deno semantics).
-- Checks are synchronous and blocking: the run stalls until the broker answers
-  each query.
-- The returned `Result` covers only failures libdeno can report, such as a
-  duplicate install or local setup error. Upstream
-  `deno_permissions::broker::PermissionBroker::new` returns `Self`, not a
-  `try_new` result, and may call `process::exit(87)` when the initial
-  connection fails. Later broker/bridge communication failures may also
-  terminate the process through the upstream error path; the caller cannot
-  catch either termination. Do not use this API with an untrusted or
-  unreliable endpoint, or where the host must remain alive after broker
-  failure.
-- Works across `run_in_subprocess` children when the host binary installs it in
-  `main()` before `maybe_handle_child_mode()`.
+The upstream constructor may call `process::exit(87)` if the initial connection
+fails; later bridge failures may also terminate the process. These exits cannot
+be returned as `LibdenoError`, so use a trusted, reliable broker. To pass the
+broker to subprocess runs, install it during trusted startup before
+`maybe_handle_child_mode()` dispatches child mode.
 
 ## `install_permission_hook`
 
@@ -709,41 +480,22 @@ pub type PermissionPrompt = Arc<dyn Fn(&PermissionRequest) -> bool + Send + Sync
 pub fn install_permission_hook(hook: PermissionPrompt) -> Result<(), LibdenoError>
 ```
 
-Installs an in-process permission hook (Unix only; on Windows use
-`install_permission_broker` with an external broker process). Return `true` to
-allow, `false` to deny.
+Installs an in-process hook on Unix; on Windows, use
+`install_permission_broker`. Return `true` to allow a request and `false` to
+deny it. Like the broker, the hook is process-global, install-once, and the sole
+authority for permission checks once installed. It cannot be combined with the
+broker.
 
-- Same semantics as `install_permission_broker`: process-global, install-once,
-  the sole authority for every permission check once installed, and mutually
-  exclusive with `install_permission_broker`.
-- The hook is served on an internal thread through a temp-dir Unix socket
-  (private 0700 dir, unlinked once the connection is established). The
-  `PermissionRequest` carries the capability name (`"read"`, `"net"`, ...) and
-  the stringified access value (path, host, env name, ...; `None` for unary
-  checks).
-- The hook uses the same upstream `deno_permissions` broker bridge and
-  `PermissionBroker::new` constructor. The locally-created listener and path
-  reduce normal connection-failure risk but do not make that constructor
-  fallible: an initial connection failure, or a later bridge communication
-  failure, may still terminate the process through an uncapturable
-  `process::exit(87)`/upstream error path. `Result` cannot recover those
-  terminations.
-- The hook must return quickly and must not block: checks are synchronous and
-  blocking, so a stalled hook stalls every permission check in the process. An
-  unwinding panic is caught at the bridge boundary and the request is denied.
-  A `panic = "abort"` build or a panic hook that aborts/exits is not catchable
-  by `catch_unwind` and may terminate the host; the hook must still not panic
-  because it may produce noisy panic-hook diagnostics. This fail-closed
-  handling does not change the upstream external broker's uncapturable
-  constructor/communication termination behavior.
-- A blocked hook can defeat `execution_deadline`: the permission bridge may be
-  waiting on the hook while V8 has no interruptible JavaScript stack. The
-  deadline resumes only after the hook returns; it is not a timeout on the
-  callback or the broker connection.
-- The hook decides checks, not construction: an empty `permissions` list still
-  fails at `run` construction time unless `prompt: true` (or flags /
-  `allow_all_permissions`) is set — the minimal hook configuration is hook +
-  `prompt: true` (the all-Prompt container routes every check to the hook).
+The hook runs synchronously on an internal thread; a slow callback stalls
+permission checks and can delay `execution_deadline`. An unwinding panic is
+denied, but a `panic = "abort"` build cannot recover. The shared upstream
+broker bridge can still terminate the host on connection failure (`exit(87)`);
+that termination is not returned through `Result`. With no permission flags,
+set `prompt: true` so checks reach the hook.
+
+Do not fork and continue using an installed broker or hook. Exec immediately,
+then install it during trusted startup in the new process; reinstalling in the
+fork child is not supported.
 
 ## Permission decision priority
 
@@ -752,21 +504,12 @@ prompt when `prompt: true` → deny.
 
 ## Example host binary
 
-`examples/demo.rs` is the reference host. It calls
-`maybe_handle_child_mode()` on startup and supports both embedded and
-subprocess execution. Usage:
+`examples/demo.rs` shows a host that calls `maybe_handle_child_mode()` at
+startup and supports embedded and subprocess execution. Usage:
 
 ```text
 demo [permission flags...] <entry> [script args...]
 ```
 
-It also understands the translated argument style used by
-`child_process.fork` (`demo run -A --unstable-... script.js`): the `run`
-subcommand and flags are skipped when picking the entry.
-
-Node's `NODE_CHANNEL_FD` IPC is separate from deno_process's private inherited
-npm-state file descriptor/handle. The library currently has no trusted
-child-startup receiver for that state, so it does not automatically restore
-inherited npm snapshots. A fork child may still resolve local packages or use
-its lockfile; that is ordinary resolver behavior. See
-[npm support](npm-support.md#child_processfork) for the current boundary.
+For Node `child_process.fork` startup and inherited npm-state limits, see
+[npm support](npm-support.md#child_processfork).

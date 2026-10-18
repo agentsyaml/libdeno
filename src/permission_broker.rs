@@ -9,8 +9,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(unix)]
-use std::sync::OnceLock;
 
 use deno_runtime::deno_permissions::broker::has_broker;
 use deno_runtime::deno_permissions::broker::set_broker;
@@ -101,12 +99,33 @@ pub fn install_permission_broker(path: impl AsRef<Path>) -> Result<(), LibdenoEr
 }
 
 #[cfg(unix)]
-static HOOK: OnceLock<PermissionPrompt> = OnceLock::new();
-
-#[cfg(unix)]
 struct HookSocketDir {
     dir: std::path::PathBuf,
     socket: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+struct BrokerThreadGuard {
+    start: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl BrokerThreadGuard {
+    fn commit(mut self) {
+        self.start.take().unwrap().send(()).unwrap();
+        drop(self.thread.take());
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BrokerThreadGuard {
+    fn drop(&mut self) {
+        self.start.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -126,21 +145,20 @@ impl Drop for HookSocketDir {
 /// Unix only for now; on Windows use [`install_permission_broker`] with an
 /// external broker process.
 ///
-/// The hook uses the same upstream `deno_permissions` broker bridge and
-/// `PermissionBroker::new` constructor as an external broker. The listener
-/// and socket path are created locally, which lowers normal connection-failure
-/// risk, but does not make the upstream constructor fallible: an initial
-/// connection failure, or a later bridge communication failure, may still
-/// terminate the process through an uncapturable `process::exit(87)`/upstream
-/// error path. `Result` cannot recover those terminations.
+/// The hook uses the same upstream broker bridge as an external broker. It
+/// establishes its local socket connection before publishing the broker and
+/// returns thread-start failures as `LibdenoError`; later bridge failures still
+/// follow upstream's non-recoverable error path. The install lock serializes
+/// this crate's install APIs, but cannot serialize direct upstream
+/// `set_broker` calls made concurrently by other code.
 ///
 /// # Safety (fork)
 ///
 /// Forking after installation without an immediate exec is unsafe: the child
-/// inherits the installed broker state and the socket fd, but has no bridge
-/// thread serving it, so the child's first permission check hangs forever.
-/// The same applies to an external broker (both endpoints inherited, no
-/// reader). Re-install the hook/broker in the child (or exec immediately).
+/// inherits broker connection state that must not be reused after fork. For an
+/// in-process hook, the serving thread does not survive, so permission checks
+/// hang. Exec immediately, then install the broker or hook during trusted
+/// startup in the new process; reinstalling in the fork child is not possible.
 pub fn install_permission_hook(hook: PermissionPrompt) -> Result<(), LibdenoError> {
     #[cfg(not(unix))]
     {
@@ -212,10 +230,8 @@ fn install_permission_hook_unix(hook: PermissionPrompt) -> Result<(), LibdenoErr
             socket_path.display()
         ))
     })?;
-    // Create the broker (which connects) before accepting: accept() blocks
-    // until a client connects, and the only client is PermissionBroker::new
-    // itself — accept-first would deadlock. The connect enqueues the
-    // connection, so the accept below returns immediately.
+    // PermissionBroker::new connects to this listener, so construct it before
+    // accept; accepting first would wait forever for this same connection.
     let broker = PermissionBroker::new(&socket_path);
     let stream = match listener.accept() {
         Ok((stream, _)) => stream,
@@ -225,20 +241,40 @@ fn install_permission_hook_unix(hook: PermissionPrompt) -> Result<(), LibdenoErr
             )))
         }
     };
-    // The guard unlinks these after all remaining install steps complete.
-    // The hook is recorded only after every fallible step above succeeded, so
-    // no partial "hook set but broker missing" state can survive an error.
-    HOOK.set(hook).map_err(|_| {
-        LibdenoError::Permission(
-            "a permission hook is already installed; it can only be installed once per process"
-                .to_string(),
-        )
-    })?;
+    let (start_tx, start_rx) = std::sync::mpsc::channel();
+    let thread = spawn_hook_thread(move || {
+        if start_rx.recv().is_ok() {
+            serve_broker_connection(stream, &hook);
+        }
+    })
+    .map_err(LibdenoError::Io)?;
+    let worker = BrokerThreadGuard {
+        start: Some(start_tx),
+        thread: Some(thread),
+    };
     set_broker(broker);
-    std::thread::spawn(move || {
-        serve_broker_connection(stream, HOOK.get().expect("hook was just set"))
-    });
+    worker.commit();
     Ok(())
+}
+
+#[cfg(all(unix, test))]
+static FAIL_HOOK_THREAD_SPAWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+fn spawn_hook_thread<F>(run: F) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    #[cfg(test)]
+    if FAIL_HOOK_THREAD_SPAWN.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err(std::io::Error::other(
+            "injected permission-hook thread spawn failure",
+        ));
+    }
+    std::thread::Builder::new()
+        .name("libdeno-permission-hook".to_string())
+        .spawn(run)
 }
 
 // The broker JSON-line protocol, mirrored from deno_permissions' broker.rs
@@ -274,186 +310,139 @@ struct BrokerResponseLine {
 const MAX_BROKER_LINE_BYTES: usize = 64 * 1024;
 
 #[cfg(unix)]
-fn read_broker_line<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
-    use std::io::BufRead;
-    use std::io::Read;
+enum BrokerLine {
+    Request(Vec<u8>),
+    Oversized(Option<u32>),
+}
 
-    let mut line = Vec::with_capacity(MAX_BROKER_LINE_BYTES.min(4096));
-    let read = reader
-        .by_ref()
-        .take((MAX_BROKER_LINE_BYTES + 1) as u64)
-        .read_until(b'\n', &mut line)?;
-    if read == 0 {
-        return Ok(None);
+#[cfg(unix)]
+fn broker_request_id(prefix: &[u8], allow_truncated_eof: bool) -> Option<u32> {
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+    struct IdSeed<'a>(&'a mut Option<u32>);
+    impl<'de> DeserializeSeed<'de> for IdSeed<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+            struct IdVisitor<'a>(&'a mut Option<u32>);
+            impl<'de> Visitor<'de> for IdVisitor<'_> {
+                type Value = ();
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a broker request object")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+                    while let Some(key) = map.next_key::<String>()? {
+                        if key == "id" {
+                            if self.0.is_some() {
+                                *self.0 = None;
+                                return Err(serde::de::Error::custom("duplicate id"));
+                            }
+                            *self.0 = Some(map.next_value::<u32>()?);
+                        } else {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            deserializer.deserialize_map(IdVisitor(self.0))
+        }
     }
-    if read > MAX_BROKER_LINE_BYTES || line.last() != Some(&b'\n') {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "permission broker request line exceeds the configured limit",
-        ));
+    let mut id = None;
+    let mut deserializer = deno_core::serde_json::Deserializer::from_slice(prefix);
+    match IdSeed(&mut id).deserialize(&mut deserializer) {
+        Ok(()) if deserializer.end().is_ok() => id,
+        Err(error) if allow_truncated_eof && error.is_eof() => id,
+        _ => None,
     }
-    Ok(Some(line))
+}
+
+#[cfg(unix)]
+fn read_broker_line<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<Option<BrokerLine>> {
+    let mut prefix = Vec::with_capacity(MAX_BROKER_LINE_BYTES.min(4096));
+    let mut oversized = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if available.is_empty() {
+            if prefix.is_empty() {
+                return Ok(None);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unterminated broker request",
+            ));
+        }
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |i| i + 1);
+        if !oversized {
+            let room = MAX_BROKER_LINE_BYTES + 1 - prefix.len();
+            prefix.extend_from_slice(&available[..count.min(room)]);
+            oversized = prefix.len() > MAX_BROKER_LINE_BYTES;
+        }
+        let newline = available[..count].last() == Some(&b'\n');
+        reader.consume(count);
+        if newline {
+            return if oversized {
+                Ok(Some(BrokerLine::Oversized(broker_request_id(
+                    &prefix, true,
+                ))))
+            } else {
+                Ok(Some(BrokerLine::Request(prefix)))
+            };
+        }
+    }
 }
 
 #[cfg(unix)]
 fn serve_broker_connection(stream: std::os::unix::net::UnixStream, hook: &PermissionPrompt) {
     use std::io::BufReader;
     use std::io::Write;
-    let reader_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("libdeno: permission hook bridge: {e}");
-            return;
-        }
-    };
-    let mut reader = BufReader::new(reader_stream);
-    let mut writer = stream;
-    // EOF, malformed framing, and oversized requests all stop the bridge.
+    let mut reader = BufReader::new(stream);
     while let Ok(Some(line)) = read_broker_line(&mut reader) {
-        let response = match deno_core::serde_json::from_slice::<BrokerRequest>(&line) {
-            Ok(req) => {
-                let request = PermissionRequest {
-                    name: req.permission,
-                    value: req.value,
-                };
-                let allow = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    (hook)(&request)
-                })) {
-                    Ok(allow) => allow,
-                    Err(_) => {
-                        let mut stderr = std::io::stderr().lock();
-                        let _ = writeln!(
-                            stderr,
-                            "libdeno: permission hook panicked; denying the request"
-                        );
-                        false
-                    }
-                };
-                BrokerResponseLine {
-                    id: req.id,
-                    result: if allow { "allow" } else { "deny" },
-                    reason: None,
-                }
-            }
-            Err(_) => {
-                // Normally unreachable for the locally-created hook endpoint,
-                // but a well-formed deny response keeps the upstream broker reading;
-                // a protocol mismatch ends in the upstream exit(87) path
-                // either way — this yields the deterministic "ID mismatch"
-                // error rather than a parse failure on EOF.
-                BrokerResponseLine {
-                    id: 0,
-                    result: "deny",
-                    reason: None,
+        let (id, request) = match line {
+            BrokerLine::Oversized(Some(id)) => (id, None),
+            BrokerLine::Oversized(None) => break,
+            BrokerLine::Request(line) => {
+                match deno_core::serde_json::from_slice::<BrokerRequest>(&line) {
+                    Ok(req) => (req.id, Some((req.permission, req.value))),
+                    Err(_) => match broker_request_id(&line, false) {
+                        Some(id) => (id, None),
+                        None => break,
+                    },
                 }
             }
         };
+        let allow = if let Some((name, value)) = request {
+            let request = PermissionRequest { name, value };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (hook)(&request))) {
+                Ok(allow) => allow,
+                Err(_) => {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = writeln!(
+                        stderr,
+                        "libdeno: permission hook panicked; denying the request"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let response = BrokerResponseLine {
+            id,
+            result: if allow { "allow" } else { "deny" },
+            reason: None,
+        };
         let msg = format!("{}\n", deno_core::serde_json::to_string(&response).unwrap());
-        if writer.write_all(msg.as_bytes()).is_err() {
+        if reader.get_mut().write_all(msg.as_bytes()).is_err() {
             break;
         }
     }
 }
 
-#[cfg(unix)]
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hook_socket_directory_guard_cleans_bind_failure() {
-        use std::os::unix::fs::DirBuilderExt;
-
-        let dir = std::env::temp_dir().join(format!("libdeno-hook-cleanup-{}", std::process::id()));
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700).create(&dir).unwrap();
-        let socket = dir.join("x".repeat(256));
-        let guard = HookSocketDir {
-            dir: dir.clone(),
-            socket: socket.clone(),
-        };
-        assert!(std::os::unix::net::UnixListener::bind(&socket).is_err());
-        drop(guard);
-        assert!(!dir.exists());
-    }
-
-    /// Sends one request over a paired Unix stream, feeds the server side to
-    /// `serve_broker_connection`, and returns the echoed id + result.
-    fn round_trip(hook: PermissionPrompt) -> (u32, String) {
-        use std::io::BufRead;
-        use std::io::BufReader;
-        use std::io::Write;
-        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
-        let hook = hook.clone(); // the bridge thread needs a 'static handle
-        std::thread::spawn(move || serve_broker_connection(server, &hook));
-        let req = r#"{"v":1,"pid":123,"id":7,"datetime":"2026-08-13T00:00:00Z","permission":"read","value":"/etc/passwd"}"#;
-        client.write_all(format!("{req}\n").as_bytes()).unwrap();
-        let mut reader = BufReader::new(&client);
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        let resp: deno_core::serde_json::Value =
-            deno_core::serde_json::from_str(line.trim()).unwrap();
-        (
-            resp["id"].as_u64().unwrap() as u32,
-            resp["result"].as_str().unwrap().to_string(),
-        )
-    }
-
-    #[test]
-    fn hook_bridge_allows_and_denies() {
-        // Allow-hook: the response echoes the request id (the upstream broker
-        // validates id matching) and says allow.
-        let (id, result) = round_trip(Arc::new(|_req: &PermissionRequest| true));
-        assert_eq!(id, 7);
-        assert_eq!(result, "allow");
-        // Deny-hook.
-        let (id, result) = round_trip(Arc::new(|_req: &PermissionRequest| false));
-        assert_eq!(id, 7);
-        assert_eq!(result, "deny");
-    }
-
-    #[test]
-    fn panicking_hook_fails_closed_as_deny() {
-        let (id, result) = round_trip(Arc::new(|_req: &PermissionRequest| -> bool {
-            panic!("synthetic permission-hook panic")
-        }));
-        assert_eq!(id, 7);
-        assert_eq!(result, "deny");
-    }
-
-    #[test]
-    fn oversized_broker_request_disconnects_without_calling_hook() {
-        use std::io::Read;
-        use std::io::Write;
-        use std::os::unix::net::UnixStream;
-        use std::sync::atomic::AtomicBool;
-        use std::sync::atomic::Ordering;
-
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let called = Arc::new(AtomicBool::new(false));
-        let called_by_hook = called.clone();
-        let hook: PermissionPrompt = Arc::new(move |_req: &PermissionRequest| {
-            called_by_hook.store(true, Ordering::SeqCst);
-            true
-        });
-        let bridge = std::thread::spawn(move || serve_broker_connection(server, &hook));
-
-        // No newline is needed: the bounded reader reaches its max+1 sentinel
-        // and closes the connection instead of growing a request buffer.
-        client
-            .write_all(&vec![b'x'; MAX_BROKER_LINE_BYTES + 1])
-            .unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).unwrap();
-        bridge.join().unwrap();
-
-        assert!(
-            response.is_empty(),
-            "oversized requests must be disconnected"
-        );
-        assert!(
-            !called.load(Ordering::SeqCst),
-            "oversized requests must not reach the hook"
-        );
-    }
-}
+#[cfg(all(unix, test))]
+#[path = "permission_broker/tests.rs"]
+mod tests;

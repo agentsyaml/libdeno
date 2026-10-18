@@ -1,100 +1,58 @@
 # Architecture
 
-libdeno embeds the Deno runtime by composing the same crates the Deno CLI
-uses, plus the embedder glue the CLI keeps private (`cli/graph_util.rs`).
+libdeno combines the Deno runtime, resolver, and module-graph crates to run
+JavaScript and TypeScript inside a Rust process.
 
 ## Source layout
 
 ```
 src/
-  lib.rs           Public API (run / LibdenoOptions / LibdenoError) + assembly
-  permissions.rs   build_permissions: --allow-* strings -> PermissionsContainer
-  subprocess.rs    run_in_subprocess / maybe_handle_child_mode
-  worker_factory.rs create_web_worker_factory: new Worker(...) callback
-  services.rs      Runtime services assembly (resolver stack, npm installer)
-  graph.rs         GraphResolver: deno_graph Resolver + NpmResolver impls
-  module_loader.rs GraphModuleLoader: deno_core ModuleLoader over the graph
-  node_loader.rs   SimpleNodeRequireLoader for require() + CJS analysis provider
-  http.rs          ReqwestHttpClient: HTTP client for remote modules & npm registry
+  lib.rs           Public API and run assembly
+  permissions.rs   Permission parsing
+  subprocess.rs    Child-process execution
+  worker_factory.rs Web worker creation
+  services.rs      Resolver and runtime services
+  graph.rs         Graph resolver adapters
+  module_loader.rs Module loading
+  node_loader.rs   Node require() and CJS analysis
+  http.rs          HTTP requests for modules and npm
 build.rs           V8 runtime snapshot + residual lazy-source tables
 ```
 
-## Assembly order (`run_inner`)
+## Run flow
 
-1. **Crypto provider**: installs the `aws-lc-rs` rustls crypto provider as the
-   default. Both `aws-lc-rs` (deno_tls) and `ring` (reqwest) providers are
-   enabled in the dependency graph; rustls cannot auto-select, so this must be
-   explicit — otherwise `op_fetch` panics. (Idempotent; the `Err` is ignored.)
-2. **Entry resolution**: file / directory / `package.json` → `ModuleSpecifier`.
-3. **Services**: `RuntimeServices` builds the resolver pipeline (see below).
-4. **Permission parser**: `--allow-*` strings → `PermissionsContainer`.
-5. **Module loader**: `GraphModuleLoader` wrapping the shared services.
-6. **Worker bootstrap**: `MainWorker::bootstrap_from_options` with the
-   generated snapshot and residual lazy sources.
-7. **Lifecycle**: `execute_main_module` → event loop → `load` →
-   `beforeunload` → `unload` → `process.beforeExit` → `process.exit`.
+1. Resolve the file, directory, or `package.json` entry.
+2. Build resolver services and parse permission options.
+3. Build the module graph and fetch its dependencies.
+4. Bootstrap a worker from the V8 snapshot and execute the script lifecycle.
 
 ## The resolver stack (`services.rs`)
 
-Mirrors the CLI's composition:
-
-- **`WorkspaceFactory`** — discovers `deno.json` (import maps, JSX, compiler
-  options) walking up from the main module's directory
-  (`ConfigDiscoveryOption::Discover`). The configured `nodeModulesDir` mode is
-  respected; without an explicit mode libdeno uses managed `Auto`. An existing
-  `node_modules` directory alone does not switch to BYONM.
-- **`ResolverFactory`** — the official resolver: Deno resolver (import maps,
-  TS, jsr:), node resolver (bare specifiers, package.json), CJS tracker.
-  CJS→ESM translation is enabled in the module loader
-  (`NodeCodeTranslatorMode::ModuleLoader`); JSON imports require an import
-  attribute (`AllowJsonImports::WithAttribute`), matching modern Deno.
-  `force_disable_verbatim_module_syntax` is set because untyped execution
-  cannot honor verbatim semantics safely.
-- **`NpmInstallerFactory`** — managed npm installs with lazy caching, npm
-  cache enabled, and lifecycle scripts disabled by default
-  (`PackagesAllowedScripts::None`, matching deno CLI 2.x — packages whose
-  install requires scripts, e.g. esbuild, are not usable as-is).
-- **`PermissionedFileFetcher`** — fetches remote modules into the HTTP cache;
-  redirects are handled by the fetcher, not the HTTP client.
-- **`DenoGraphLoader`** — the `FileFetcher` wrapper implementing
-  `deno_graph::source::Loader`.
-- **`ModuleGraph`** — the mutex-guarded main-run
-  `deno_graph::ModuleGraph` (`GraphKind::CodeOnly`). It is shared by the main
-  run's loader instances only; web workers allocate their own graph.
+`SharedServices` builds the workspace and resolver factories, the optional npm
+installer, permissioned file fetcher, and `ModuleGraph` loader. The resolver
+handles import maps, TypeScript, `jsr:`, Node package resolution, and CJS
+classification. Configured `nodeModulesDir` modes are respected; an existing
+`node_modules` directory alone does not select BYONM. npm lifecycle scripts are
+disabled. The main run owns a code-only module graph; each web worker gets its
+own graph and permission-bound loader.
 
 ### Feature gates (two layers, must be kept in sync)
 
-Unstable APIs require two synchronized gates:
-
-1. **Ops layer**: `FeatureChecker` (by name, e.g. `"kv"`) — ops call
-   `check_or_exit`.
-2. **JS layer**: `BootstrapOptions.unstable_features: Vec<i32>` (by ID —
-   cron=4, ffi=6, kv=9, webgpu=25) — decides whether the `Deno.*` namespace
-   is exposed.
-
-Enabling only one yields `Deno.openKv is not a function`. libdeno enables
-`kv`, `cron`, `ffi`, `webgpu`, `worker-options` by filtering
-`deno_features::UNSTABLE_FEATURES` by name and collecting the IDs, keeping
-both layers in sync from a single list (`ENABLED_FEATURES` in `lib.rs`).
-`worker-options` gates the `deno.permissions` options in `new Worker(...)`.
+An unstable API is available only when both the op's `FeatureChecker` and the
+JavaScript namespace are enabled. `deno_runtime_adapter.rs` supplies both from
+one list (`DEFAULT_RUNTIME_FEATURES`, overridable through
+`LibdenoOptions.features`). The defaults include `kv`, `cron`, `ffi`, `webgpu`,
+and `worker-options`.
 
 ## Module loading (`module_loader.rs`)
 
-- **`resolve`** — pass-through for absolute (`file:`, `node:`, `data:`) and
-  `jsr:`/`npm:` specifiers; everything else goes through the official graph
-  resolver.
-- **`prepare_load`** — builds (or extends) the owning loader's module graph
-  rooted at the requested specifier. The main worker keeps the per-run graph;
-  each web worker gets a fresh `CodeOnly` graph. `node:` builtins are skipped
-  (they come from the extension module map in the snapshot). Already-present
-  specifiers are not rebuilt within that owning graph.
-- **`load`** — reads the prepared module from the graph via the
-  `deno_resolver` module loader, which handles TS transpilation, CJS→ESM
-  translation, JSON and WASM. `npm:` specifiers are first resolved to the
-  installed package file (`resolve_non_workspace_npm_req_ref_to_file`). The
-  requested npm:/jsr: URL is registered alongside the concrete file URL via
-  a redirect alias. External assets (e.g. `data:` or fetched-on-demand files)
-  are loaded through the file fetcher.
+- **`resolve`** — sends local and `node:` specifiers to the graph resolver;
+  `npm:` and `jsr:` are handled by `deno_graph`.
+- **`prepare_load`** — builds or extends the owning graph. Each worker keeps a
+  separate graph; `node:` builtins come from the runtime snapshot.
+- **`load`** — reads prepared modules through `deno_resolver`, which handles
+  TypeScript, CJS-to-ESM, JSON, and WASM. npm URLs resolve to installed package
+  files; remote modules are fetched through the permissioned file fetcher.
 
 ## Node compat (`node_loader.rs`)
 
@@ -110,19 +68,10 @@ both layers in sync from a single list (`ENABLED_FEATURES` in `lib.rs`).
 
 ## Web Workers
 
-`create_web_worker_factory` (in `worker_factory.rs`) builds the
-`CreateWebWorkerCb` for `new Worker(...)`. Each spawned worker constructs its
-own Rc-based loader/node services from the per-run `Arc<RuntimeServices>` and
-its shared `Arc<SharedServices>` resolver state — nothing non-Send crosses
-threads. The factory is recursive, so nested workers work. Workers reuse the
-same snapshot, residual sources, blob store, and broadcast channel. Each
-worker builds its own `DenoGraphLoader` bound to the
-worker's permissions container, so a worker's module loads are gated by its
-own grants, not the main run's. `GraphModuleLoader::with_graph_loader` also
-allocates a fresh `GraphKind::CodeOnly` `ModuleGraph` for every worker, so a
-module already fetched by the main or parent worker cannot be returned from a
-shared graph without the new worker's permission check. Resolver factories,
-HTTP/file caches, analysis cache, and npm process state remain shared.
+`new Worker(...)` gets its own loader, permission-bound fetcher, and code-only
+module graph. Nested workers are supported. Workers share resolver factories,
+HTTP/file caches, analysis caches, the V8 snapshot, and npm process state, but
+not module graphs or permissions.
 
 ## HTTP client (`http.rs`)
 
@@ -134,17 +83,10 @@ and optional Authorization).
 
 ## Snapshot (`build.rs`)
 
-Adapted from `deno/cli/snapshot/build.rs`:
-
-- `create_runtime_snapshot` produces `CLI_SNAPSHOT.bin` with all runtime
-  extension JS compiled in.
-- Residual lazy-load sources (extension files not consumed by the snapshot)
-  are pre-transpiled at build time (node builtins are TypeScript) and emitted
-  as `EXTENSION_RESIDUAL_SOURCES.rs` tables.
-- `DENO_SNAPSHOT_MINIFY_SOURCES` triggers source minification.
+The generated snapshot contains the runtime extensions. Any extension source
+needed later is included in the binary as a residual source table.
 
 ## N-API / `.node` addons
 
-The example host re-exports `napi_*` symbols via `.cargo/config.toml`
-rustflags (dev-only). Real embedders must export them from their own binary —
-`deno_napi::print_linker_flags("<host-binary-name>")` in their `build.rs`.
+Hosts loading `.node` addons must export N-API symbols. See
+[Getting Started](getting-started.md#writing-your-own-host-binary).

@@ -1,8 +1,7 @@
 # libdeno Python API
 
-This is a private alpha Python binding for the Rust `libdeno` runtime. The
-Python distribution and core Rust crate are both versioned at `0.3.4`. The
-contract is deliberately small, synchronous, and fail-closed:
+The Python distribution and Rust crate are versioned at `0.3.4`. The Python
+API is alpha and provides synchronous access to the runtime:
 
 ```python
 import libdeno
@@ -17,10 +16,9 @@ runtime = libdeno.Runtime(cwd=None)
 exit_code = runtime.run("entry.js", allow_all_permissions=True)
 ```
 
-`run()` and `Runtime.run()` block until the script and its event loop finish and
-return an integer exit code. The native call releases the Python GIL while the
-Rust runtime executes. `Runtime` reuses its resolver stack while permissions,
-module graphs, and isolates remain per run.
+`run()` and `Runtime.run()` block until the script and its event loop finish,
+return an exit code, and release the GIL while Rust runs. `Runtime` reuses the
+resolver stack; permissions, module graphs, and isolates remain per run.
 
 `entry` and `cwd` accept `str`, `bytes`, and `os.PathLike` values, including
 non-ASCII paths. `cwd=None` (or an omitted `cwd`) means the process current
@@ -33,9 +31,9 @@ runtime's permission model.
 
 ## Options and limits
 
-- `permissions` contains CLI-style `--allow-*` capability strings. An empty
-  sequence is rejected with `ConfigurationError` unless
-  `allow_all_permissions=True` is explicit. `-A`/`--allow-all` is equivalent.
+- `permissions` contains CLI-style `--allow-*` strings. An empty sequence
+  requires `allow_all_permissions=True`; prompting is not exposed.
+  `-A`/`--allow-all` grants all capabilities.
 - `args` are exposed through `process.argv`; `features` optionally selects
   valid Deno unstable feature names. `None` keeps the runtime defaults.
 - `execution_deadline` is a finite, non-negative number of seconds. A busy
@@ -95,13 +93,11 @@ Run the stdlib test suite after installing the wheel from the repository root,
 so the source package does not shadow the installed package. Keep the same
 virtual environment activated so `python` refers to its interpreter.
 
-## Not supported yet
+## Limitations
 
 - Prompting and permission hooks.
 - Output capture, async APIs, and subprocess execution.
 - Python-facing permission/options objects beyond the keyword arguments above.
 - Native addons.
-- Source distributions (`sdist`); this prototype only defines a wheel build
-  path.
-- A stable public contract; this is a private alpha API and may change
-  without notice.
+- Source distributions (`sdist`); releases currently provide wheels.
+- The Python API remains alpha and may change.

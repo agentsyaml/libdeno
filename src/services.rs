@@ -43,7 +43,9 @@ use url::Url;
 
 use crate::graph::GraphResolver;
 use crate::http::ReqwestHttpClient;
+use crate::thread_messaging::ThreadMessagingDomain;
 use crate::timing::{ExecutionTiming, Phase};
+use crate::worker_lifecycle::WorkerLifecycleRegistry;
 
 #[cfg(not(feature = "npm"))]
 struct NoNetworkLockfileRegistryApi;
@@ -362,6 +364,8 @@ pub struct SharedServices {
     pub global_http_cache: GlobalHttpCacheRc<RealSys>,
     /// Read-only workspace lockfile used to seed and validate every graph.
     pub(crate) lockfile: Option<deno_resolver::lockfile::LockfileLockRc<RealSys>>,
+    /// Effective frozen setting from the resolved root workspace config.
+    pub(crate) frozen_lockfile: bool,
     /// Implements deno_graph's `Resolver` and `NpmResolver` traits for graph
     /// building.
     pub graph_resolver: Arc<GraphResolver>,
@@ -555,6 +559,15 @@ impl SharedServices {
             );
             workspace_factory.maybe_lockfile(&provider).await?.cloned()
         };
+        let frozen_lockfile = lockfile.is_some()
+            && workspace_factory
+                .workspace_directory()?
+                .workspace
+                .root_folder_configs()
+                .deno_json
+                .as_ref()
+                .and_then(|config| config.to_lock_config().ok().flatten())
+                .is_some_and(|config| config.frozen());
 
         // Load the lockfile/package.json npm snapshot so that managed npm
         // resolution is initialized before the graph asks for packages. The
@@ -591,6 +604,7 @@ impl SharedServices {
             http_cache,
             global_http_cache,
             lockfile,
+            frozen_lockfile,
             graph_resolver,
             module_info_cache,
             npm_process_state_provider,
@@ -707,6 +721,9 @@ pub struct RuntimeServices {
     pub(crate) memory_files: Arc<MemoryFiles>,
     /// Shared sink for this run and its web workers.
     pub(crate) timing: ExecutionTiming,
+    /// Run-local communication identities; never cached in the reusable resolver stack.
+    pub(crate) thread_messaging: ThreadMessagingDomain,
+    pub(crate) worker_lifecycle: WorkerLifecycleRegistry,
 }
 
 impl RuntimeServices {
@@ -821,6 +838,8 @@ impl RuntimeServices {
             blob_store,
             memory_files,
             timing,
+            thread_messaging: ThreadMessagingDomain::new(),
+            worker_lifecycle: WorkerLifecycleRegistry::new(),
         })
     }
 }

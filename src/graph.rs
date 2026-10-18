@@ -27,6 +27,7 @@ use crate::services::RealNpmInstallerFactory;
 
 pub struct GraphResolver {
     resolver: deno_resolver::graph::DefaultDenoResolverRc<RealSys>,
+    jsx_config: deno_resolver::deno_json::JsxImportSourceConfigResolver,
     #[cfg(feature = "npm")]
     npm_resolver: Option<Arc<NpmDenoGraphResolver<ReqwestHttpClient, RealSys>>>,
 }
@@ -49,6 +50,9 @@ impl GraphResolver {
         };
         Ok(Self {
             resolver: resolver_factory.deno_resolver().await?.clone(),
+            jsx_config: deno_resolver::deno_json::JsxImportSourceConfigResolver::from_compiler_options_resolver(
+                resolver_factory.compiler_options_resolver()?,
+            )?,
             #[cfg(feature = "npm")]
             npm_resolver,
         })
@@ -97,18 +101,37 @@ impl GraphResolver {
 }
 
 impl Resolver for GraphResolver {
+    fn default_jsx_import_source(&self, referrer: &url::Url) -> Option<String> {
+        self.jsx_config.for_specifier(referrer).and_then(|config| {
+            config
+                .import_source
+                .as_ref()
+                .map(|source| source.specifier.clone())
+        })
+    }
+
+    fn default_jsx_import_source_types(&self, referrer: &url::Url) -> Option<String> {
+        self.jsx_config.for_specifier(referrer).and_then(|config| {
+            config
+                .import_source_types
+                .as_ref()
+                .map(|source| source.specifier.clone())
+        })
+    }
+
+    fn jsx_import_source_module(&self, referrer: &url::Url) -> &str {
+        self.jsx_config
+            .for_specifier(referrer)
+            .map(|config| config.module.as_str())
+            .unwrap_or(deno_graph::source::DEFAULT_JSX_IMPORT_SOURCE_MODULE)
+    }
+
     fn resolve(
         &self,
         specifier_text: &str,
         referrer_range: &Range,
         kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ResolveError> {
-        // jsr: and npm: specifiers are handled by the graph itself
-        // (load_jsr_specifier / load_npm_specifier); pass them through as URLs.
-        if specifier_text.starts_with("jsr:") || specifier_text.starts_with("npm:") {
-            return ModuleSpecifier::parse(specifier_text)
-                .map_err(|e| ResolveError::Other(deno_error::JsErrorBox::generic(e.to_string())));
-        }
         let resolution_kind = match kind {
             ResolutionKind::Execution => NodeResolutionKind::Execution,
             ResolutionKind::Types => NodeResolutionKind::Types,
@@ -184,7 +207,7 @@ impl deno_graph::source::NpmResolver for GraphResolver {
     }
 }
 
-/// deno_graph 0.110.1 stores `dep_graph_result` on the graph but uses each
+/// deno_graph 0.111.0 stores `dep_graph_result` on the graph but uses each
 /// per-request result to populate npm module slots. Associate an overall
 /// install failure with only this batch, preserving existing request errors.
 #[cfg(any(feature = "npm", test))]
@@ -204,6 +227,72 @@ pub(crate) fn propagate_dep_graph_error(result: &mut NpmResolvePkgReqsResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use url::Url;
+
+    #[test]
+    fn jsx_import_source_uses_referrers_workspace_settings() {
+        let _guard = crate::npm_cache::resolver_env_test_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("libdeno-jsx-resolver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("deno.json"), r#"{"lock":false,"imports":{"npm:shim":"./shim.js","jsr:shim":"./shim.js"},"compilerOptions":{"jsx":"react-jsx","jsxImportSource":"./runtime","jsxImportSourceTypes":"./types"}}"#).unwrap();
+        std::fs::write(dir.join("shim.js"), "export const shim = true;").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let shared = runtime
+            .block_on(crate::services::SharedServices::new(
+                dir.clone(),
+                vec![dir.clone()],
+            ))
+            .unwrap();
+        let referrer = Url::from_file_path(dir.join("main.tsx")).unwrap();
+        let resolver = &*shared.graph_resolver;
+        assert_eq!(
+            resolver.default_jsx_import_source(&referrer).as_deref(),
+            Some("./runtime")
+        );
+        assert_eq!(
+            resolver
+                .default_jsx_import_source_types(&referrer)
+                .as_deref(),
+            Some("./types")
+        );
+        assert_eq!(resolver.jsx_import_source_module(&referrer), "jsx-runtime");
+        let range = Range {
+            specifier: referrer.clone(),
+            range: deno_graph::PositionRange {
+                start: deno_graph::Position::zeroed(),
+                end: deno_graph::Position::zeroed(),
+            },
+            resolution_mode: None,
+        };
+        for raw in ["npm:shim", "jsr:shim"] {
+            assert_eq!(
+                deno_graph::source::Resolver::resolve(
+                    resolver,
+                    raw,
+                    &range,
+                    ResolutionKind::Execution
+                )
+                .unwrap(),
+                Url::from_file_path(dir.join("shim.js")).unwrap()
+            );
+        }
+        std::fs::write(dir.join("deno.json"), r#"{"lock":false,"compilerOptions":{"jsx":"react-jsxdev","jsxImportSource":"./runtime"}}"#).unwrap();
+        let dev = runtime
+            .block_on(crate::services::SharedServices::new(
+                dir.clone(),
+                vec![dir.clone()],
+            ))
+            .unwrap();
+        assert_eq!(
+            dev.graph_resolver.jsx_import_source_module(&referrer),
+            "jsx-dev-runtime"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn overall_npm_failure_reaches_only_ok_requests_and_preserves_causes() {
