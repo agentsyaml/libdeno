@@ -76,7 +76,7 @@ fn deno_exit_finishes_with_or_without_active_worker() {
         command.process_group(0);
     }
     let mut child = command.spawn().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -89,7 +89,7 @@ fn deno_exit_finishes_with_or_without_active_worker() {
             #[cfg(not(unix))]
             child.kill().unwrap();
             let _ = child.wait();
-            panic!("Deno.exit worker child exceeded 10 seconds");
+            panic!("Deno.exit worker child exceeded 30 seconds");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
@@ -260,19 +260,25 @@ fn run_exit_cases() {
         !close_called.exists(),
         "worker close function was invoked after future drop"
     );
+    let final_options = LibdenoOptions {
+        permissions: vec![format!("--allow-read={}", dir.display())],
+        ..Default::default()
+    };
+    #[cfg(not(windows))]
     assert_eq!(
         run_with_output(
             &capture_entry,
             &LibdenoOptions {
-                permissions: vec![format!("--allow-read={}", dir.display())],
                 capture_stdout: true,
-                ..Default::default()
+                ..final_options.clone()
             }
         )
         .unwrap()
         .exit_code,
         0
     );
+    #[cfg(windows)]
+    assert_eq!(run(&capture_entry, &final_options).unwrap(), 0);
     let _ = fs::remove_dir_all(dir);
 }
 

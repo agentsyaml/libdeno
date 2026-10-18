@@ -1627,6 +1627,21 @@ fn read_supervisor_terminal(
     stream: &mut TcpStream,
     context: SupervisorTerminalReadContext<'_>,
 ) -> std::io::Result<SupervisorTerminal> {
+    read_supervisor_terminal_with_duplicate_grace(
+        stream,
+        context,
+        Duration::from_millis(100),
+        || {},
+    )
+}
+
+#[cfg(feature = "execution-control")]
+fn read_supervisor_terminal_with_duplicate_grace(
+    stream: &mut TcpStream,
+    context: SupervisorTerminalReadContext<'_>,
+    duplicate_grace: Duration,
+    on_duplicate_deadline_started: impl FnOnce(),
+) -> std::io::Result<SupervisorTerminal> {
     let SupervisorTerminalReadContext {
         state,
         effective_deadline,
@@ -1704,9 +1719,10 @@ fn read_supervisor_terminal(
     // A child normally closes immediately after its one terminal frame. Give
     // a peer a short bounded window to prove an identical duplicate is benign
     // while still rejecting a conflicting duplicate.
-    let duplicate_deadline = supervisor_deadline_after(Duration::from_millis(100));
+    let duplicate_deadline = supervisor_deadline_after(duplicate_grace);
     let duplicate_deadline =
         cancel_grace_deadline.map_or(duplicate_deadline, |grace| duplicate_deadline.min(grace));
+    on_duplicate_deadline_started();
     while let Some(frame) =
         read_optional_frame_until(stream, FrameDirection::ChildToParent, duplicate_deadline)?
     {
@@ -2861,9 +2877,9 @@ mod tests {
     };
     #[cfg(feature = "execution-control")]
     use super::{
-        read_supervisor_terminal, start_supervisor_child_control,
-        start_supervisor_child_control_observed, SupervisorCancellation, SupervisorParentSession,
-        SupervisorTerminalReadContext,
+        read_supervisor_terminal, read_supervisor_terminal_with_duplicate_grace,
+        start_supervisor_child_control, start_supervisor_child_control_observed,
+        SupervisorCancellation, SupervisorParentSession, SupervisorTerminalReadContext,
     };
     #[cfg(feature = "execution-control")]
     use crate::limits::CancellationContext;
@@ -2917,13 +2933,15 @@ mod tests {
     }
 
     #[cfg(feature = "execution-control")]
-    fn read_test_terminal(
+    fn read_test_terminal_with_duplicate_grace(
         stream: &mut std::net::TcpStream,
         state: &std::sync::Arc<std::sync::Mutex<SupervisorParentSession>>,
+        duplicate_grace: Duration,
+        on_duplicate_deadline_started: impl FnOnce(),
     ) -> std::io::Result<SupervisorTerminal> {
         let cancellation =
             SupervisorCancellation::new(CancellationContext::new(), CancelReason::User);
-        read_supervisor_terminal(
+        read_supervisor_terminal_with_duplicate_grace(
             stream,
             SupervisorTerminalReadContext {
                 state,
@@ -2934,12 +2952,23 @@ mod tests {
                 read_cancellation: None,
                 on_started: None,
             },
+            duplicate_grace,
+            on_duplicate_deadline_started,
         )
     }
 
     #[cfg(feature = "execution-control")]
     fn terminal_fixture(
         send: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
+    ) -> std::io::Result<SupervisorTerminal> {
+        terminal_fixture_with_duplicate_grace(send, Duration::from_millis(100), || {})
+    }
+
+    #[cfg(feature = "execution-control")]
+    fn terminal_fixture_with_duplicate_grace(
+        send: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
+        duplicate_grace: Duration,
+        on_duplicate_deadline_started: impl FnOnce(),
     ) -> std::io::Result<SupervisorTerminal> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2952,7 +2981,12 @@ mod tests {
         });
         let mut stream = std::net::TcpStream::connect(address).unwrap();
         prepare_supervisor_stream(&stream).unwrap();
-        let result = read_test_terminal(&mut stream, &terminal_test_state());
+        let result = read_test_terminal_with_duplicate_grace(
+            &mut stream,
+            &terminal_test_state(),
+            duplicate_grace,
+            on_duplicate_deadline_started,
+        );
         let _ = done_tx.send(());
         peer.join().unwrap();
         result
@@ -3065,16 +3099,26 @@ mod tests {
     fn duplicate_terminal_frames_share_one_partial_frame_deadline() {
         use std::io::Write;
         let frame = terminal_frame(&completed_test_terminal());
-        let started = Instant::now();
-        let error = terminal_fixture(move |stream| {
-            write_frame(stream, &frame).unwrap();
-            write_frame(stream, &frame).unwrap();
-            std::thread::sleep(Duration::from_millis(70));
-            stream.write_all(b"L").unwrap();
-        })
+        let duplicate = terminal_wire(&frame);
+        let (deadline_started, wait_for_deadline) = std::sync::mpsc::channel();
+        let error = terminal_fixture_with_duplicate_grace(
+            move |stream| {
+                write_frame(stream, &frame).unwrap();
+                wait_for_deadline
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(700));
+                stream.write_all(&duplicate).unwrap();
+                stream.write_all(b"L").unwrap();
+                std::thread::sleep(Duration::from_millis(400));
+                stream.write_all(&duplicate[1..]).unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+            },
+            Duration::from_secs(1),
+            move || deadline_started.send(()).unwrap(),
+        )
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(started.elapsed() < Duration::from_millis(160));
     }
 
     #[test]
