@@ -283,7 +283,6 @@ deno_core::extension!(
     deps = [deno_net],
     ops = [op_libdeno_install_net_delegates],
     esm_entry_point = "ext:runtime_guards_ext/init.js",
-    esm = [dir "src/runtime_guards", "init.js"],
 );
 
 #[cfg(test)]
@@ -291,8 +290,41 @@ deno_core::extension!(
     runtime_guard_test_ext,
     deps = [deno_net, deno_kv, deno_cron],
     esm_entry_point = "ext:runtime_guard_test_ext/test_routes.js",
-    esm = [dir "src/runtime_guards", "test_routes.js"],
 );
+
+// These extensions are registered at runtime, so they are never baked into the
+// startup snapshot. deno_core's `esm = [dir ..., ...]` form records the build
+// tree path and reads it when the runtime starts, which only works on the
+// machine that compiled the crate. Embed the sources instead.
+fn embed_esm(
+    extension: &mut deno_core::Extension,
+    specifier: &'static str,
+    source: deno_core::FastStaticString,
+) {
+    extension.esm_files =
+        std::borrow::Cow::Owned(vec![deno_core::ExtensionFileSource::new(specifier, source)]);
+}
+
+fn guards_extension() -> deno_core::Extension {
+    let mut extension = runtime_guards_ext::init();
+    embed_esm(
+        &mut extension,
+        "ext:runtime_guards_ext/init.js",
+        deno_core::ascii_str_include!("runtime_guards/init.js"),
+    );
+    extension
+}
+
+#[cfg(test)]
+fn test_routes_extension() -> deno_core::Extension {
+    let mut extension = runtime_guard_test_ext::init();
+    embed_esm(
+        &mut extension,
+        "ext:runtime_guard_test_ext/test_routes.js",
+        deno_core::ascii_str_include!("runtime_guards/test_routes.js"),
+    );
+    extension
+}
 
 pub(crate) fn extensions(
     checker: Arc<deno_runtime::FeatureChecker>,
@@ -307,7 +339,7 @@ pub(crate) fn extensions(
     let tls = find_op(&net, "op_net_listen_tls");
     let tcp_guard = op_net_listen_tcp_guard();
     let tls_guard = op_net_listen_tls_guard();
-    let mut extension = runtime_guards_ext::init();
+    let mut extension = guards_extension();
     let mut ops = extension.ops.into_owned();
     let require_ops = require_guards::declarations();
     ops.extend(require_ops.iter().copied());
@@ -376,7 +408,7 @@ pub(crate) fn extensions(
     {
         let mut extensions = vec![extension];
         if test_probe {
-            extensions.push(runtime_guard_test_ext::init());
+            extensions.push(test_routes_extension());
         }
         extensions
     }
@@ -414,6 +446,25 @@ fn replace_op(original: deno_core::OpDecl, guard: deno_core::OpDecl) -> deno_cor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_guard_sources_are_embedded_in_the_binary() {
+        for extension in [guards_extension(), test_routes_extension()] {
+            for file in extension
+                .esm_files
+                .iter()
+                .chain(extension.js_files.iter())
+                .chain(extension.lazy_loaded_esm_files.iter())
+                .chain(extension.lazy_loaded_js_files.iter())
+            {
+                assert!(
+                    file.is_runtime_loadable(),
+                    "{} is read from the build tree at runtime",
+                    file.specifier
+                );
+            }
+        }
+    }
 
     #[test]
     fn missing_feature_checker_fails_closed() {

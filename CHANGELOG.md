@@ -7,6 +7,15 @@ breaking changes are highlighted per release with migration notes.
 
 ## Unreleased
 
+### Fixed
+
+- Embed the runtime guard scripts in the binary. Earlier builds registered
+  `src/runtime_guards/init.js` by absolute build-tree path and read it when a
+  runtime started, so any binary moved off the build machine (including the
+  published 0.3.5 wheels) failed with `No such file or directory`. Runtime-only
+  extensions are now embedded, and a regression test rejects path-based
+  extension sources.
+
 ## 0.3.5
 
 ### Added
