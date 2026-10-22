@@ -179,7 +179,6 @@ pub(crate) fn read_frame_after_first_byte(
         assembly_deadline,
         cancellation,
         || {},
-        None,
     )
 }
 
@@ -190,14 +189,9 @@ pub(crate) fn read_frame_after_first_byte_with_hook(
     assembly_deadline: Option<Instant>,
     cancellation: Option<&SupervisorCancellation>,
     on_first_byte: impl FnOnce(),
-    stop: Option<&dyn Fn() -> bool>,
 ) -> io::Result<SupervisorFrame> {
     let mut magic = [0u8; 4];
-    if let Some(stop) = stop {
-        read_until_stoppable(stream, &mut magic[..1], first_byte_deadline, stop)?;
-    } else {
-        read_until(stream, &mut magic[..1], first_byte_deadline, cancellation)?;
-    }
+    read_until(stream, &mut magic[..1], first_byte_deadline, cancellation)?;
     on_first_byte();
     let frame_started = Instant::now();
     let assembly_deadline = assembly_deadline.unwrap_or_else(|| {
@@ -205,23 +199,18 @@ pub(crate) fn read_frame_after_first_byte_with_hook(
             .checked_add(SUPERVISOR_FRAME_TIMEOUT)
             .unwrap_or(frame_started)
     });
-    if let Some(stop) = stop {
-        read_until_stoppable(stream, &mut magic[1..], Some(assembly_deadline), stop)?;
-    } else {
-        read_until(
-            stream,
-            &mut magic[1..],
-            Some(assembly_deadline),
-            cancellation,
-        )?;
-    }
+    read_until(
+        stream,
+        &mut magic[1..],
+        Some(assembly_deadline),
+        cancellation,
+    )?;
     read_frame_with_magic(
         stream,
         expected_direction,
         magic,
         Some(assembly_deadline),
         cancellation,
-        stop,
     )
 }
 
@@ -233,14 +222,7 @@ fn read_frame_with_deadline(
 ) -> io::Result<SupervisorFrame> {
     let mut magic = [0u8; 4];
     read_until(stream, &mut magic, deadline, cancellation)?;
-    read_frame_with_magic(
-        stream,
-        expected_direction,
-        magic,
-        deadline,
-        cancellation,
-        None,
-    )
+    read_frame_with_magic(stream, expected_direction, magic, deadline, cancellation)
 }
 
 fn read_frame_with_magic(
@@ -249,50 +231,36 @@ fn read_frame_with_magic(
     magic: [u8; 4],
     deadline: Option<Instant>,
     cancellation: Option<&SupervisorCancellation>,
-    stop: Option<&dyn Fn() -> bool>,
 ) -> io::Result<SupervisorFrame> {
     if magic != SUPERVISOR_MAGIC {
         return Err(invalid_data("invalid supervisor frame magic"));
     }
 
-    fn read(
-        stream: &mut TcpStream,
-        buffer: &mut [u8],
-        deadline: Option<Instant>,
-        cancellation: Option<&SupervisorCancellation>,
-        stop: Option<&dyn Fn() -> bool>,
-    ) -> io::Result<()> {
-        match stop {
-            Some(stop) => read_until_stoppable(stream, buffer, deadline, stop),
-            None => read_until(stream, buffer, deadline, cancellation),
-        }
-    }
-
     let mut version = [0u8; 1];
-    read(stream, &mut version, deadline, cancellation, stop)?;
+    read_until(stream, &mut version, deadline, cancellation)?;
     if version[0] != SUPERVISOR_VERSION {
         return Err(invalid_data("unsupported supervisor frame version"));
     }
 
     let mut kind_byte = [0u8; 1];
-    read(stream, &mut kind_byte, deadline, cancellation, stop)?;
+    read_until(stream, &mut kind_byte, deadline, cancellation)?;
     let kind = FrameKind::from_byte(kind_byte[0])
         .ok_or_else(|| invalid_data("unknown supervisor frame kind"))?;
     kind.validate_direction(expected_direction)?;
 
     let mut request_id = [0u8; 8];
-    read(stream, &mut request_id, deadline, cancellation, stop)?;
+    read_until(stream, &mut request_id, deadline, cancellation)?;
     let request_id = u64::from_be_bytes(request_id);
 
     let mut payload_len = [0u8; 4];
-    read(stream, &mut payload_len, deadline, cancellation, stop)?;
+    read_until(stream, &mut payload_len, deadline, cancellation)?;
     let payload_len = u32::from_be_bytes(payload_len);
     if payload_len > MAX_SUPERVISOR_FRAME_PAYLOAD as u32 {
         return Err(invalid_data("supervisor frame payload is too large"));
     }
 
     let mut payload = vec![0u8; payload_len as usize];
-    read(stream, &mut payload, deadline, cancellation, stop)?;
+    read_until(stream, &mut payload, deadline, cancellation)?;
     Ok(SupervisorFrame {
         kind,
         request_id,
@@ -328,14 +296,7 @@ pub(crate) fn read_optional_frame_until(
             Err(error)
         };
     }
-    match read_frame_with_magic(
-        stream,
-        expected_direction,
-        magic,
-        Some(deadline),
-        None,
-        None,
-    ) {
+    match read_frame_with_magic(stream, expected_direction, magic, Some(deadline), None) {
         Ok(frame) => Ok(Some(frame)),
         Err(error)
             if matches!(
@@ -966,7 +927,6 @@ fn read_until_with(
     buffer: &mut [u8],
     deadline: Option<Instant>,
     cancellation: Option<&SupervisorCancellation>,
-    stop: Option<&dyn Fn() -> bool>,
     mut read: impl FnMut(&mut TcpStream, &mut [u8]) -> io::Result<usize>,
 ) -> io::Result<()> {
     let mut offset = 0;
@@ -977,12 +937,6 @@ fn read_until_with(
                 "supervisor cancellation requested",
             ));
         }
-        if stop.is_some_and(|stop| stop()) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "supervisor control stop requested",
-            ));
-        }
         let remaining = deadline.map(|at| at.saturating_duration_since(Instant::now()));
         if remaining.is_some_and(|remaining| remaining.is_zero()) {
             return Err(io::Error::new(
@@ -990,19 +944,12 @@ fn read_until_with(
                 "supervisor frame deadline exceeded",
             ));
         }
-        // A stoppable read must poll so an idle control reader can observe
-        // `stop` without depending on platform-specific socket shutdown.
         #[cfg(not(target_vendor = "apple"))]
-        stream.set_read_timeout(if cancellation.is_some() {
-            Some(remaining.map_or(Duration::from_millis(10), |remaining| {
-                remaining.min(Duration::from_millis(10))
-            }))
-        } else if stop.is_some() {
-            Some(remaining.map_or(Duration::from_millis(100), |remaining| {
-                remaining.min(Duration::from_millis(100))
-            }))
-        } else {
-            remaining
+        stream.set_read_timeout(match (remaining, cancellation.is_some()) {
+            (Some(remaining), true) => Some(remaining.min(Duration::from_millis(10))),
+            (Some(remaining), false) => Some(remaining),
+            (None, true) => Some(Duration::from_millis(10)),
+            (None, false) => None,
         })?;
         match read(stream, &mut buffer[offset..]) {
             Ok(0) => {
@@ -1020,45 +967,13 @@ fn read_until_with(
                 ) =>
             {
                 #[cfg(target_vendor = "apple")]
-                {
-                    // A stoppable read must wake periodically even when the
-                    // socket itself has no timeout (macOS polls externally).
-                    let poll_deadline =
-                        match stop {
-                            Some(_) => Some(deadline.map_or(
-                                Instant::now() + Duration::from_millis(100),
-                                |deadline| {
-                                    deadline.min(Instant::now() + Duration::from_millis(100))
-                                },
-                            )),
-                            None => deadline,
-                        };
-                    match poll_readable(stream, poll_deadline, cancellation) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == io::ErrorKind::TimedOut && stop.is_some() => {
-                            if stop.is_some_and(|stop| stop()) {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::Interrupted,
-                                    "supervisor control stop requested",
-                                ));
-                            }
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
+                poll_readable(stream, deadline, cancellation)?;
                 #[cfg(not(target_vendor = "apple"))]
                 {
                     if cancellation.is_some_and(SupervisorCancellation::is_requested) {
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
                             "supervisor cancellation requested",
-                        ));
-                    }
-                    if stop.is_some_and(|stop| stop()) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Interrupted,
-                            "supervisor control stop requested",
                         ));
                     }
                     if deadline.is_some_and(|at| at <= Instant::now()) {
@@ -1081,30 +996,9 @@ fn read_until(
     deadline: Option<Instant>,
     cancellation: Option<&SupervisorCancellation>,
 ) -> io::Result<()> {
-    read_until_with(
-        stream,
-        buffer,
-        deadline,
-        cancellation,
-        None,
-        |stream, buffer| stream.read(buffer),
-    )
-}
-
-fn read_until_stoppable(
-    stream: &mut TcpStream,
-    buffer: &mut [u8],
-    deadline: Option<Instant>,
-    stop: &dyn Fn() -> bool,
-) -> io::Result<()> {
-    read_until_with(
-        stream,
-        buffer,
-        deadline,
-        None,
-        Some(stop),
-        |stream, buffer| stream.read(buffer),
-    )
+    read_until_with(stream, buffer, deadline, cancellation, |stream, buffer| {
+        stream.read(buffer)
+    })
 }
 
 #[cfg(target_vendor = "apple")]

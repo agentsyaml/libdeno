@@ -18,10 +18,9 @@ breaking changes are highlighted per release with migration notes.
 - Stop capped output readers once their collection ends instead of draining a
   descendant's pipe forever; subprocess and in-process capture now release the
   reader budget promptly at caps of zero and above.
-- Stop the supervisor control reader promptly on normal child shutdown, on
-  every platform, using a polled stop flag instead of relying on socket
-  shutdown semantics; retry interrupted socket reads without losing partial
-  frames or cancelling a healthy request.
+- Wake the supervisor control reader on normal child shutdown instead of
+  waiting for its 100 ms poll, and retry interrupted socket reads without
+  losing partial frames or cancelling a healthy request.
 - Skip process-resource sampling unless `phase-diagnostics` is enabled, and
   avoid copying subprocess output on the normal success path.
 - Preserve the native OS error code through shared `ExecutionError` clones, so

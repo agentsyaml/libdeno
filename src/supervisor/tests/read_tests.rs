@@ -7,7 +7,7 @@ fn retries_syscall_interruption_without_losing_partial_frame_bytes() {
     let mut calls = 0;
     let mut requested = Vec::new();
     let mut bytes = [0; 3];
-    read_until_with(&mut stream, &mut bytes, None, None, None, |_, buffer| {
+    read_until_with(&mut stream, &mut bytes, None, None, |_, buffer| {
         calls += 1;
         requested.push(buffer.len());
         match calls {
@@ -35,18 +35,11 @@ fn cancellation_interrupt_is_not_retried_as_a_syscall_interrupt() {
         CancelReason::User,
     );
     let mut calls = 0;
-    let error = read_until_with(
-        &mut stream,
-        &mut [0],
-        None,
-        Some(&cancellation),
-        None,
-        |_, _| {
-            calls += 1;
-            cancellation.request(CancelReason::User);
-            Err(io::ErrorKind::Interrupted.into())
-        },
-    )
+    let error = read_until_with(&mut stream, &mut [0], None, Some(&cancellation), |_, _| {
+        calls += 1;
+        cancellation.request(CancelReason::User);
+        Err(io::ErrorKind::Interrupted.into())
+    })
     .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     assert_eq!(calls, 1);
