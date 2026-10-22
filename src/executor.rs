@@ -575,10 +575,18 @@ impl ExecutionFailure {
         report: ExecutionReport,
         partial_output: Option<ExecutionOutput>,
     ) -> Self {
+        Self::new_with_shared_partial_output(error, report, partial_output.map(Arc::new))
+    }
+
+    fn new_with_shared_partial_output(
+        error: ExecutionError,
+        report: ExecutionReport,
+        partial_output: Option<Arc<ExecutionOutput>>,
+    ) -> Self {
         Self {
             error: Arc::new(error),
             report: Arc::new(report),
-            partial_output: partial_output.map(Arc::new),
+            partial_output,
         }
     }
 
@@ -632,6 +640,7 @@ struct SharedError {
 #[derive(Debug, Clone, Copy)]
 enum SharedErrorSource {
     Owner,
+    IoInner,
     CoreKind,
     CoreJsBoxInner,
 }
@@ -662,6 +671,13 @@ impl std::error::Error for SharedError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self.source {
             SharedErrorSource::Owner => Some(self.owner.as_ref()),
+            SharedErrorSource::IoInner => match self.owner.as_ref() {
+                ExecutionError::Libdeno(LibdenoError::Io(error)) => error
+                    .get_ref()
+                    .map(|source| source as &(dyn std::error::Error + 'static))
+                    .or(Some(self.owner.as_ref())),
+                _ => Some(self.owner.as_ref()),
+            },
             SharedErrorSource::CoreKind => match self.owner.as_ref() {
                 ExecutionError::Libdeno(LibdenoError::Core(error)) => Some(error.0.as_ref()),
                 _ => Some(self.owner.as_ref()),
@@ -723,10 +739,13 @@ fn clone_libdeno_error(error: &LibdenoError, owner: Arc<ExecutionError>) -> Libd
             ))
             .into_box(),
         ),
-        LibdenoError::Io(error) => LibdenoError::Io(std::io::Error::new(
-            error.kind(),
-            SharedError::new(owner, error, "Error", SharedErrorSource::Owner),
-        )),
+        LibdenoError::Io(error) => match error.raw_os_error() {
+            Some(code) => LibdenoError::Io(std::io::Error::from_raw_os_error(code)),
+            None => LibdenoError::Io(std::io::Error::new(
+                error.kind(),
+                SharedError::new(owner, error, "Error", SharedErrorSource::IoInner),
+            )),
+        },
         LibdenoError::Timeout(message) => LibdenoError::Timeout(message.clone()),
     }
 }
@@ -1030,14 +1049,6 @@ impl TaskControl {
                 failure.report.transport_status,
             ),
         };
-        let partial_output = match &backend_result {
-            // A supervisor can report a valid terminal result while its
-            // parent-owned capture is still bounded. If cancellation wins
-            // before publication, retain that captured output as partial.
-            Ok(result) if dispatched == ExecutionBackend::Subprocess => Some(result.output.clone()),
-            Ok(_) => None,
-            Err(failure) => failure.partial_output.as_deref().cloned(),
-        };
         let supervisor_failure = match &backend_result {
             Err(failure) => match failure.error() {
                 ExecutionError::Supervisor(
@@ -1069,7 +1080,7 @@ impl TaskControl {
                         Some(dispatched),
                         cleanup_strength,
                         transport_status,
-                        partial_output,
+                        backend_result_partial_output(&backend_result, dispatched),
                     )),
                 ),
                 Some(CancelReason::User | CancelReason::Shutdown) => (
@@ -1078,7 +1089,7 @@ impl TaskControl {
                         Some(dispatched),
                         cleanup_strength,
                         transport_status,
-                        partial_output,
+                        backend_result_partial_output(&backend_result, dispatched),
                     )),
                 ),
                 None => match backend_result {
@@ -1166,9 +1177,9 @@ impl TaskControl {
         dispatched: Option<ExecutionBackend>,
         cleanup_strength: Option<ExecutionCleanupStrength>,
         transport_status: Option<ExecutionTransportStatus>,
-        partial_output: Option<ExecutionOutput>,
+        partial_output: Option<Arc<ExecutionOutput>>,
     ) -> ExecutionFailure {
-        ExecutionFailure::new(
+        ExecutionFailure::new_with_shared_partial_output(
             ExecutionError::Cancelled,
             self.report_with_metadata(
                 dispatched,
@@ -1203,9 +1214,9 @@ impl TaskControl {
         dispatched: Option<ExecutionBackend>,
         cleanup_strength: Option<ExecutionCleanupStrength>,
         transport_status: Option<ExecutionTransportStatus>,
-        partial_output: Option<ExecutionOutput>,
+        partial_output: Option<Arc<ExecutionOutput>>,
     ) -> ExecutionFailure {
-        ExecutionFailure::new(
+        ExecutionFailure::new_with_shared_partial_output(
             ExecutionError::Libdeno(LibdenoError::Timeout(
                 "execution request deadline exceeded".to_string(),
             )),
@@ -1217,6 +1228,21 @@ impl TaskControl {
             ),
             partial_output,
         )
+    }
+}
+
+#[cfg(feature = "execution-control")]
+fn backend_result_partial_output(
+    result: &Result<ExecutionResult, ExecutionFailure>,
+    dispatched: ExecutionBackend,
+) -> Option<Arc<ExecutionOutput>> {
+    match result {
+        // The subprocess capture is only needed when cancellation replaces the result.
+        Ok(result) if dispatched == ExecutionBackend::Subprocess => {
+            Some(Arc::new(result.output.clone()))
+        }
+        Err(failure) => failure.partial_output.clone(),
+        _ => None,
     }
 }
 
@@ -2647,6 +2673,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cloned_io_errors_preserve_native_codes_and_custom_sources() {
+        let native = Arc::new(ExecutionError::Libdeno(LibdenoError::Io(
+            std::io::Error::from_raw_os_error(2),
+        )));
+        let cloned = clone_execution_error(&native);
+        assert!(matches!(
+            cloned,
+            ExecutionError::Libdeno(LibdenoError::Io(ref error))
+                if error.raw_os_error() == Some(2)
+        ));
+
+        #[derive(Debug)]
+        struct CustomIoError;
+        impl std::fmt::Display for CustomIoError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("custom io error")
+            }
+        }
+        impl std::error::Error for CustomIoError {}
+
+        let custom = Arc::new(ExecutionError::Libdeno(LibdenoError::Io(
+            std::io::Error::other(CustomIoError),
+        )));
+        let cloned = clone_execution_error(&custom);
+        let ExecutionError::Libdeno(LibdenoError::Io(error)) = cloned else {
+            panic!("cloned error changed type")
+        };
+        let mut source = std::error::Error::source(&error);
+        while let Some(error) = source {
+            if error.is::<CustomIoError>() {
+                return;
+            }
+            source = error.source();
+        }
+        panic!("custom I/O error was lost from the source chain");
+    }
+
+    #[test]
     fn disabled_observation_is_empty_and_secret_free() {
         let timing = ExecutionTiming::disabled();
         assert_eq!(timing.snapshot(), PhaseTiming::default());
@@ -3345,11 +3409,20 @@ mod tests {
             transport_status: None,
         };
         let cell = ResultCell::new();
-        cell.publish(Err(ExecutionFailure::new(
+        let failure = ExecutionFailure::new(
             ExecutionError::Libdeno(LibdenoError::Configuration("shared failure".to_string())),
             report,
             Some(output.clone()),
-        )));
+        );
+        let result = Err(failure);
+        let reused_partial = backend_result_partial_output(&result, ExecutionBackend::InProcess)
+            .expect("backend failure should retain its partial output");
+        let Err(failure) = result else { unreachable!() };
+        assert!(Arc::ptr_eq(
+            &reused_partial,
+            failure.partial_output.as_ref().unwrap()
+        ));
+        cell.publish(Err(failure));
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

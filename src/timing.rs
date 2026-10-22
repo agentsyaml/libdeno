@@ -251,6 +251,7 @@ impl Drop for TimingSpan {
     }
 }
 
+#[cfg(feature = "phase-diagnostics")]
 fn resource_sample() -> ResourceSample {
     ResourceSample {
         threads: thread_count(),
@@ -259,14 +260,19 @@ fn resource_sample() -> ResourceSample {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(feature = "phase-diagnostics"))]
+fn resource_sample() -> ResourceSample {
+    ResourceSample::default()
+}
+
+#[cfg(all(feature = "phase-diagnostics", target_os = "linux"))]
 fn thread_count() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/self/status").ok()?;
     text.lines()
         .find_map(|line| line.strip_prefix("Threads:")?.trim().parse().ok())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(feature = "phase-diagnostics", not(target_os = "linux")))]
 fn thread_count() -> Option<u64> {
     // Keep platform-specific process inspection out of the library's normal
     // execution path.  The diagnostic benchmark may report NA when the host
@@ -274,7 +280,7 @@ fn thread_count() -> Option<u64> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "phase-diagnostics", unix))]
 fn fd_count() -> Option<u64> {
     let directory = if cfg!(target_os = "linux") {
         "/proc/self/fd"
@@ -284,12 +290,12 @@ fn fd_count() -> Option<u64> {
     Some(std::fs::read_dir(directory).ok()?.count() as u64)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(feature = "phase-diagnostics", not(unix)))]
 fn fd_count() -> Option<u64> {
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "phase-diagnostics", target_os = "linux"))]
 fn rss_bytes() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/self/status").ok()?;
     let kilobytes: u64 = text
@@ -300,7 +306,7 @@ fn rss_bytes() -> Option<u64> {
     kilobytes.checked_mul(1024)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "phase-diagnostics", target_os = "macos"))]
 fn rss_bytes() -> Option<u64> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
@@ -311,7 +317,39 @@ fn rss_bytes() -> Option<u64> {
     u64::try_from(usage.ru_maxrss).ok()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "phase-diagnostics",
+    not(any(target_os = "linux", target_os = "macos"))
+))]
 fn rss_bytes() -> Option<u64> {
     None
+}
+
+#[cfg(all(test, any(not(feature = "phase-diagnostics"), target_os = "linux")))]
+mod tests {
+    use super::*;
+
+    #[cfg(not(feature = "phase-diagnostics"))]
+    #[test]
+    fn resource_samples_are_empty_without_diagnostics() {
+        let timing = ExecutionTiming::enabled();
+        let snapshot = timing.snapshot();
+        assert_eq!(snapshot.resources, ResourceTiming::default());
+    }
+
+    #[cfg(all(feature = "phase-diagnostics", target_os = "linux"))]
+    #[test]
+    fn resource_samples_are_captured_with_diagnostics() {
+        let timing = ExecutionTiming::enabled();
+        let snapshot = timing.snapshot();
+        #[cfg(target_os = "linux")]
+        {
+            assert!(snapshot.resources.start.threads.is_some());
+            assert!(snapshot.resources.start.fds.is_some());
+            assert!(snapshot.resources.start.rss_bytes.is_some());
+            assert!(snapshot.resources.end.threads.is_some());
+            assert!(snapshot.resources.end.fds.is_some());
+            assert!(snapshot.resources.end.rss_bytes.is_some());
+        }
+    }
 }

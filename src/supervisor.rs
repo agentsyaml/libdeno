@@ -172,8 +172,27 @@ pub(crate) fn read_frame_after_first_byte(
     assembly_deadline: Option<Instant>,
     cancellation: Option<&SupervisorCancellation>,
 ) -> io::Result<SupervisorFrame> {
+    read_frame_after_first_byte_with_hook(
+        stream,
+        expected_direction,
+        first_byte_deadline,
+        assembly_deadline,
+        cancellation,
+        || {},
+    )
+}
+
+pub(crate) fn read_frame_after_first_byte_with_hook(
+    stream: &mut TcpStream,
+    expected_direction: FrameDirection,
+    first_byte_deadline: Option<Instant>,
+    assembly_deadline: Option<Instant>,
+    cancellation: Option<&SupervisorCancellation>,
+    on_first_byte: impl FnOnce(),
+) -> io::Result<SupervisorFrame> {
     let mut magic = [0u8; 4];
     read_until(stream, &mut magic[..1], first_byte_deadline, cancellation)?;
+    on_first_byte();
     let frame_started = Instant::now();
     let assembly_deadline = assembly_deadline.unwrap_or_else(|| {
         frame_started
@@ -903,41 +922,36 @@ fn write_until(
 #[cfg(not(any(unix, windows)))]
 use std::io::Write;
 
-fn read_until(
+fn read_until_with(
     stream: &mut TcpStream,
     buffer: &mut [u8],
     deadline: Option<Instant>,
     cancellation: Option<&SupervisorCancellation>,
+    mut read: impl FnMut(&mut TcpStream, &mut [u8]) -> io::Result<usize>,
 ) -> io::Result<()> {
     let mut offset = 0;
     while offset < buffer.len() {
-        if cancellation.is_some_and(|cancellation| cancellation.is_requested()) {
+        if cancellation.is_some_and(SupervisorCancellation::is_requested) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "supervisor cancellation requested",
             ));
         }
-        let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let remaining = deadline.map(|at| at.saturating_duration_since(Instant::now()));
         if remaining.is_some_and(|remaining| remaining.is_zero()) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "supervisor frame deadline exceeded",
             ));
         }
-        // Set the timeout for each syscall. `read_exact` would keep one socket
-        // timeout across its internal reads, allowing a peer to reset the
-        // effective deadline by sending one byte at a time.
         #[cfg(not(target_vendor = "apple"))]
-        {
-            let timeout = match (remaining, cancellation.is_some()) {
-                (Some(remaining), true) => Some(remaining.min(Duration::from_millis(10))),
-                (Some(remaining), false) => Some(remaining),
-                (None, true) => Some(Duration::from_millis(10)),
-                (None, false) => None,
-            };
-            stream.set_read_timeout(timeout)?;
-        }
-        match stream.read(&mut buffer[offset..]) {
+        stream.set_read_timeout(match (remaining, cancellation.is_some()) {
+            (Some(remaining), true) => Some(remaining.min(Duration::from_millis(10))),
+            (Some(remaining), false) => Some(remaining),
+            (None, true) => Some(Duration::from_millis(10)),
+            (None, false) => None,
+        })?;
+        match read(stream, &mut buffer[offset..]) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -945,6 +959,7 @@ fn read_until(
                 ))
             }
             Ok(count) => offset += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error)
                 if matches!(
                     error.kind(),
@@ -955,13 +970,13 @@ fn read_until(
                 poll_readable(stream, deadline, cancellation)?;
                 #[cfg(not(target_vendor = "apple"))]
                 {
-                    if cancellation.is_some_and(|cancellation| cancellation.is_requested()) {
+                    if cancellation.is_some_and(SupervisorCancellation::is_requested) {
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
                             "supervisor cancellation requested",
                         ));
                     }
-                    if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                    if deadline.is_some_and(|at| at <= Instant::now()) {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "supervisor frame deadline exceeded",
@@ -973,6 +988,17 @@ fn read_until(
         }
     }
     Ok(())
+}
+
+fn read_until(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Option<Instant>,
+    cancellation: Option<&SupervisorCancellation>,
+) -> io::Result<()> {
+    read_until_with(stream, buffer, deadline, cancellation, |stream, buffer| {
+        stream.read(buffer)
+    })
 }
 
 #[cfg(target_vendor = "apple")]
@@ -1668,6 +1694,9 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[path = "read_tests.rs"]
+    mod read_tests;
 
     fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

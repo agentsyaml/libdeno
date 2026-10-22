@@ -152,6 +152,7 @@ struct StreamCapture {
     rx: std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
     /// Set by the reader thread when the byte cap was hit (truncated).
     overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct SavedFd(libc::c_int);
@@ -306,6 +307,8 @@ impl StreamCapture {
         let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
         let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let overflow_flag = overflow.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = stop.clone();
         // Dropping the handle detaches: finish() drains the channel with a
         // timeout, and joining could block forever while a detached child
         // holds the pipe write end (macOS posix_spawn ignores FD_CLOEXEC).
@@ -329,6 +332,9 @@ impl StreamCapture {
                     let n = unsafe {
                         libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, count)
                     };
+                    if stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
                     if n < 0 {
                         let error = std::io::Error::last_os_error();
                         if error.kind() == std::io::ErrorKind::Interrupted {
@@ -344,9 +350,9 @@ impl StreamCapture {
                     // discarding (never closing the read end): the pipe's write
                     // end is the script's fd 1/2, so closing it here would make
                     // the script's subsequent writes fail with EPIPE mid-run.
-                    // Draining also keeps a blocked writer flowing. The drain
-                    // ends when finish() restores the fds (EOF) or the receiver
-                    // disconnects.
+                    // Draining keeps an active writer flowing. finish/drop sets
+                    // stop only after the run ends; the reader checks it after
+                    // the next read so a capped stream cannot retain its fd.
                     if discarding {
                         continue;
                     }
@@ -407,6 +413,7 @@ impl StreamCapture {
             target_flags,
             rx,
             overflow,
+            stop,
         })
     }
 
@@ -423,9 +430,9 @@ impl StreamCapture {
     /// timeout, which reports an incomplete capture. The budget is
     /// total, not per-block: a child that *keeps writing* (a logging daemon)
     /// would otherwise reset the idle timer on every block and stall the
-    /// caller forever. A child that never exits also leaves the detached
-    /// reader thread blocked in read() until it does (one thread + fd per
-    /// such run — documented trade-off).
+    /// caller forever. A silent descendant that keeps the write end open can
+    /// still leave the detached reader blocked in read() until it writes or
+    /// exits (one thread + fd per such run — documented trade-off).
     fn finish(mut self) -> Result<(Vec<u8>, bool), std::io::Error> {
         // Defensive: finish() consumes self, so this can only trigger on a
         // double-finish bookkeeping bug. Never dup2 a closed fd number.
@@ -523,6 +530,7 @@ impl Drop for StreamCapture {
                 libc::close(saved);
             }
         }
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -602,6 +610,10 @@ mod tests {
     use super::collect_blocks_until;
     use super::reserve_capture_reader;
     use super::MAX_ACTIVE_CAPTURE_READERS;
+
+    #[cfg(unix)]
+    #[path = "capture_tests.rs"]
+    mod capture_tests;
 
     #[cfg(unix)]
     #[test]

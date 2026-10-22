@@ -914,6 +914,14 @@ enum SubprocessOutputReaderMessage {
 struct SubprocessOutputReader {
     receiver: std::sync::mpsc::Receiver<SubprocessOutputReaderMessage>,
     overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // Set on collector drop; checked after read so active requests keep draining.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for SubprocessOutputReader {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl SubprocessOutputReader {
@@ -922,11 +930,19 @@ impl SubprocessOutputReader {
         let (sender, receiver) = std::sync::mpsc::channel();
         let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let overflow_for_thread = overflow.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_for_thread = stop.clone();
         let reader = std::thread::Builder::new()
             .name("libdeno-subprocess-output-reader".to_string())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drain_pipe_to_channel(&mut pipe, max, &sender, &overflow_for_thread)
+                    drain_pipe_to_channel(
+                        &mut pipe,
+                        max,
+                        &sender,
+                        &overflow_for_thread,
+                        &stop_for_thread,
+                    )
                 }));
                 drop(pipe);
                 drop(reader_budget);
@@ -948,7 +964,11 @@ impl SubprocessOutputReader {
         // The reader owns its pipe and remains bounded by the collection
         // timeout/resource budget; joining it after a descendant inherits the
         // write end can block forever.
-        Ok(Self { receiver, overflow })
+        Ok(Self {
+            receiver,
+            overflow,
+            stop,
+        })
     }
 }
 
@@ -957,6 +977,7 @@ fn drain_pipe_to_channel(
     max: usize,
     sender: &std::sync::mpsc::Sender<SubprocessOutputReaderMessage>,
     overflow: &std::sync::atomic::AtomicBool,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()> {
     let mut retained = 0usize;
     let mut discarding = false;
@@ -967,10 +988,14 @@ fn drain_pipe_to_channel(
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         if n == 0 {
             return Ok(());
         }
         if discarding {
+            // Keep draining until the collector ends, then stop after this read.
             continue;
         }
         let keep = max.saturating_sub(retained).min(n);
@@ -1064,8 +1089,7 @@ impl SubprocessOutputCapture {
 }
 
 struct SubprocessOutputStream {
-    receiver: std::sync::mpsc::Receiver<SubprocessOutputReaderMessage>,
-    overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reader: SubprocessOutputReader,
     name: &'static str,
     output: Vec<u8>,
     error: Option<std::io::Error>,
@@ -1075,8 +1099,7 @@ struct SubprocessOutputStream {
 impl SubprocessOutputStream {
     fn new(reader: SubprocessOutputReader, name: &'static str) -> Self {
         Self {
-            receiver: reader.receiver,
-            overflow: reader.overflow,
+            reader,
             name,
             output: Vec::new(),
             error: None,
@@ -1107,7 +1130,7 @@ impl SubprocessOutputStream {
     }
 
     fn try_receive(&mut self) -> bool {
-        match self.receiver.try_recv() {
+        match self.reader.receiver.try_recv() {
             Ok(message) => {
                 self.accept(message);
                 true
@@ -1121,7 +1144,7 @@ impl SubprocessOutputStream {
     }
 
     fn wait_receive(&mut self, timeout: std::time::Duration) -> bool {
-        match self.receiver.recv_timeout(timeout) {
+        match self.reader.receiver.recv_timeout(timeout) {
             Ok(message) => {
                 self.accept(message);
                 true
@@ -1225,7 +1248,10 @@ impl SubprocessOutputReaders {
             .map(|stream| {
                 (
                     stream.output,
-                    stream.overflow.load(std::sync::atomic::Ordering::Relaxed),
+                    stream
+                        .reader
+                        .overflow
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     stream.error,
                 )
             })
@@ -1235,7 +1261,10 @@ impl SubprocessOutputReaders {
             .map(|stream| {
                 (
                     stream.output,
-                    stream.overflow.load(std::sync::atomic::Ordering::Relaxed),
+                    stream
+                        .reader
+                        .overflow
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     stream.error,
                 )
             })
@@ -2511,6 +2540,71 @@ fn supervisor_child_exit(
 }
 
 #[cfg(feature = "execution-control")]
+fn stop_supervisor_child_control(stream: &TcpStream, stop: &mpsc::Sender<()>) {
+    let _ = stop.send(());
+    // The read half is shared with the control worker; shutting it down wakes
+    // both an idle peek and a partial-frame read without closing terminal writes.
+    let _ = stream.shutdown(Shutdown::Read);
+}
+
+#[cfg(feature = "execution-control")]
+fn supervisor_child_control_stop_requested(stop: &mpsc::Receiver<()>) -> bool {
+    matches!(
+        stop.try_recv(),
+        Ok(()) | Err(mpsc::TryRecvError::Disconnected)
+    )
+}
+
+#[cfg(feature = "execution-control")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPeekOutcome {
+    Ready,
+    Idle,
+    Closed,
+    Stopped,
+}
+
+#[cfg(feature = "execution-control")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptedPeekAction {
+    Retry,
+    #[cfg(target_vendor = "apple")]
+    Idle,
+    Stopped,
+}
+
+#[cfg(feature = "execution-control")]
+fn peek_control_with_retry(
+    mut peek: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+    mut on_interrupted: impl FnMut() -> std::io::Result<InterruptedPeekAction>,
+) -> std::io::Result<ControlPeekOutcome> {
+    let mut byte = [0u8; 1];
+    loop {
+        match peek(&mut byte) {
+            Ok(0) => return Ok(ControlPeekOutcome::Closed),
+            Ok(_) => return Ok(ControlPeekOutcome::Ready),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                match on_interrupted()? {
+                    InterruptedPeekAction::Retry => continue,
+                    #[cfg(target_vendor = "apple")]
+                    InterruptedPeekAction::Idle => return Ok(ControlPeekOutcome::Idle),
+                    InterruptedPeekAction::Stopped => return Ok(ControlPeekOutcome::Stopped),
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Ok(ControlPeekOutcome::Idle)
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(feature = "execution-control")]
 fn start_supervisor_child_control(
     stream: &TcpStream,
     request_id: u64,
@@ -2519,7 +2613,15 @@ fn start_supervisor_child_control(
 ) -> Result<std::thread::JoinHandle<std::io::Result<()>>, LibdenoError> {
     #[cfg(test)]
     {
-        start_supervisor_child_control_inner(stream, request_id, cancellation, stop_rx, None)
+        start_supervisor_child_control_inner(
+            stream,
+            request_id,
+            cancellation,
+            stop_rx,
+            None,
+            None,
+            None,
+        )
     }
     #[cfg(not(test))]
     {
@@ -2534,6 +2636,8 @@ fn start_supervisor_child_control_inner(
     cancellation: SupervisorCancellation,
     stop_rx: mpsc::Receiver<()>,
     #[cfg(test)] idle_event: Option<mpsc::Sender<()>>,
+    #[cfg(test)] partial_frame_event: Option<mpsc::Sender<()>>,
+    #[cfg(test)] initial_idle_event: Option<mpsc::Sender<()>>,
 ) -> Result<std::thread::JoinHandle<std::io::Result<()>>, LibdenoError> {
     let mut stream = stream.try_clone().map_err(LibdenoError::Io)?;
     std::thread::Builder::new()
@@ -2542,11 +2646,20 @@ fn start_supervisor_child_control_inner(
             let result = (|| {
                 #[cfg(test)]
                 let mut idle_event_pending = false;
+                #[cfg(test)]
+                let mut initial_idle_event_pending = initial_idle_event.is_some();
                 #[cfg(not(target_vendor = "apple"))]
                 stream.set_read_timeout(Some(Duration::from_millis(100)))?;
                 loop {
-                    if stop_rx.try_recv().is_ok() {
+                    if supervisor_child_control_stop_requested(&stop_rx) {
                         return Ok(());
+                    }
+                    #[cfg(test)]
+                    if initial_idle_event_pending {
+                        if let Some(event) = &initial_idle_event {
+                            let _ = event.send(());
+                        }
+                        initial_idle_event_pending = false;
                     }
                     #[cfg(target_vendor = "apple")]
                     match poll_readable(
@@ -2560,38 +2673,77 @@ fn start_supervisor_child_control_inner(
                             notify_supervisor_child_idle(&idle_event, &mut idle_event_pending);
                             continue;
                         }
+                        Err(_) if supervisor_child_control_stop_requested(&stop_rx) => {
+                            return Ok(())
+                        }
                         Err(error) => return Err(error),
                     }
                     #[cfg(not(target_vendor = "apple"))]
                     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
                     #[cfg(test)]
                     notify_supervisor_child_idle(&idle_event, &mut idle_event_pending);
-                    let mut first_byte = [0u8; 1];
-                    match stream.peek(&mut first_byte) {
-                        Ok(0) => {
+                    match peek_control_with_retry(
+                        |byte| stream.peek(byte),
+                        || {
+                            if supervisor_child_control_stop_requested(&stop_rx) {
+                                return Ok(InterruptedPeekAction::Stopped);
+                            }
+                            #[cfg(target_vendor = "apple")]
+                            {
+                                match poll_readable(
+                                    &stream,
+                                    Some(supervisor_deadline_after(Duration::from_millis(100))),
+                                    None,
+                                ) {
+                                    Ok(()) => Ok(InterruptedPeekAction::Retry),
+                                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                                        Ok(InterruptedPeekAction::Idle)
+                                    }
+                                    Err(_) if supervisor_child_control_stop_requested(&stop_rx) => {
+                                        Ok(InterruptedPeekAction::Stopped)
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            #[cfg(not(target_vendor = "apple"))]
+                            {
+                                stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+                                Ok(InterruptedPeekAction::Retry)
+                            }
+                        },
+                    )? {
+                        ControlPeekOutcome::Ready => {}
+                        ControlPeekOutcome::Idle => continue,
+                        ControlPeekOutcome::Stopped => return Ok(()),
+                        ControlPeekOutcome::Closed => {
+                            if supervisor_child_control_stop_requested(&stop_rx) {
+                                return Ok(());
+                            }
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::UnexpectedEof,
                                 "supervisor control stream closed",
-                            ))
+                            ));
                         }
-                        Ok(_) => {}
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                            ) =>
-                        {
-                            continue
-                        }
-                        Err(error) => return Err(error),
                     }
-                    let frame = read_frame_after_first_byte(
+                    let frame = match crate::supervisor::read_frame_after_first_byte_with_hook(
                         &mut stream,
                         FrameDirection::ParentToChild,
                         None,
                         None,
                         None,
-                    )?;
+                        || {
+                            #[cfg(test)]
+                            if let Some(event) = &partial_frame_event {
+                                let _ = event.send(());
+                            }
+                        },
+                    ) {
+                        Ok(frame) => frame,
+                        Err(_) if supervisor_child_control_stop_requested(&stop_rx) => {
+                            return Ok(())
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if frame.kind != FrameKind::Cancel || frame.request_id != request_id {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -2645,6 +2797,46 @@ fn start_supervisor_child_control_observed(
         cancellation,
         stop_rx,
         Some(idle_event),
+        None,
+        None,
+    )
+}
+
+#[cfg(all(test, feature = "execution-control"))]
+fn start_supervisor_child_control_partial_observed(
+    stream: &TcpStream,
+    request_id: u64,
+    cancellation: SupervisorCancellation,
+    stop_rx: mpsc::Receiver<()>,
+    partial_frame_event: mpsc::Sender<()>,
+) -> Result<std::thread::JoinHandle<std::io::Result<()>>, LibdenoError> {
+    start_supervisor_child_control_inner(
+        stream,
+        request_id,
+        cancellation,
+        stop_rx,
+        None,
+        Some(partial_frame_event),
+        None,
+    )
+}
+
+#[cfg(all(test, feature = "execution-control"))]
+fn start_supervisor_child_control_initial_idle_observed(
+    stream: &TcpStream,
+    request_id: u64,
+    cancellation: SupervisorCancellation,
+    stop_rx: mpsc::Receiver<()>,
+    initial_idle_event: mpsc::Sender<()>,
+) -> Result<std::thread::JoinHandle<std::io::Result<()>>, LibdenoError> {
+    start_supervisor_child_control_inner(
+        stream,
+        request_id,
+        cancellation,
+        stop_rx,
+        None,
+        None,
+        Some(initial_idle_event),
     )
 }
 
@@ -2730,7 +2922,7 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
         Some(phase_frame_deadline(None)),
         None,
     ) {
-        let _ = stop_tx.send(());
+        stop_supervisor_child_control(&stream, &stop_tx);
         let _ = control.join();
         return Err(LibdenoError::Io(error));
     }
@@ -2762,7 +2954,7 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
             Some(cancellation.context()),
         )
     };
-    let _ = stop_tx.send(());
+    stop_supervisor_child_control(&stream, &stop_tx);
     let control_result = control.join();
 
     let reason = cancellation.reason();
@@ -2868,6 +3060,9 @@ pub fn maybe_handle_supervisor_mode() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[path = "lifecycle_tests.rs"]
+    mod lifecycle_tests;
+
     use super::active_handshake_writers;
     use super::active_subprocess_output_readers;
     use super::drain_pipe;
@@ -2889,8 +3084,9 @@ mod tests {
     use super::{
         collection_deadline_error, read_supervisor_terminal,
         read_supervisor_terminal_with_duplicate_grace, start_supervisor_child_control,
-        start_supervisor_child_control_observed, SupervisorCancellation, SupervisorParentSession,
-        SupervisorPartialOutput, SupervisorTerminalReadContext,
+        start_supervisor_child_control_observed, stop_supervisor_child_control,
+        SupervisorCancellation, SupervisorParentSession, SupervisorPartialOutput,
+        SupervisorTerminalReadContext,
     };
     #[cfg(feature = "execution-control")]
     use super::{
@@ -3219,6 +3415,7 @@ mod tests {
         let reader = SubprocessOutputReader {
             receiver,
             overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let capture = SubprocessOutputReaders {
             stdout: Some(reader),
@@ -3248,8 +3445,11 @@ mod tests {
         }
         let stream = |receiver: std::sync::mpsc::Receiver<SubprocessOutputReaderMessage>,
                       name: &'static str| SubprocessOutputStream {
-            receiver,
-            overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reader: SubprocessOutputReader {
+                receiver,
+                overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
             name,
             output: Vec::new(),
             error: None,
@@ -3278,6 +3478,7 @@ mod tests {
         let reader = super::SubprocessOutputReader {
             receiver: rx,
             overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let capture = SubprocessOutputReaders {
             stdout: Some(reader),
@@ -3337,6 +3538,7 @@ mod tests {
         let reader = super::SubprocessOutputReader {
             receiver: rx,
             overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let capture = SubprocessOutputReaders {
             stdout: Some(reader),
@@ -4162,12 +4364,9 @@ mod tests {
             .expect("child control did not enter its idle-read state after CANCEL");
 
         let stopped_at = Instant::now();
-        stop_tx.send(()).unwrap();
+        stop_supervisor_child_control(&receiver, &stop_tx);
         control.join().unwrap().unwrap();
-        assert!(
-            stopped_at.elapsed() < Duration::from_millis(200),
-            "idle control poll exceeded its stop budget"
-        );
+        assert!(stopped_at.elapsed() < Duration::from_millis(200));
     }
 
     #[cfg(feature = "execution-control")]
@@ -4219,30 +4418,6 @@ mod tests {
         assert!(control.join().unwrap().is_err());
         assert!(cancellation.is_requested());
         assert_eq!(cancellation.reason(), CancelReason::Deadline);
-    }
-
-    #[cfg(feature = "execution-control")]
-    #[test]
-    fn child_control_explicit_stop_does_not_cancel() {
-        use std::net::{TcpListener, TcpStream};
-        use std::sync::mpsc;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        prepare_supervisor_stream(&_peer).unwrap();
-        let (receiver, _) = listener.accept().unwrap();
-        prepare_supervisor_stream(&receiver).unwrap();
-        let cancellation = SupervisorCancellation::new(
-            crate::limits::CancellationContext::new(),
-            CancelReason::User,
-        );
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let control =
-            start_supervisor_child_control(&receiver, 73, cancellation.clone(), stop_rx).unwrap();
-        stop_tx.send(()).unwrap();
-
-        control.join().unwrap().unwrap();
-        assert!(!cancellation.is_requested());
     }
 
     #[test]
