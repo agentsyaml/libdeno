@@ -136,12 +136,17 @@ fn run_exit_cases() {
     assert!(!late.exists(), "terminated worker resumed after run return");
 
     let nested_late = dir.join("nested-late.txt");
+    let nested_started = dir.join("nested-started.txt");
     fs::write(dir.join("nested.js"), format!(
-        "const end=Date.now()+1200; while(Date.now()<end){{}} Deno.writeTextFileSync({:?}, 'nested-late');",
+        "Deno.writeTextFileSync({:?}, 'started'); const end=Date.now()+1200; while(Date.now()<end){{}} Deno.writeTextFileSync({:?}, 'nested-late');",
+        nested_started.display().to_string(),
         nested_late.display().to_string()
     )).unwrap();
+    // Post 'ready' only after the nested worker is actually running, so the
+    // exit below races a live worker rather than its startup.
     fs::write(&worker, format!(
-        "new Worker(new URL('./nested.js', import.meta.url).href, {{type:'module'}}); postMessage('ready'); const end=Date.now()+1200; while(Date.now()<end){{}} Deno.writeTextFileSync({:?}, 'late');",
+        "new Worker(new URL('./nested.js', import.meta.url).href, {{type:'module'}}); const limit=Date.now()+5000; while(Date.now()<limit){{ try {{ Deno.statSync({:?}); break; }} catch {{}} }} postMessage('ready'); const end=Date.now()+1200; while(Date.now()<end){{}} Deno.writeTextFileSync({:?}, 'late');",
+        nested_started.display().to_string(),
         late.display().to_string()
     )).unwrap();
     fs::write(&main, "const worker = new Worker(new URL('./worker.js', import.meta.url).href, {type:'module'}); worker.onmessage=()=>Deno.exit(7); worker.onerror=()=>Deno.exit(2);").unwrap();

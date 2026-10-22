@@ -2540,19 +2540,19 @@ fn supervisor_child_exit(
 }
 
 #[cfg(feature = "execution-control")]
-fn stop_supervisor_child_control(stream: &TcpStream, stop: &mpsc::Sender<()>) {
-    let _ = stop.send(());
-    // The read half is shared with the control worker; shutting it down wakes
-    // both an idle peek and a partial-frame read without closing terminal writes.
+type ControlStop = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+#[cfg(feature = "execution-control")]
+fn stop_supervisor_child_control(stream: &TcpStream, stop: &ControlStop) {
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The reader polls the flag every 100 ms; shutdown only makes the common
+    // case immediate and is unsupported on some platforms.
     let _ = stream.shutdown(Shutdown::Read);
 }
 
 #[cfg(feature = "execution-control")]
-fn supervisor_child_control_stop_requested(stop: &mpsc::Receiver<()>) -> bool {
-    matches!(
-        stop.try_recv(),
-        Ok(()) | Err(mpsc::TryRecvError::Disconnected)
-    )
+fn supervisor_child_control_stop_requested(stop: &ControlStop) -> bool {
+    stop.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(feature = "execution-control")]
@@ -2609,7 +2609,7 @@ fn start_supervisor_child_control(
     stream: &TcpStream,
     request_id: u64,
     cancellation: SupervisorCancellation,
-    stop_rx: mpsc::Receiver<()>,
+    stop: ControlStop,
 ) -> Result<std::thread::JoinHandle<std::io::Result<()>>, LibdenoError> {
     #[cfg(test)]
     {
@@ -2617,7 +2617,7 @@ fn start_supervisor_child_control(
             stream,
             request_id,
             cancellation,
-            stop_rx,
+            stop.clone(),
             None,
             None,
             None,
@@ -2625,7 +2625,7 @@ fn start_supervisor_child_control(
     }
     #[cfg(not(test))]
     {
-        start_supervisor_child_control_inner(stream, request_id, cancellation, stop_rx)
+        start_supervisor_child_control_inner(stream, request_id, cancellation, stop.clone())
     }
 }
 
@@ -2634,7 +2634,7 @@ fn start_supervisor_child_control_inner(
     stream: &TcpStream,
     request_id: u64,
     cancellation: SupervisorCancellation,
-    stop_rx: mpsc::Receiver<()>,
+    stop: ControlStop,
     #[cfg(test)] idle_event: Option<mpsc::Sender<()>>,
     #[cfg(test)] partial_frame_event: Option<mpsc::Sender<()>>,
     #[cfg(test)] initial_idle_event: Option<mpsc::Sender<()>>,
@@ -2651,7 +2651,7 @@ fn start_supervisor_child_control_inner(
                 #[cfg(not(target_vendor = "apple"))]
                 stream.set_read_timeout(Some(Duration::from_millis(100)))?;
                 loop {
-                    if supervisor_child_control_stop_requested(&stop_rx) {
+                    if supervisor_child_control_stop_requested(&stop) {
                         return Ok(());
                     }
                     #[cfg(test)]
@@ -2673,9 +2673,7 @@ fn start_supervisor_child_control_inner(
                             notify_supervisor_child_idle(&idle_event, &mut idle_event_pending);
                             continue;
                         }
-                        Err(_) if supervisor_child_control_stop_requested(&stop_rx) => {
-                            return Ok(())
-                        }
+                        Err(_) if supervisor_child_control_stop_requested(&stop) => return Ok(()),
                         Err(error) => return Err(error),
                     }
                     #[cfg(not(target_vendor = "apple"))]
@@ -2685,7 +2683,7 @@ fn start_supervisor_child_control_inner(
                     match peek_control_with_retry(
                         |byte| stream.peek(byte),
                         || {
-                            if supervisor_child_control_stop_requested(&stop_rx) {
+                            if supervisor_child_control_stop_requested(&stop) {
                                 return Ok(InterruptedPeekAction::Stopped);
                             }
                             #[cfg(target_vendor = "apple")]
@@ -2699,7 +2697,7 @@ fn start_supervisor_child_control_inner(
                                     Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
                                         Ok(InterruptedPeekAction::Idle)
                                     }
-                                    Err(_) if supervisor_child_control_stop_requested(&stop_rx) => {
+                                    Err(_) if supervisor_child_control_stop_requested(&stop) => {
                                         Ok(InterruptedPeekAction::Stopped)
                                     }
                                     Err(error) => Err(error),
@@ -2716,7 +2714,7 @@ fn start_supervisor_child_control_inner(
                         ControlPeekOutcome::Idle => continue,
                         ControlPeekOutcome::Stopped => return Ok(()),
                         ControlPeekOutcome::Closed => {
-                            if supervisor_child_control_stop_requested(&stop_rx) {
+                            if supervisor_child_control_stop_requested(&stop) {
                                 return Ok(());
                             }
                             return Err(std::io::Error::new(
@@ -2725,6 +2723,7 @@ fn start_supervisor_child_control_inner(
                             ));
                         }
                     }
+                    let stop_check = || supervisor_child_control_stop_requested(&stop);
                     let frame = match crate::supervisor::read_frame_after_first_byte_with_hook(
                         &mut stream,
                         FrameDirection::ParentToChild,
@@ -2737,11 +2736,10 @@ fn start_supervisor_child_control_inner(
                                 let _ = event.send(());
                             }
                         },
+                        Some(&stop_check),
                     ) {
                         Ok(frame) => frame,
-                        Err(_) if supervisor_child_control_stop_requested(&stop_rx) => {
-                            return Ok(())
-                        }
+                        Err(_) if supervisor_child_control_stop_requested(&stop) => return Ok(()),
                         Err(error) => return Err(error),
                     };
                     if frame.kind != FrameKind::Cancel || frame.request_id != request_id {
@@ -2788,14 +2786,14 @@ fn start_supervisor_child_control_observed(
     stream: &TcpStream,
     request_id: u64,
     cancellation: SupervisorCancellation,
-    stop_rx: mpsc::Receiver<()>,
+    stop: ControlStop,
     idle_event: mpsc::Sender<()>,
 ) -> Result<std::thread::JoinHandle<std::io::Result<()>>, LibdenoError> {
     start_supervisor_child_control_inner(
         stream,
         request_id,
         cancellation,
-        stop_rx,
+        stop,
         Some(idle_event),
         None,
         None,
@@ -2807,14 +2805,14 @@ fn start_supervisor_child_control_partial_observed(
     stream: &TcpStream,
     request_id: u64,
     cancellation: SupervisorCancellation,
-    stop_rx: mpsc::Receiver<()>,
+    stop: ControlStop,
     partial_frame_event: mpsc::Sender<()>,
 ) -> Result<std::thread::JoinHandle<std::io::Result<()>>, LibdenoError> {
     start_supervisor_child_control_inner(
         stream,
         request_id,
         cancellation,
-        stop_rx,
+        stop,
         None,
         Some(partial_frame_event),
         None,
@@ -2826,14 +2824,14 @@ fn start_supervisor_child_control_initial_idle_observed(
     stream: &TcpStream,
     request_id: u64,
     cancellation: SupervisorCancellation,
-    stop_rx: mpsc::Receiver<()>,
+    stop: ControlStop,
     initial_idle_event: mpsc::Sender<()>,
 ) -> Result<std::thread::JoinHandle<std::io::Result<()>>, LibdenoError> {
     start_supervisor_child_control_inner(
         stream,
         request_id,
         cancellation,
-        stop_rx,
+        stop,
         None,
         None,
         Some(initial_idle_event),
@@ -2908,10 +2906,10 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
         ));
     }
 
-    let (stop_tx, stop_rx) = mpsc::channel();
+    let stop = ControlStop::default();
     let cancellation = SupervisorCancellation::new(CancellationContext::new(), CancelReason::User);
     let control =
-        start_supervisor_child_control(&stream, request_id, cancellation.clone(), stop_rx)?;
+        start_supervisor_child_control(&stream, request_id, cancellation.clone(), stop.clone())?;
     // STARTED is sent only after the control reader exists. No runtime call is
     // made before this frame is successfully written.
     let started = SupervisorFrame::new(FrameKind::Started, request_id, Vec::new())
@@ -2922,7 +2920,7 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
         Some(phase_frame_deadline(None)),
         None,
     ) {
-        stop_supervisor_child_control(&stream, &stop_tx);
+        stop_supervisor_child_control(&stream, &stop);
         let _ = control.join();
         return Err(LibdenoError::Io(error));
     }
@@ -2954,7 +2952,7 @@ fn run_supervisor_child(endpoint: SocketAddr, token: SupervisorToken) -> Result<
             Some(cancellation.context()),
         )
     };
-    stop_supervisor_child_control(&stream, &stop_tx);
+    stop_supervisor_child_control(&stream, &stop);
     let control_result = control.join();
 
     let reason = cancellation.reason();
@@ -4321,13 +4319,13 @@ mod tests {
             crate::limits::CancellationContext::new(),
             CancelReason::User,
         );
-        let (stop_tx, stop_rx) = mpsc::channel();
+        let stop = super::ControlStop::default();
         let (idle_tx, idle_rx) = mpsc::channel();
         let control = start_supervisor_child_control_observed(
             &receiver,
             request_id,
             cancellation.clone(),
-            stop_rx,
+            stop.clone(),
             idle_tx,
         )
         .unwrap();
@@ -4364,7 +4362,7 @@ mod tests {
             .expect("child control did not enter its idle-read state after CANCEL");
 
         let stopped_at = Instant::now();
-        stop_supervisor_child_control(&receiver, &stop_tx);
+        stop_supervisor_child_control(&receiver, &stop);
         control.join().unwrap().unwrap();
         assert!(stopped_at.elapsed() < Duration::from_millis(200));
     }
@@ -4373,7 +4371,6 @@ mod tests {
     #[test]
     fn child_control_peer_eof_requests_cancellation() {
         use std::net::{TcpListener, TcpStream};
-        use std::sync::mpsc;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -4384,9 +4381,9 @@ mod tests {
             crate::limits::CancellationContext::new(),
             CancelReason::User,
         );
-        let (_stop_tx, stop_rx) = mpsc::channel();
+        let stop = super::ControlStop::default();
         let control =
-            start_supervisor_child_control(&receiver, 73, cancellation.clone(), stop_rx).unwrap();
+            start_supervisor_child_control(&receiver, 73, cancellation.clone(), stop).unwrap();
         drop(peer);
 
         assert!(control.join().unwrap().is_err());
@@ -4398,7 +4395,6 @@ mod tests {
     #[test]
     fn child_control_peer_loss_preserves_prior_deadline_reason() {
         use std::net::{TcpListener, TcpStream};
-        use std::sync::mpsc;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -4410,9 +4406,9 @@ mod tests {
             CancelReason::User,
         );
         cancellation.request(CancelReason::Deadline);
-        let (_stop_tx, stop_rx) = mpsc::channel();
+        let stop = super::ControlStop::default();
         let control =
-            start_supervisor_child_control(&receiver, 73, cancellation.clone(), stop_rx).unwrap();
+            start_supervisor_child_control(&receiver, 73, cancellation.clone(), stop).unwrap();
         drop(peer);
 
         assert!(control.join().unwrap().is_err());

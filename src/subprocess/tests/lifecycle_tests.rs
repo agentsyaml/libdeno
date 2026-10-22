@@ -28,18 +28,18 @@ fn control_stop_wakes_idle_reader_without_cancellation() {
         crate::limits::CancellationContext::new(),
         CancelReason::User,
     );
-    let (stop_tx, stop_rx) = mpsc::channel();
+    let stop = super::super::ControlStop::default();
     let (idle_tx, idle_rx) = mpsc::channel();
     let control = start_supervisor_child_control_initial_idle_observed(
         &receiver,
         73,
         cancellation.clone(),
-        stop_rx,
+        stop.clone(),
         idle_tx,
     )
     .unwrap();
     idle_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    stop_supervisor_child_control(&receiver, &stop_tx);
+    stop_supervisor_child_control(&receiver, &stop);
     control.join().unwrap().unwrap();
     assert!(!cancellation.is_requested());
 }
@@ -152,6 +152,52 @@ fn control_peek_retries_interrupted_and_honors_stop() {
 
 #[cfg(feature = "execution-control")]
 #[test]
+fn control_stop_alone_exits_a_partial_frame_read() {
+    // Windows may report an error from shutdown(Read) without waking a
+    // blocked reader, so the stop flag must end the read by itself.
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    prepare_supervisor_stream(&peer).unwrap();
+    let (receiver, _) = listener.accept().unwrap();
+    prepare_supervisor_stream(&receiver).unwrap();
+    let cancellation = SupervisorCancellation::new(
+        crate::limits::CancellationContext::new(),
+        CancelReason::User,
+    );
+    let stop = super::super::ControlStop::default();
+    let (partial_tx, partial_rx) = mpsc::channel();
+    let control = start_supervisor_child_control_partial_observed(
+        &receiver,
+        73,
+        cancellation.clone(),
+        stop.clone(),
+        partial_tx,
+    )
+    .unwrap();
+    peer.write_all(&SUPERVISOR_MAGIC[..1]).unwrap();
+    partial_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("control reader did not start the frame");
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(control.join());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("stop alone did not end the partial-frame read")
+        .unwrap()
+        .unwrap();
+    assert!(!cancellation.is_requested());
+}
+
+#[cfg(feature = "execution-control")]
+#[test]
 fn control_stop_wakes_partial_frame_and_preserves_terminal_write() {
     const CHILD: &str = "LIBDENO_CHILD_CONTROL_STOP_TEST";
     if std::env::var(CHILD).ok().as_deref() == Some("1") {
@@ -167,13 +213,13 @@ fn control_stop_wakes_partial_frame_and_preserves_terminal_write() {
             crate::limits::CancellationContext::new(),
             CancelReason::User,
         );
-        let (stop_tx, stop_rx) = mpsc::channel();
+        let stop = super::super::ControlStop::default();
         let (partial_tx, partial_rx) = mpsc::channel();
         let control = start_supervisor_child_control_partial_observed(
             &receiver,
             73,
             cancellation.clone(),
-            stop_rx,
+            stop.clone(),
             partial_tx,
         )
         .unwrap();
@@ -181,7 +227,7 @@ fn control_stop_wakes_partial_frame_and_preserves_terminal_write() {
         partial_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
-        stop_supervisor_child_control(&receiver, &stop_tx);
+        stop_supervisor_child_control(&receiver, &stop);
         control.join().unwrap().unwrap();
         assert!(!cancellation.is_requested());
         write_frame(
@@ -218,8 +264,8 @@ fn control_stop_wakes_partial_frame_and_preserves_terminal_write() {
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
-            panic!("control-stop child timed out");
+            let output = child.wait_with_output().unwrap();
+            panic!("control-stop child timed out: {output:?}");
         }
         std::thread::yield_now();
     }
