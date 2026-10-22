@@ -16,6 +16,12 @@ breaking changes are highlighted per release with migration notes.
   extensions are now embedded, and a regression test rejects path-based
   extension sources.
 
+### Security
+
+- Update `rustls-webpki` to 0.103.16 and `webpki-roots`/`webpki-root-certs`
+  to 1.0.10, which reject the distrusted emSign intermediates
+  (RUSTSEC-2026-0381, RUSTSEC-2026-0382, RUSTSEC-2026-0383).
+
 ## 0.3.5
 
 ### Added
