@@ -140,7 +140,38 @@ fn create_cli_snapshot(snapshot_path: &Path, residual_path: &Path, out_dir: &Pat
         target: env::var("TARGET").unwrap(),
     };
 
-    let output = create_runtime_snapshot(snapshot_path.to_path_buf(), snapshot_options, vec![]);
+    // Snapshot creation boots a full Deno runtime, which reads extension
+    // sources from the cargo registry. A missing file there surfaces only as
+    // "os error 2" from V8's runtime init, which is impossible to act on, so
+    // print the environment that decides those paths before re-panicking.
+    let output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        create_runtime_snapshot(snapshot_path.to_path_buf(), snapshot_options, vec![])
+    })) {
+        Ok(output) => output,
+        Err(payload) => {
+            eprintln!("libdeno: snapshot creation failed before the crate compiled");
+            for name in [
+                "TARGET",
+                "HOST",
+                "CARGO_HOME",
+                "CARGO_MANIFEST_DIR",
+                "OUT_DIR",
+            ] {
+                if let Some(value) = env::var_os(name) {
+                    eprintln!("  {name}={}", PathBuf::from(value).display());
+                }
+            }
+            if let Ok(cwd) = env::current_dir() {
+                eprintln!("  cwd={}", cwd.display());
+            }
+            eprintln!(
+                "  hint: ensure the cargo registry checkout under CARGO_HOME is readable \
+                 (offline mirrors, moved vendor directories, junctions, and antivirus \
+                 quarantine can hide it)."
+            );
+            std::panic::resume_unwind(payload);
+        }
+    };
 
     let consumed: HashSet<&str> = output
         .consumed_lazy_specifiers

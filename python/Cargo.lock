@@ -4835,7 +4835,7 @@ dependencies = [
 
 [[package]]
 name = "libdeno"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4871,7 +4871,7 @@ dependencies = [
 
 [[package]]
 name = "libdeno-python"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "libdeno",
  "pyo3",

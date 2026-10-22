@@ -5,7 +5,7 @@ breaking changes are highlighted per release with migration notes.
 
 [keep a changelog]: https://keepachangelog.com/en/1.1.0/
 
-## Unreleased
+## 0.3.6
 
 ### Fixed
 
@@ -15,6 +15,16 @@ breaking changes are highlighted per release with migration notes.
   published 0.3.5 wheels) failed with `No such file or directory`. Runtime-only
   extensions are now embedded, and a regression test rejects path-based
   extension sources.
+- Stop capped output readers once their collection ends instead of draining a
+  descendant's pipe forever; subprocess and in-process capture now release the
+  reader budget promptly at caps of zero and above.
+- Wake the supervisor control reader on normal child shutdown instead of
+  waiting for its 100 ms poll, and retry interrupted socket reads without
+  losing partial frames or cancelling a healthy request.
+- Skip process-resource sampling unless `phase-diagnostics` is enabled, and
+  avoid copying subprocess output on the normal success path.
+- Preserve the native OS error code through shared `ExecutionError` clones, so
+  `into_parts()` no longer drops `raw_os_error()`.
 
 ### Security
 

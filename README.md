@@ -143,6 +143,12 @@ See the [full API reference](docs/api.md) or the
   rejected; build natively for the target. Prebuilt snapshots are unsupported,
   and matching CPU architecture does not certify OS/ABI compatibility.
 - Hosts that load `.node` addons must export `napi_*` symbols; see [`docs/getting-started.md`](docs/getting-started.md) for linker setup.
+- The compiled binary is self-contained: runtime extension scripts are embedded,
+  so it can be copied to a machine without the Rust build tree. If snapshot
+  creation fails with `No such file or directory`, the build prints the cargo
+  paths it used; check that the `CARGO_HOME` registry checkout is readable
+  (offline mirrors, moved vendor directories, junctions, and antivirus
+  quarantine can hide it).
 
 ### Cargo feature: `npm`
 
