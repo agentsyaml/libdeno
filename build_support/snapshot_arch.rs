@@ -8,6 +8,6 @@ pub fn ensure_compatible(
         return Ok(());
     }
     Err(format!(
-        "libdeno cannot build its runtime snapshot for cross-architecture TARGET={target}: HOST={host} (arch {host_arch}) differs from target arch {target_arch}. Snapshot creation runs on the build host; build natively for the target architecture. Prebuilt snapshots are not supported."
+        "libdeno cannot build its runtime snapshot for cross-architecture TARGET={target}: HOST={host} (arch {host_arch}) differs from target arch {target_arch}. Snapshot creation runs on the build host; build natively for the target architecture, or point LIBDENO_SNAPSHOT_DIR at a\n         snapshot bundle built for the target (see docs/prebuilt-snapshots.md)."
     ))
 }

@@ -24,15 +24,27 @@ use deno_runtime::snapshot::LazyExtensionFileKind;
 #[path = "build_support/snapshot_arch.rs"]
 mod snapshot_arch;
 
-fn main() {
-    #[cfg(feature = "snapshot")]
-    ensure_snapshot_architecture();
+#[cfg(feature = "snapshot")]
+#[path = "build_support/snapshot_bundle.rs"]
+mod snapshot_bundle;
+#[cfg(feature = "snapshot")]
+#[path = "build_support/snapshot_sources.rs"]
+mod snapshot_sources;
 
+fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
     #[cfg(feature = "snapshot")]
     {
         println!("cargo:rerun-if-env-changed=DENO_SNAPSHOT_MINIFY_SOURCES");
+        println!("cargo:rerun-if-env-changed=LIBDENO_SNAPSHOT_DIR");
+        println!("cargo:rerun-if-env-changed=LIBDENO_SNAPSHOT_EXPORT_DIR");
+        // A bundle carries a snapshot for its own target, so importing one is
+        // also the supported way to build for another architecture.
+        let prebuilt = env::var_os("LIBDENO_SNAPSHOT_DIR");
+        if prebuilt.is_none() {
+            ensure_snapshot_architecture();
+        }
         // The integration smoke test invokes this exact build-script binary.
         let marker = out_dir.join("SNAPSHOT_BUILD_SCRIPT_PATH");
         std::fs::write(
@@ -48,9 +60,17 @@ fn main() {
             "cargo:rustc-env=LIBDENO_SNAPSHOT_BUILD_SCRIPT_MARKER={}",
             marker.display()
         );
-        let snapshot_path = out_dir.join("CLI_SNAPSHOT.bin");
-        let residual_path = out_dir.join("EXTENSION_RESIDUAL_SOURCES.rs");
-        create_cli_snapshot(&snapshot_path, &residual_path, &out_dir);
+        match prebuilt {
+            Some(dir) => install_prebuilt_snapshot(Path::new(&dir), &out_dir),
+            None => {
+                let snapshot_path = out_dir.join("CLI_SNAPSHOT.bin");
+                let residual_path = out_dir.join("EXTENSION_RESIDUAL_SOURCES.rs");
+                create_cli_snapshot(&snapshot_path, &residual_path, &out_dir);
+                if let Some(dir) = env::var_os("LIBDENO_SNAPSHOT_EXPORT_DIR") {
+                    export_snapshot_bundle(Path::new(&dir), &snapshot_path, &residual_path);
+                }
+            }
+        }
     }
 
     // Node-API symbols: the example host binary re-exports napi_* via
@@ -104,38 +124,72 @@ fn ensure_snapshot_architecture() {
         .unwrap_or_else(|error| panic!("{error}"));
 }
 
+// The TypeScript version bundled in deno_runtime 0.267.0's snapshot.
+// No crate in the dep tree exposes the bundled TypeScript compiler version
+// (deno_ast::VERSION is the deno_ast crate version, not the TS compiler's), so
+// it cannot be machine-verified against a dependency. Source of truth: the deno
+// repo's cli/snapshot/shared.rs TS_VERSION at the tag for deno_runtime 0.267.0
+// (v2.9.7) — update in lockstep with the deno_runtime bump.
+//
+// The checked-in Cargo.toml ledger and the offline CI/release checks catch
+// local declaration drift, but they cannot prove upstream provenance. When
+// bumping deno_runtime, copy TS_VERSION from the matching deno tag and update
+// the ledger together. Snapshot bundles record this value, so a stale entry
+// also rejects bundles built by another version.
 #[cfg(feature = "snapshot")]
-fn create_cli_snapshot(snapshot_path: &Path, residual_path: &Path, out_dir: &Path) {
-    // The TypeScript version bundled in deno_runtime 0.267.0's snapshot.
-    // No crate in the dep tree exposes the bundled TypeScript compiler
-    // version (deno_ast::VERSION is the deno_ast crate version, not the TS
-    // compiler's), so it cannot be machine-verified against a dependency.
-    // Source of truth: the deno repo's cli/snapshot/shared.rs TS_VERSION at
-    // the tag for deno_runtime 0.267.0 (v2.9.7) — update in lockstep with the
-    // deno_runtime bump (see the format assertion below).
-    //
-    // There is no public constant to machine-check this against. The checked-in
-    // Cargo.toml compatibility ledger and the offline CI/release checks catch
-    // local declaration drift, but they cannot prove upstream provenance. When
-    // bumping deno_runtime, manually copy TS_VERSION from the corresponding
-    // deno tag's cli/snapshot/shared.rs and update that ledger together.
+fn typescript_version() -> &'static str {
     const TS_VERSION: &str = "6.0.3";
-    // Sanity check: TS_VERSION must be a bare x.y.z version. This only
-    // catches malformed values, not a wrong-but-well-formed one; upgrading
-    // deno_runtime still requires the manual upstream-tag check described
-    // above.
-    let ts_version_parts: Vec<&str> = TS_VERSION.split('.').collect();
+    // Only catches malformed values, not a wrong-but-well-formed one.
+    let parts: Vec<&str> = TS_VERSION.split('.').collect();
     assert!(
-        ts_version_parts.len() == 3
-            && ts_version_parts
+        parts.len() == 3
+            && parts
                 .iter()
                 .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
         "TS_VERSION {TS_VERSION:?} must be a bare x.y.z version; \
          sync it by hand with the deno tag when bumping deno_runtime"
     );
+    TS_VERSION
+}
+
+/// Snapshot creation reads every extension source from disk, and deno_core
+/// reports a missing one as a bare `os error 2` with no path. An incompletely
+/// copied `[patch.crates-io]` path dependency is the usual cause, so name the
+/// files instead of leaving the error opaque.
+#[cfg(feature = "snapshot")]
+fn ensure_extension_sources_exist() {
+    let collect = || {
+        let extensions = deno_runtime::snapshot_info::get_extensions_in_snapshot();
+        snapshot_sources::missing(&extensions)
+    };
+    // Diagnostic only: never turn a panic in the enumeration itself into a
+    // build failure that did not exist before.
+    let Ok(missing) = std::panic::catch_unwind(collect) else {
+        return;
+    };
+    if missing.is_empty() {
+        return;
+    }
+    let list = missing
+        .iter()
+        .map(|path| format!("  {path}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    panic!(
+        "libdeno: {} extension source file(s) that snapshot creation reads from disk are \
+         missing:\n{list}\n\
+         This usually means a [patch.crates-io] path dependency was copied without all \
+         of its files; restore them or drop the patch.",
+        missing.len()
+    );
+}
+
+#[cfg(feature = "snapshot")]
+fn create_cli_snapshot(snapshot_path: &Path, residual_path: &Path, out_dir: &Path) {
+    ensure_extension_sources_exist();
 
     let snapshot_options = SnapshotOptions {
-        ts_version: TS_VERSION.to_string(),
+        ts_version: typescript_version().to_string(),
         v8_version: deno_runtime::deno_core::v8::VERSION_STRING,
         target: env::var("TARGET").unwrap(),
     };
@@ -264,4 +318,151 @@ fn write_residual_table(
         .unwrap();
     }
     writeln!(f, "];\n").unwrap();
+}
+
+#[cfg(feature = "snapshot")]
+fn snapshot_identity() -> snapshot_bundle::Identity {
+    let (deno_core, deno_runtime) = declared_deno_versions();
+    snapshot_bundle::Identity {
+        libdeno: env!("CARGO_PKG_VERSION").to_string(),
+        target: env::var("TARGET").expect("Cargo must provide TARGET to the build script"),
+        v8: deno_runtime_version_string(),
+        typescript: typescript_version().to_string(),
+        deno_core,
+        deno_runtime,
+    }
+}
+
+#[cfg(feature = "snapshot")]
+fn deno_runtime_version_string() -> String {
+    deno_runtime::deno_core::v8::VERSION_STRING.to_string()
+}
+
+/// Versions declared in this crate's own Cargo.toml ledger. A bundle records
+/// them so a snapshot from a different dependency stack is rejected at build
+/// time instead of failing inside V8 or at the first script.
+#[cfg(feature = "snapshot")]
+fn declared_deno_versions() -> (String, String) {
+    let manifest_path =
+        Path::new(&env::var("CARGO_MANIFEST_DIR").expect("Cargo must provide CARGO_MANIFEST_DIR"))
+            .join("Cargo.toml");
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display()));
+    (
+        declared_version(&manifest, "deno-core-version"),
+        declared_version(&manifest, "deno-runtime-version"),
+    )
+}
+
+#[cfg(feature = "snapshot")]
+fn declared_version(manifest: &str, key: &str) -> String {
+    manifest
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(key))
+        .find_map(|rest| {
+            rest.strip_prefix(" = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            panic!(
+                "Cargo.toml is missing {key}; it belongs under \
+                 [package.metadata.libdeno.upstream]"
+            )
+        })
+}
+
+#[cfg(feature = "snapshot")]
+fn install_prebuilt_snapshot(bundle: &Path, out_dir: &Path) {
+    let identity = snapshot_identity();
+    let manifest_path = bundle.join(snapshot_bundle::MANIFEST_FILE);
+    let text = std::fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+        panic!(
+            "libdeno: LIBDENO_SNAPSHOT_DIR={} has no readable {}: {e}\n\
+             Run a normal build once with LIBDENO_SNAPSHOT_EXPORT_DIR set to create a bundle.",
+            bundle.display(),
+            snapshot_bundle::MANIFEST_FILE
+        )
+    });
+    let manifest = snapshot_bundle::parse(&text)
+        .unwrap_or_else(|e| panic!("libdeno: invalid {}: {e}", manifest_path.display()));
+    let read = |name: &str| {
+        std::fs::read(bundle.join(name)).unwrap_or_else(|e| {
+            panic!(
+                "libdeno: bundle {} is missing {name}: {e}",
+                bundle.display()
+            )
+        })
+    };
+    let snapshot = read(snapshot_bundle::SNAPSHOT_FILE);
+    let table_bytes = read(snapshot_bundle::TABLE_FILE);
+    snapshot_bundle::verify(&manifest, &identity, &snapshot, &table_bytes).unwrap_or_else(|e| {
+        panic!(
+            "libdeno: the prebuilt snapshot in {} cannot be used: {e}\n\
+             Build the bundle on a machine with this target and the same libdeno and \
+             deno versions, or unset LIBDENO_SNAPSHOT_DIR.",
+            bundle.display()
+        )
+    });
+    std::fs::write(out_dir.join(snapshot_bundle::SNAPSHOT_FILE), &snapshot).unwrap();
+    std::fs::write(out_dir.join(snapshot_bundle::TABLE_FILE), &table_bytes).unwrap();
+    let table = String::from_utf8_lossy(&table_bytes);
+    for name in snapshot_bundle::table_sources(&table) {
+        let source = bundle.join(&name);
+        let target = out_dir.join(&name);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::copy(&source, &target).unwrap_or_else(|e| {
+            panic!(
+                "libdeno: bundle {} does not contain the residual source {name}: {e}",
+                bundle.display()
+            )
+        });
+    }
+    let missing = snapshot_bundle::missing_sources(&table, out_dir);
+    if !missing.is_empty() {
+        panic!(
+            "libdeno: bundle {} does not contain the residual sources its table \
+             references: {missing:?}",
+            bundle.display()
+        );
+    }
+    println!(
+        "cargo:warning=libdeno: reused the prebuilt snapshot in {} (target {})",
+        bundle.display(),
+        identity.target
+    );
+}
+
+#[cfg(feature = "snapshot")]
+fn export_snapshot_bundle(bundle: &Path, snapshot_path: &Path, table_path: &Path) {
+    std::fs::create_dir_all(bundle)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", bundle.display()));
+    let snapshot = std::fs::read(snapshot_path).unwrap();
+    let table_bytes = std::fs::read(table_path).unwrap();
+    let table = String::from_utf8_lossy(&table_bytes);
+    for name in snapshot_bundle::table_sources(&table) {
+        let source = snapshot_path.parent().unwrap().join(&name);
+        let target = bundle.join(&name);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::copy(&source, &target).unwrap_or_else(|e| {
+            panic!("failed to export residual source {}: {e}", source.display())
+        });
+    }
+    std::fs::write(bundle.join(snapshot_bundle::SNAPSHOT_FILE), &snapshot).unwrap();
+    std::fs::write(bundle.join(snapshot_bundle::TABLE_FILE), &table_bytes).unwrap();
+    let manifest = snapshot_bundle::describe(&snapshot_identity(), &snapshot, &table_bytes);
+    std::fs::write(
+        bundle.join(snapshot_bundle::MANIFEST_FILE),
+        snapshot_bundle::render(&manifest),
+    )
+    .unwrap();
+    println!(
+        "cargo:warning=libdeno: wrote a reusable snapshot bundle to {}",
+        bundle.display()
+    );
 }

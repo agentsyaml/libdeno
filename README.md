@@ -2,6 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/libdeno.svg)](https://crates.io/crates/libdeno)
 [![docs.rs](https://docs.rs/libdeno/badge.svg)](https://docs.rs/libdeno)
+[![PyPI](https://img.shields.io/pypi/v/libdeno.svg)](https://pypi.org/project/libdeno/)
 [![CI](https://github.com/agentsyaml/libdeno/actions/workflows/ci.yml/badge.svg)](https://github.com/agentsyaml/libdeno/actions/workflows/ci.yml)
 
 Embed the Deno JavaScript/TypeScript runtime in a Rust application, with support for npm packages and Deno module resolution.
@@ -20,6 +21,7 @@ libdeno runs scripts inside your process and provides file-based and in-memory e
 - Native Rust extensions through per-runtime `ExtensionFactory` values; see the
   [native extension guide](docs/native-extensions.md).
 - Optional output capture and child-process execution.
+- Python bindings on PyPI (`pip install libdeno`); see [Python](#python).
 - npm lifecycle scripts are disabled by default. The `npm` Cargo feature can be disabled at build time; see [Build](#build).
 
 ---
@@ -105,6 +107,31 @@ runtime directory.
 
 ---
 
+## Python
+
+`pip install libdeno` installs the same runtime as a Python extension. Both
+packages share a version.
+
+```python
+import libdeno
+
+exit_code = libdeno.run("app.js", permissions=("--allow-read=.",))
+
+runtime = libdeno.Runtime("my-app")
+runtime.run("app.js", allow_all_permissions=True)
+```
+
+`run()` blocks until the script and its event loop finish, returns the exit
+code, and releases the GIL while Rust runs. `Runtime` reuses resolver state
+across runs; permissions and isolates stay per run.
+
+The binding is alpha and synchronous: no output capture, async APIs,
+subprocess helpers, or native addons. Wheels require Python 3.9+ and exist for
+Linux x86_64/aarch64, macOS x86_64/arm64, and Windows x64. See the
+[Python API guide](docs/python.md) for arguments and exceptions.
+
+---
+
 ## API
 
 | Item | Description |
@@ -139,9 +166,11 @@ See the [full API reference](docs/api.md) or the
 ## Build
 
 - Requires Rust 1.95 or newer; the crate uses edition 2021. The first build compiles the dependencies and V8 snapshot.
-- V8 snapshots are created on the build host. Cross-architecture builds are
-  rejected; build natively for the target. Prebuilt snapshots are unsupported,
-  and matching CPU architecture does not certify OS/ABI compatibility.
+- V8 snapshots are created on the build host, so cross-architecture builds are
+  rejected unless you supply a snapshot bundle: `LIBDENO_SNAPSHOT_DIR` reuses
+  one and `LIBDENO_SNAPSHOT_EXPORT_DIR` writes one. Matching CPU architecture
+  alone does not certify OS/ABI compatibility; see
+  [Prebuilt snapshots](docs/prebuilt-snapshots.md).
 - Hosts that load `.node` addons must export `napi_*` symbols; see [`docs/getting-started.md`](docs/getting-started.md) for linker setup.
 - The compiled binary is self-contained: runtime extension scripts are embedded,
   so it can be copied to a machine without the Rust build tree. If snapshot
@@ -163,6 +192,8 @@ existing local dependency tree can use `{"nodeModulesDir":"manual"}`.
 - [English docs](docs/):
   - [Getting Started](docs/getting-started.md)
   - [API Reference](docs/api.md)
+  - [Python API](docs/python.md)
+  - [Prebuilt snapshots](docs/prebuilt-snapshots.md)
   - [Native Rust extensions](docs/native-extensions.md)
   - [Architecture](docs/architecture.md)
   - [npm & Module Resolution](docs/npm-support.md)

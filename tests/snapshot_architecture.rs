@@ -21,7 +21,7 @@ fn distinct_architectures_are_rejected() {
         assert!(error.contains("HOST=host"));
         assert!(error.contains("TARGET=target"));
         assert!(error.contains(host_arch) && error.contains(target_arch));
-        assert!(error.contains("Prebuilt snapshots are not supported"));
+        assert!(error.contains("LIBDENO_SNAPSHOT_DIR"));
     }
 }
 

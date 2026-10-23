@@ -16,6 +16,7 @@ English: [README.md](README.md)
 - 通过 `ExtensionFactory` 为每个 runtime 注册原生 Rust 扩展，见
   [原生扩展指南](docs/native-extensions.md)。
 - 可选输出捕获和子进程执行。
+- PyPI 上的 Python 绑定（`pip install libdeno`），见 [Python](#python)。
 - npm 生命周期脚本默认关闭；构建时也可关闭 `npm` Cargo feature，见[构建](#构建)。
 
 ---
@@ -98,6 +99,28 @@ let exit_code = run_with(&runtime, "app.js", &options).unwrap();
 
 ---
 
+## Python
+
+`pip install libdeno` 安装的是同一个运行时的 Python 扩展，两个包版本一致。
+
+```python
+import libdeno
+
+exit_code = libdeno.run("app.js", permissions=("--allow-read=.",))
+
+runtime = libdeno.Runtime("my-app")
+runtime.run("app.js", allow_all_permissions=True)
+```
+
+`run()` 会阻塞到脚本和事件循环结束，返回退出码，执行期间释放 GIL；`Runtime`
+复用解析器状态，权限与 isolate 每次运行独立。
+
+Python 绑定目前是 alpha 且仅同步：不提供输出捕获、异步 API、子进程和原生插件。
+wheel 要求 Python 3.9+，覆盖 Linux x86_64/aarch64、macOS x86_64/arm64、Windows
+x64。参数与异常见[Python API 文档](docs/python.md)。
+
+---
+
 ## API
 
 | 项 | 说明 |
@@ -127,8 +150,9 @@ Tokio 宿主可使用 `run_async` / `run_with_output_async`；future 是 `!Send`
 ## 构建
 
 - 需要 Rust 1.95 或更新版本，crate 使用 edition 2021。首次构建会编译依赖并生成 V8 快照。
-- V8 快照在构建宿主上生成；跨 CPU 架构构建会被拒绝，请在目标架构上原生构建。
-  不支持预编译快照；CPU 架构相同也不代表跨操作系统或 ABI 兼容。
+- V8 快照在构建宿主上生成，因此跨 CPU 架构构建默认被拒绝；可用快照包绕过：
+  `LIBDENO_SNAPSHOT_DIR` 复用已有快照，`LIBDENO_SNAPSHOT_EXPORT_DIR` 导出快照包。
+  CPU 架构相同也不代表跨操作系统或 ABI 兼容，详见[预编译快照](docs/prebuilt-snapshots.md)。
 - 加载 `.node` 插件的宿主需要导出 `napi_*` 符号；链接配置见英文[入门文档](docs/getting-started.md)。
 
 ### Cargo feature：`npm`
@@ -144,6 +168,8 @@ Tokio 宿主可使用 `run_async` / `run_with_output_async`；future 是 `!Send`
 - [英文文档](docs/)：
   - [Getting Started](docs/getting-started.md)
   - [API Reference](docs/api.md)
+  - [Python API](docs/python.md)
+  - [Prebuilt snapshots](docs/prebuilt-snapshots.md)
   - [Native Rust extensions](docs/native-extensions.md)
   - [Architecture](docs/architecture.md)
   - [npm & Module Resolution](docs/npm-support.md)

@@ -113,3 +113,6 @@ fn main() {
 - [npm & Module Resolution](npm-support.md) — npm modes, lifecycle scripts,
   `child_process.fork`.
 - [Permissions](permissions.md) — the permission model in detail.
+- [Python API](python.md) — the `pip install libdeno` binding.
+- [Prebuilt snapshots](prebuilt-snapshots.md) — export a snapshot on one
+  machine and reuse it for a cross-architecture build.

@@ -1425,6 +1425,10 @@ fn package_main(pkg_path: &Path) -> Result<PathBuf, AnyError> {
 }
 
 #[cfg(test)]
+#[path = "../build_support/snapshot_bundle.rs"]
+mod snapshot_bundle;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

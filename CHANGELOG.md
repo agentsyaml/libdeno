@@ -5,6 +5,25 @@ breaking changes are highlighted per release with migration notes.
 
 [keep a changelog]: https://keepachangelog.com/en/1.1.0/
 
+## Unreleased
+
+### Added
+
+- Prebuilt snapshot bundles for cross-architecture builds:
+  `LIBDENO_SNAPSHOT_EXPORT_DIR` writes a portable bundle after a local snapshot
+  build, and `LIBDENO_SNAPSHOT_DIR` reuses one while skipping snapshot creation
+  and the architecture guard. A bundle is checked against the target triple,
+  V8, deno, TypeScript, and libdeno versions, its recorded sizes and
+  fingerprints, and the residual sources its table references. See
+  [docs/prebuilt-snapshots.md](docs/prebuilt-snapshots.md).
+
+### Fixed
+
+- Name the missing files when snapshot creation cannot read an extension
+  source. `deno_core` reports those reads as a bare `os error 2`, so an
+  incompletely copied `[patch.crates-io]` path dependency looked like a
+  cross-compilation failure.
+
 ## 0.3.6
 
 ### Fixed
