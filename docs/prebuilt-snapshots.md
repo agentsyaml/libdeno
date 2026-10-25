@@ -71,5 +71,13 @@ Release assets include `libdeno-<version>-<target>-snapshot.tar.gz` with a
 `.sha256` beside it. Extract the archive and point `LIBDENO_SNAPSHOT_DIR` at the
 extracted directory.
 
+The repository ships a helper that does the three steps for the host target:
+
+```bash
+./scripts/fetch-snapshot.sh 0.3.7
+# download, verify sha256, extract, then print the variable to export
+export LIBDENO_SNAPSHOT_DIR=...   # printed by the script
+```
+
 Builds never download a bundle on their own. Cache and trust decisions stay
 with the caller.

@@ -5,6 +5,14 @@ breaking changes are highlighted per release with migration notes.
 
 [keep a changelog]: https://keepachangelog.com/en/1.1.0/
 
+## Unreleased
+
+### Added
+
+- `scripts/fetch-snapshot.sh` downloads a published snapshot bundle for a
+  version and target, verifies its `.sha256`, extracts it, and prints the
+  `LIBDENO_SNAPSHOT_DIR` value to export.
+
 ## 0.3.7
 
 ### Added
