@@ -24,6 +24,15 @@ breaking changes are highlighted per release with migration notes.
   incompletely copied `[patch.crates-io]` path dependency looked like a
   cross-compilation failure.
 
+### Security
+
+- Update `tokio` to 1.54.1, `crypto-bigint` to 0.7.8, `ctutils` to 0.4.5, and
+  `clipboard-win` to 5.4.3 to clear RUSTSEC-2026-0386 and the yanked
+  `clipboard-win` release. `crypto-bigint` 0.5 (RUSTSEC-2026-0387) has no fixed
+  release on the major version the Deno stack's `elliptic-curve` 0.13 uses, so
+  it stays covered by the time-limited audit exception until the stack
+  upgrades.
+
 ## 0.3.6
 
 ### Fixed
