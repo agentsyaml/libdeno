@@ -194,6 +194,7 @@ existing local dependency tree can use `{"nodeModulesDir":"manual"}`.
   - [API Reference](docs/api.md)
   - [Python API](docs/python.md)
   - [Prebuilt snapshots](docs/prebuilt-snapshots.md)
+  - [Building on musl](docs/musl.md)
   - [Native Rust extensions](docs/native-extensions.md)
   - [Architecture](docs/architecture.md)
   - [npm & Module Resolution](docs/npm-support.md)

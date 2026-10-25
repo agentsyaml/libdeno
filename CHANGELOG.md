@@ -12,6 +12,10 @@ breaking changes are highlighted per release with migration notes.
 - `scripts/fetch-snapshot.sh` downloads a published snapshot bundle for a
   version and target, verifies its `.sha256`, extracts it, and prints the
   `LIBDENO_SNAPSHOT_DIR` value to export.
+- [docs/musl.md](docs/musl.md) and `patches/deno-musl-0.267.0-0.197.0.patch`
+  document building and exporting a snapshot bundle for musl targets,
+  which the published bundles do not cover because the Deno crates do
+  not compile for musl unpatched.
 
 ## 0.3.7
 

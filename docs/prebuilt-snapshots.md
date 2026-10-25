@@ -81,3 +81,7 @@ export LIBDENO_SNAPSHOT_DIR=...   # printed by the script
 
 Builds never download a bundle on their own. Cache and trust decisions stay
 with the caller.
+
+`*-unknown-linux-musl` is not published: the Deno crates do not compile for
+musl without a local patch. [musl.md](musl.md) walks through building and
+exporting your own bundle there.
