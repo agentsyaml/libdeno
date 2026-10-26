@@ -1587,6 +1587,9 @@ mod tests {
         let (registry, registry_url) = ColdInstallRegistry::new();
         std::env::set_var("HOME", &home);
         std::env::set_var("DENO_DIR", &deno_dir);
+        // The mock registry is on loopback and reqwest reads NO_PROXY when the
+        // client is built; install the bypass before the first run.
+        crate::http::bypass_proxy_for_loopback();
         std::env::set_var("NPM_CONFIG_REGISTRY", registry_url);
         std::fs::write(
             project.join("package.json"),

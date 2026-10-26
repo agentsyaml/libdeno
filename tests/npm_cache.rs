@@ -16,6 +16,19 @@ use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
 use libdeno::{run, run_with, LibdenoOptions, LibdenoRuntime};
 
+mod common;
+
+use common::{EnvGuard, LOOPBACK_NO_PROXY};
+
+/// Keeps fixture traffic off a proxy configured in the developer's
+/// environment. reqwest resolves NO_PROXY when the client is built, so this
+/// must be set before the run; callers already hold `env_lock`.
+fn loopback_no_proxy() -> EnvGuard {
+    let guard = EnvGuard::new(&["NO_PROXY"]);
+    std::env::set_var("NO_PROXY", LOOPBACK_NO_PROXY);
+    guard
+}
+
 /// Serializes the tests in this file: NPM_CONFIG_REGISTRY / DENO_DIR are
 /// process-global env vars and the in-process snapshot cache is shared state,
 /// so env-dependent tests must not interleave.
@@ -23,30 +36,6 @@ static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn env_lock() -> &'static Mutex<()> {
     ENV_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-impl EnvGuard {
-    fn new(names: &[&'static str]) -> Self {
-        Self(
-            names
-                .iter()
-                .map(|&name| (name, std::env::var_os(name)))
-                .collect(),
-        )
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in &self.0 {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
 }
 
 fn clean_home(name: &str) -> (EnvGuard, PathBuf) {
@@ -461,6 +450,7 @@ fn first_run_requires_the_registry() {
     // refuses every connection must make the very first run fail, and the
     // packument fetch must actually be attempted over the network.
     let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _proxy = loopback_no_proxy();
     let (_home_env, home) = clean_home("registry-down-home");
     let dir = temp_dir("registry-down");
     let deno_dir = temp_dir("registry-down-deno");
@@ -498,6 +488,7 @@ fn first_run_requires_the_registry() {
 #[test]
 fn cold_npm_304_responses_return_errors_from_public_run() {
     let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+    let _proxy = loopback_no_proxy();
     let _env = EnvGuard::new(&["HOME", "DENO_DIR", "NPM_CONFIG_REGISTRY"]);
     for (name, metadata_ok) in [("cold-metadata-304", false), ("tarball-304", true)] {
         let dir = temp_dir(name);
@@ -527,6 +518,7 @@ fn cold_npm_304_responses_return_errors_from_public_run() {
 #[test]
 fn registry_recovery_across_runs_preserves_sibling_root() {
     let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _proxy = loopback_no_proxy();
     let _env = EnvGuard::new(&["NPM_CONFIG_REGISTRY", "DENO_DIR", "HOME"]);
     let home = temp_dir("dep-graph-retry-home");
     std::env::set_var("HOME", &home);
@@ -585,6 +577,7 @@ fn cached_snapshot_skips_network_on_second_run() {
     // re-resolution is served from the snapshot cache, re-install from the
     // on-disk tarball cache, with zero network traffic.
     let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _proxy = loopback_no_proxy();
     let (_home_env, home) = clean_home("cache-hit-home");
     let dir = temp_dir("cache-hit");
     let deno_dir = temp_dir("cache-hit-deno");
@@ -626,6 +619,7 @@ fn cached_snapshot_skips_network_on_second_run() {
 #[test]
 fn snapshot_save_uses_original_resolver_key_when_npmrc_changes_during_run() {
     let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _proxy = loopback_no_proxy();
     let _env = EnvGuard::new(&["NPM_CONFIG_REGISTRY", "DENO_DIR", "HOME"]);
     let home = temp_dir("save-original-key-home");
     std::env::set_var("HOME", &home);
@@ -678,6 +672,7 @@ fn snapshot_save_uses_original_resolver_key_when_npmrc_changes_during_run() {
 #[test]
 fn workspace_discovery_scopes_do_not_share_snapshots() {
     let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _proxy = loopback_no_proxy();
     let _env = EnvGuard::new(&["NPM_CONFIG_REGISTRY", "DENO_DIR", "HOME"]);
     let home = temp_dir("workspace-scope-home");
     std::env::set_var("HOME", &home);
@@ -741,6 +736,7 @@ fn workspace_discovery_scopes_do_not_share_snapshots() {
 #[test]
 fn reusable_runtime_rebuilds_for_same_size_workspace_member_package_and_config_edit() {
     let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _proxy = loopback_no_proxy();
     let _env = EnvGuard::new(&["NPM_CONFIG_REGISTRY", "DENO_DIR", "HOME"]);
     let home = temp_dir("workspace-runtime-home");
     std::env::set_var("HOME", &home);
@@ -803,6 +799,7 @@ fn reusable_runtime_rebuilds_for_same_size_workspace_member_package_and_config_e
 #[test]
 fn reusable_runtime_rebuilds_for_home_npmrc_change_with_independent_userconfig() {
     let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _proxy = loopback_no_proxy();
     let _env = EnvGuard::new(&[
         "NPM_CONFIG_REGISTRY",
         "NPM_CONFIG_USERCONFIG",
@@ -905,6 +902,7 @@ fn reusable_runtime_rebuilds_for_home_npmrc_change_with_independent_userconfig()
 #[test]
 fn child_process_fork_uses_the_parent_npm_snapshot() {
     let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _proxy = loopback_no_proxy();
     let (_home_env, home) = clean_home("fork-snapshot-home");
     let dir = temp_dir("fork-snapshot");
     let deno_dir = temp_dir("fork-snapshot-deno");
@@ -1033,6 +1031,7 @@ fs.writeFileSync({done}, pkg);
 #[test]
 fn reusable_runtime_first_managed_npm_use_concurrent_calls_share_cold_rebuild() {
     let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _proxy = loopback_no_proxy();
     let _env = EnvGuard::new(&["NPM_CONFIG_REGISTRY", "DENO_DIR", "HOME"]);
     let home = temp_dir("runtime-cold-npm-home");
     std::env::set_var("HOME", &home);
@@ -1093,6 +1092,7 @@ fn reusable_runtime_first_managed_npm_use_concurrent_calls_share_cold_rebuild() 
 #[test]
 fn managed_npm_scheme_import_from_npm_package_referrer_is_graph_resolved() {
     let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _proxy = loopback_no_proxy();
     let _env = EnvGuard::new(&["NPM_CONFIG_REGISTRY", "DENO_DIR", "HOME"]);
     let dir = temp_dir("npm-scheme-referrer");
     let deno_dir = temp_dir("npm-scheme-referrer-deno");

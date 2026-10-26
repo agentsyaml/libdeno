@@ -36,6 +36,8 @@ mod runtime_guards;
 // `LibdenoRuntime` for the common paths.
 pub mod runtime;
 mod services;
+#[cfg(any(feature = "snapshot", feature = "snapshot-import"))]
+mod snapshot_identity;
 mod subprocess;
 #[cfg(feature = "execution-control")]
 mod supervisor;

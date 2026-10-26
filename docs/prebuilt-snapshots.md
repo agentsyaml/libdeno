@@ -35,6 +35,18 @@ With `LIBDENO_SNAPSHOT_DIR` set, the build script skips snapshot creation and
 the cross-architecture guard. The target still needs its linker and native
 libraries; only the snapshot step is removed.
 
+To avoid building and linking Deno/V8 into the build-script host, use the
+additive import-only feature (the default `snapshot` feature is disabled):
+
+```bash
+LIBDENO_SNAPSHOT_DIR=/tmp/libdeno-bundle \
+  cargo build --locked --no-default-features --features snapshot-import,npm
+```
+
+This requires a bundle and still checks its target, V8, Deno, TypeScript, and
+crate identity. It removes snapshot-generation work and build-script Deno/V8
+dependencies; actual build time varies with the host and Cargo cache.
+
 Set both variables on the same build and the import wins; export is ignored.
 
 ## Compatibility

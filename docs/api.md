@@ -147,7 +147,7 @@ On a current-thread runtime, await the future directly.
 ## `LibdenoRuntime` / reusable sync and async runs
 
 ```rust
-pub struct LibdenoRuntime { /* Clone + Send + Sync; its only state is an Arc<Mutex<...>> */ }
+pub struct LibdenoRuntime { /* Clone + Send + Sync; holds `cwd` plus two Arcs: resolver state and rebuild gate */ }
 
 impl LibdenoRuntime {
   pub async fn new(cwd: impl AsRef<Path>) -> Result<Self, LibdenoError>;
@@ -367,7 +367,7 @@ the [native extension guide](native-extensions.md) for initialization examples.
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum LibdenoError {
-  Entry(AnyError),                       // entry module resolution failed
+  Entry(AnyError),                       // entry path could not be resolved to a module
   Permission(String),                    // invalid permission flags
   Configuration(String),                 // invalid options
   Runtime(AnyError),                     // runtime startup or script failure
@@ -381,6 +381,13 @@ pub enum LibdenoError {
 is preserved. JavaScript names, classes, causes, and messages do not establish
 denial provenance. A JS failure without typed evidence may be `Runtime` or
 `Core`; both map to `DenoRuntimeError` in Python.
+
+`Entry` covers entry *resolution*: a `package.json` that cannot be read or
+parsed, a `main` that escapes the package directory, and an invalid virtual
+in-memory path. A path entry that simply does not exist still resolves to a
+`file:` URL and fails at module load as `Core` (`Module not found`), matching
+the Deno CLI. The Python binding checks the entry path up front and raises
+`EntryError` for it instead.
 
 ## `run_in_subprocess`
 

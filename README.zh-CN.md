@@ -115,9 +115,11 @@ runtime.run("app.js", allow_all_permissions=True)
 `run()` 会阻塞到脚本和事件循环结束，返回退出码，执行期间释放 GIL；`Runtime`
 复用解析器状态，权限与 isolate 每次运行独立。
 
-Python 绑定目前是 alpha 且仅同步：不提供输出捕获、异步 API、子进程和原生插件。
-wheel 要求 Python 3.9+，覆盖 Linux x86_64/aarch64、macOS x86_64/arm64、Windows
-x64。参数与异常见[Python API 文档](docs/python.md)。
+Python 绑定目前是 alpha 且仅同步，支持文件入口、内存源码入口和输出捕获
+（`run_with_output`、`run_source`、`SourceLang`、`RunOutput`）；不提供异步 API、
+子进程、权限钩子和原生插件。wheel 要求 Python 3.9+，覆盖 Linux
+x86_64/aarch64、macOS x86_64/arm64、Windows x64。参数与异常见
+[Python API 文档](docs/python.md)。
 
 ---
 
@@ -155,6 +157,11 @@ Tokio 宿主可使用 `run_async` / `run_with_output_async`；future 是 `!Send`
   CPU 架构相同也不代表跨操作系统或 ABI 兼容，详见[预编译快照](docs/prebuilt-snapshots.md)。
 - 加载 `.node` 插件的宿主需要导出 `napi_*` 符号；链接配置见英文[入门文档](docs/getting-started.md)。
 
+若要导入预构建快照并避免在构建脚本依赖中构建 Deno/V8，请使用
+`cargo build --no-default-features --features snapshot-import,npm`，并将
+`LIBDENO_SNAPSHOT_DIR` 设置为兼容的快照包路径。此可选模式不会生成快照；默认构建仍会在本机生成快照。
+目标依赖（包括 Deno/V8）仍会编译。
+
 ### Cargo feature：`npm`
 
 默认 features 包含 `npm`。若要关闭 npm 安装支持，使用
@@ -170,6 +177,7 @@ Tokio 宿主可使用 `run_async` / `run_with_output_async`；future 是 `!Send`
   - [API Reference](docs/api.md)
   - [Python API](docs/python.md)
   - [Prebuilt snapshots](docs/prebuilt-snapshots.md)
+  - [Building on musl](docs/musl.md)
   - [Native Rust extensions](docs/native-extensions.md)
   - [Architecture](docs/architecture.md)
   - [npm & Module Resolution](docs/npm-support.md)

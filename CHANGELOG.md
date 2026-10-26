@@ -9,13 +9,41 @@ breaking changes are highlighted per release with migration notes.
 
 ### Added
 
+- Python: `run_with_output`, `run_source`, `run_source_with_output`, the
+  `RunOutput` result type (`exit_code`, `stdout`, `stderr`,
+  `capture_truncated`), and the `SourceLang` enum (`JavaScript`,
+  `TypeScript`). `Runtime` gains matching `run_with_output`, `run_source`, and
+  `run_source_with_output` methods; in-memory sources accept `str`, `bytes`,
+  and `bytearray` code, and `lang` also accepts `"javascript"`/`"typescript"`.
 - `scripts/fetch-snapshot.sh` downloads a published snapshot bundle for a
   version and target, verifies its `.sha256`, extracts it, and prints the
-  `LIBDENO_SNAPSHOT_DIR` value to export.
+  shell-escaped `LIBDENO_SNAPSHOT_DIR` export value.
+- Add the opt-in `snapshot-import` feature to consume a supplied bundle without
+  building Deno/V8 as build-script dependencies; it requires
+  `LIBDENO_SNAPSHOT_DIR` when used without the default `snapshot` feature.
 - [docs/musl.md](docs/musl.md) and `patches/deno-musl-0.267.0-0.197.0.patch`
   document building and exporting a snapshot bundle for musl targets,
   which the published bundles do not cover because the Deno crates do
   not compile for musl unpatched.
+
+### Fixed
+
+- Python: a missing entry path now raises the documented `EntryError` (it was
+  unreachable before); `permissions`/`args`/`features` must be a list or tuple,
+  so a mapping no longer contributes only its keys; `max_heap_bytes=True` is
+  rejected as a non-integer instead of being read as 1 byte.
+- Restrict the `deno_node` argv constructor to non-musl builds and keep the
+  patch recipe aligned with the pinned `deno_node` and `deno_runtime` sources.
+- Watch imported bundle contents, including residual sources, so same-path
+  changes trigger re-import.
+- Quote exported snapshot paths so spaces and shell metacharacters survive eval.
+- Test snapshot import's missing-bundle error and validate the import path
+  without linking Deno/V8; this does not establish musl end-to-end support.
+- Test fixtures that serve modules from loopback now bypass an environment
+  proxy, so `HTTP_PROXY`/`HTTPS_PROXY` without a loopback `NO_PROXY` no longer
+  fails the suite with 502s.
+- Update `crypto-bigint` to 0.7.10: 0.7.8 was yanked, and `cargo audit --deny
+  warnings` fails on yanked crates.
 
 ## 0.3.7
 

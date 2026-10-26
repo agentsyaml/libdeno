@@ -7,49 +7,11 @@ use std::time::Duration;
 
 use libdeno::{run_source, LibdenoOptions, SourceLang};
 
+mod common;
+
+use common::{EnvGuard, Fixture};
+
 static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct EnvGuard(Option<std::ffi::OsString>);
-
-impl EnvGuard {
-    fn isolated_deno_dir(path: &std::path::Path) -> Self {
-        let old = std::env::var_os("DENO_DIR");
-        std::env::set_var("DENO_DIR", path);
-        Self(old)
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(value) => std::env::set_var("DENO_DIR", value),
-            None => std::env::remove_var("DENO_DIR"),
-        }
-    }
-}
-
-struct Fixture(PathBuf);
-
-impl Fixture {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "libdeno-remote-lock-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 struct LocalModuleServer {
     url: String,
@@ -296,7 +258,7 @@ fn setup_lock(fixture: &Fixture, config: &str, lock: &str) {
 #[test]
 fn lockfile_matching_remote_checksum_loads_module() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let fixture = Fixture::new();
+    let fixture = Fixture::new("remote-lock");
     let _env = EnvGuard::isolated_deno_dir(&fixture.0.join("deno-cache"));
     let body = "export const value = 42;";
     let server = LocalModuleServer::start(body.to_string());
@@ -322,7 +284,7 @@ fn lockfile_matching_remote_checksum_loads_module() {
 #[test]
 fn lockfile_wrong_remote_checksum_fails_before_module_executes() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let fixture = Fixture::new();
+    let fixture = Fixture::new("remote-lock");
     let _env = EnvGuard::isolated_deno_dir(&fixture.0.join("deno-cache"));
     let remote_marker = fixture.0.join("remote-marker");
     let body = format!(
@@ -362,7 +324,7 @@ fn lockfile_wrong_remote_checksum_fails_before_module_executes() {
 #[test]
 fn frozen_lockfile_rejects_new_remote_without_changing_lock_bytes() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let fixture = Fixture::new();
+    let fixture = Fixture::new("remote-lock");
     let _env = EnvGuard::isolated_deno_dir(&fixture.0.join("deno-cache"));
     let body = "export const value = 42;";
     let server = LocalModuleServer::start(body.to_string());
@@ -390,7 +352,7 @@ fn frozen_lockfile_rejects_new_remote_without_changing_lock_bytes() {
 #[test]
 fn frozen_failures_do_not_pollute_the_same_run_graph() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let fixture = Fixture::new();
+    let fixture = Fixture::new("remote-lock");
     let _env = EnvGuard::isolated_deno_dir(&fixture.0.join("deno-cache"));
     let server = LocalModuleServer::start("export const value = 42;".to_string());
     let original = lockfile(&server.url, None);
@@ -434,8 +396,8 @@ if (!local.local) throw new Error('local import was poisoned by failed frozen gr
 #[test]
 fn frozen_graph_candidates_are_isolated_between_concurrent_runs() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let a = Fixture::new();
-    let b = Fixture::new();
+    let a = Fixture::new("remote-lock");
+    let b = Fixture::new("remote-lock");
     let _env = EnvGuard::isolated_deno_dir(&a.0.join("shared-cache"));
     let server_a = LocalModuleServer::start("export const value = 'a';".to_string());
     let server_b = LocalModuleServer::start("export const value = 'b';".to_string());
@@ -493,7 +455,7 @@ fn frozen_graph_candidates_are_isolated_between_concurrent_runs() {
 #[test]
 fn lock_false_does_not_apply_remote_checksum_gate() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let fixture = Fixture::new();
+    let fixture = Fixture::new("remote-lock");
     let _env = EnvGuard::isolated_deno_dir(&fixture.0.join("deno-cache"));
     let body = "export const value = 42;";
     let server = LocalModuleServer::start(body.to_string());

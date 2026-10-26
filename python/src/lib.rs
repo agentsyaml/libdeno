@@ -1,5 +1,9 @@
+// The pyfunction signatures mirror the Rust API keyword-for-keyword, so the
+// argument count is part of the contract rather than a smell.
+#![allow(clippy::too_many_arguments)]
+
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -10,7 +14,17 @@ use libdeno::LibdenoError as CoreError;
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyList, PyTuple};
+
+mod options;
+mod output;
+mod runtime;
+mod source;
+
+use options::{apply_capture, entry_base, options_from_python};
+use output::RunOutput;
+use runtime::Runtime;
+use source::{source_bytes, source_lang_from_python, SourceLang};
 
 create_exception!(_libdeno, LibdenoError, PyException);
 create_exception!(_libdeno, EntryError, LibdenoError);
@@ -19,11 +33,6 @@ create_exception!(_libdeno, ConfigurationError, LibdenoError);
 create_exception!(_libdeno, DenoRuntimeError, LibdenoError);
 create_exception!(_libdeno, DenoIOError, LibdenoError);
 create_exception!(_libdeno, DenoTimeoutError, LibdenoError);
-
-#[pyclass(module = "libdeno")]
-struct Runtime {
-    inner: libdeno::LibdenoRuntime,
-}
 
 #[pyfunction]
 #[pyo3(
@@ -42,92 +51,153 @@ fn run(
     features: Option<Py<PyAny>>,
 ) -> PyResult<i32> {
     let entry = path_from_python(entry, "entry")?;
-    let permissions = permissions.bind(py);
-    let args = args.bind(py);
-    let features = features.as_ref().map(|value| value.bind(py));
     let options = options_from_python(
-        permissions,
+        permissions.bind(py),
         allow_all_permissions,
-        args,
+        args.bind(py),
         cwd.as_ref(),
         max_heap_bytes.as_ref(),
         execution_deadline.as_ref(),
-        features,
+        features.as_ref().map(|value| value.bind(py)),
     )?;
+    // Option validation comes first so a bad deadline/heap still reports
+    // ConfigurationError, matching the documented argument contract.
+    check_entry_exists(&entry, &entry_base(&options)?)?;
     let result = py.detach(|| libdeno::run(entry, &options));
     result.map_err(core_error_to_py)
 }
 
-#[pymethods]
-impl Runtime {
-    #[new]
-    #[pyo3(
-        signature = (cwd=None),
-        text_signature = "(cwd=None)"
-    )]
-    fn new(py: Python<'_>, cwd: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
-        let cwd = match cwd {
-            Some(cwd) => path_from_python(&cwd, "cwd")?,
-            None => std::env::current_dir().map_err(|error| {
-                DenoIOError::new_err(format!("failed to get current directory: {error}"))
-            })?,
-        };
-        let result: Result<libdeno::LibdenoRuntime, String> = py.detach(|| {
-            let tokio_runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| format!("failed to create Tokio runtime: {error}"))?;
-            tokio_runtime
-                .block_on(libdeno::LibdenoRuntime::new(cwd))
-                .map_err(|error| error.to_string())
-        });
-        result
-            .map(|inner| Self { inner })
-            .map_err(DenoRuntimeError::new_err)
-    }
+#[pyfunction]
+#[pyo3(
+    signature = (entry, *, permissions=empty_tuple(), allow_all_permissions=false, args=empty_tuple(), cwd=None, max_heap_bytes=None, execution_deadline=None, features=None, capture_stdout=true, capture_stderr=true, max_capture_bytes=None),
+    text_signature = "(entry, *, permissions=(), allow_all_permissions=False, args=(), cwd=None, max_heap_bytes=None, execution_deadline=None, features=None, capture_stdout=True, capture_stderr=True, max_capture_bytes=None)"
+)]
+#[allow(clippy::too_many_arguments)]
+fn run_with_output(
+    py: Python<'_>,
+    entry: &Bound<'_, PyAny>,
+    permissions: Py<PyAny>,
+    allow_all_permissions: bool,
+    args: Py<PyAny>,
+    cwd: Option<Bound<'_, PyAny>>,
+    max_heap_bytes: Option<Bound<'_, PyAny>>,
+    execution_deadline: Option<Bound<'_, PyAny>>,
+    features: Option<Py<PyAny>>,
+    capture_stdout: bool,
+    capture_stderr: bool,
+    max_capture_bytes: Option<Bound<'_, PyAny>>,
+) -> PyResult<RunOutput> {
+    let entry = path_from_python(entry, "entry")?;
+    let mut options = options_from_python(
+        permissions.bind(py),
+        allow_all_permissions,
+        args.bind(py),
+        cwd.as_ref(),
+        max_heap_bytes.as_ref(),
+        execution_deadline.as_ref(),
+        features.as_ref().map(|value| value.bind(py)),
+    )?;
+    apply_capture(
+        &mut options,
+        capture_stdout,
+        capture_stderr,
+        max_capture_bytes.as_ref(),
+    )?;
+    check_entry_exists(&entry, &entry_base(&options)?)?;
+    let result = py.detach(|| libdeno::run_with_output(entry, &options));
+    result.map(RunOutput::from).map_err(core_error_to_py)
+}
 
-    fn refresh(&self) {
-        self.inner.refresh();
-    }
+#[pyfunction]
+#[pyo3(
+    signature = (code, *, lang=None, base_dir=None, permissions=empty_tuple(), allow_all_permissions=false, args=empty_tuple(), max_heap_bytes=None, execution_deadline=None, features=None),
+    text_signature = "(code, *, lang='javascript', base_dir='.', permissions=(), allow_all_permissions=False, args=(), max_heap_bytes=None, execution_deadline=None, features=None)"
+)]
+#[allow(clippy::too_many_arguments)]
+fn run_source(
+    py: Python<'_>,
+    code: &Bound<'_, PyAny>,
+    lang: Option<Bound<'_, PyAny>>,
+    base_dir: Option<Bound<'_, PyAny>>,
+    permissions: Py<PyAny>,
+    allow_all_permissions: bool,
+    args: Py<PyAny>,
+    max_heap_bytes: Option<Bound<'_, PyAny>>,
+    execution_deadline: Option<Bound<'_, PyAny>>,
+    features: Option<Py<PyAny>>,
+) -> PyResult<i32> {
+    let code = source_bytes(code)?;
+    let lang = source_lang_from_python(lang.as_ref())?;
+    let base_dir = base_dir_from_python(base_dir.as_ref())?;
+    let options = options_from_python(
+        permissions.bind(py),
+        allow_all_permissions,
+        args.bind(py),
+        None,
+        max_heap_bytes.as_ref(),
+        execution_deadline.as_ref(),
+        features.as_ref().map(|value| value.bind(py)),
+    )?;
+    let result = py.detach(|| libdeno::run_source(code, lang, base_dir, &options));
+    result.map_err(core_error_to_py)
+}
 
-    #[pyo3(
-        signature = (entry, *, permissions=empty_tuple(), allow_all_permissions=false, args=empty_tuple(), max_heap_bytes=None, execution_deadline=None, features=None),
-        text_signature = "($self, entry, *, permissions=(), allow_all_permissions=False, args=(), max_heap_bytes=None, execution_deadline=None, features=None)"
-    )]
-    fn run(
-        &self,
-        py: Python<'_>,
-        entry: &Bound<'_, PyAny>,
-        permissions: Py<PyAny>,
-        allow_all_permissions: bool,
-        args: Py<PyAny>,
-        max_heap_bytes: Option<Bound<'_, PyAny>>,
-        execution_deadline: Option<Bound<'_, PyAny>>,
-        features: Option<Py<PyAny>>,
-    ) -> PyResult<i32> {
-        let entry = path_from_python(entry, "entry")?;
-        let permissions = permissions.bind(py);
-        let args = args.bind(py);
-        let features = features.as_ref().map(|value| value.bind(py));
-        let options = options_from_python(
-            permissions,
-            allow_all_permissions,
-            args,
-            None,
-            max_heap_bytes.as_ref(),
-            execution_deadline.as_ref(),
-            features,
-        )?;
-        let result = py.detach(|| libdeno::run_with(&self.inner, entry, &options));
-        result.map_err(core_error_to_py)
+#[pyfunction]
+#[pyo3(
+    signature = (code, *, lang=None, base_dir=None, permissions=empty_tuple(), allow_all_permissions=false, args=empty_tuple(), max_heap_bytes=None, execution_deadline=None, features=None, capture_stdout=true, capture_stderr=true, max_capture_bytes=None),
+    text_signature = "(code, *, lang='javascript', base_dir='.', permissions=(), allow_all_permissions=False, args=(), max_heap_bytes=None, execution_deadline=None, features=None, capture_stdout=True, capture_stderr=True, max_capture_bytes=None)"
+)]
+#[allow(clippy::too_many_arguments)]
+fn run_source_with_output(
+    py: Python<'_>,
+    code: &Bound<'_, PyAny>,
+    lang: Option<Bound<'_, PyAny>>,
+    base_dir: Option<Bound<'_, PyAny>>,
+    permissions: Py<PyAny>,
+    allow_all_permissions: bool,
+    args: Py<PyAny>,
+    max_heap_bytes: Option<Bound<'_, PyAny>>,
+    execution_deadline: Option<Bound<'_, PyAny>>,
+    features: Option<Py<PyAny>>,
+    capture_stdout: bool,
+    capture_stderr: bool,
+    max_capture_bytes: Option<Bound<'_, PyAny>>,
+) -> PyResult<RunOutput> {
+    let code = source_bytes(code)?;
+    let lang = source_lang_from_python(lang.as_ref())?;
+    let base_dir = base_dir_from_python(base_dir.as_ref())?;
+    let mut options = options_from_python(
+        permissions.bind(py),
+        allow_all_permissions,
+        args.bind(py),
+        None,
+        max_heap_bytes.as_ref(),
+        execution_deadline.as_ref(),
+        features.as_ref().map(|value| value.bind(py)),
+    )?;
+    apply_capture(
+        &mut options,
+        capture_stdout,
+        capture_stderr,
+        max_capture_bytes.as_ref(),
+    )?;
+    let result = py.detach(|| libdeno::run_source_with_output(code, lang, base_dir, &options));
+    result.map(RunOutput::from).map_err(core_error_to_py)
+}
+
+/// `base_dir` defaults to the process cwd, which is what `"."` resolves to.
+pub(crate) fn base_dir_from_python(value: Option<&Bound<'_, PyAny>>) -> PyResult<PathBuf> {
+    match value {
+        Some(value) => path_from_python(value, "base_dir"),
+        None => Ok(PathBuf::from(".")),
     }
 }
 
-fn empty_tuple() -> Py<PyAny> {
+pub(crate) fn empty_tuple() -> Py<PyAny> {
     Python::attach(|py| PyTuple::empty(py).into_any().unbind())
 }
 
-fn path_from_python(value: &Bound<'_, PyAny>, name: &str) -> PyResult<PathBuf> {
+pub(crate) fn path_from_python(value: &Bound<'_, PyAny>, name: &str) -> PyResult<PathBuf> {
     let os = value.py().import("os").map_err(|error| {
         ConfigurationError::new_err(format!("{name} must be str or os.PathLike: {error}"))
     })?;
@@ -177,67 +247,44 @@ fn path_from_python(value: &Bound<'_, PyAny>, name: &str) -> PyResult<PathBuf> {
     }
 }
 
-fn string_sequence(value: &Bound<'_, PyAny>, name: &str) -> PyResult<Vec<String>> {
+// Only list/tuple: a dict is iterable, so a plain extract would silently take
+// its keys and drop the values.
+pub(crate) fn string_sequence(value: &Bound<'_, PyAny>, name: &str) -> PyResult<Vec<String>> {
+    if !(value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>()) {
+        return Err(ConfigurationError::new_err(format!(
+            "{name} must be a list or tuple of strings"
+        )));
+    }
     value.extract::<Vec<String>>().map_err(|error| {
-        ConfigurationError::new_err(format!("{name} must be an iterable of strings: {error}"))
+        ConfigurationError::new_err(format!(
+            "{name} must be a list or tuple of strings: {error}"
+        ))
     })
 }
 
-fn options_from_python(
-    permissions: &Bound<'_, PyAny>,
-    allow_all_permissions: bool,
-    args: &Bound<'_, PyAny>,
-    cwd: Option<&Bound<'_, PyAny>>,
-    max_heap_bytes: Option<&Bound<'_, PyAny>>,
-    execution_deadline: Option<&Bound<'_, PyAny>>,
-    features: Option<&Bound<'_, PyAny>>,
-) -> PyResult<libdeno::LibdenoOptions> {
-    let max_heap_bytes = max_heap_bytes
-        .map(|value| {
-            value.extract::<usize>().map_err(|error| {
-                ConfigurationError::new_err(format!(
-                    "max_heap_bytes must be a non-negative integer within the platform usize range: {error}"
-                ))
-            })
-        })
-        .transpose()?;
-    let execution_deadline = execution_deadline
-        .map(|value| {
-            let seconds = value.extract::<f64>().map_err(|error| {
-                ConfigurationError::new_err(format!(
-                    "execution_deadline must be a number: {error}"
-                ))
-            })?;
-            if seconds.is_finite() && seconds >= 0.0 {
-                std::time::Duration::try_from_secs_f64(seconds).map_err(|_| {
-                    ConfigurationError::new_err(
-                        "execution_deadline is outside the supported duration range",
-                    )
-                })
-            } else {
-                Err(ConfigurationError::new_err(
-                    "execution_deadline must be finite and non-negative",
-                ))
-            }
-        })
-        .transpose()?;
-    Ok(libdeno::LibdenoOptions {
-        permissions: string_sequence(permissions, "permissions")?,
-        allow_all_permissions,
-        args: string_sequence(args, "args")?,
-        cwd: cwd
-            .map(|value| path_from_python(value, "cwd"))
-            .transpose()?,
-        max_heap_bytes,
-        execution_deadline,
-        features: features
-            .map(|value| string_sequence(value, "features"))
-            .transpose()?,
-        ..Default::default()
-    })
+// `resolve_entry` only builds a file URL, so a missing file surfaces later as
+// a "Module not found" module-graph error (a Core error). Check the path up
+// front so the documented EntryError case is actually reachable.
+// shortcut: only the path itself is checked, so a directory whose package.json
+// `main` names a missing file still reports DenoRuntimeError; upgrade by
+// resolving `main` here if that case must be EntryError too.
+pub(crate) fn check_entry_exists(entry: &Path, cwd: &Path) -> PyResult<()> {
+    let resolved = if entry.is_absolute() {
+        entry.to_path_buf()
+    } else {
+        cwd.join(entry)
+    };
+    if resolved.exists() {
+        Ok(())
+    } else {
+        Err(EntryError::new_err(format!(
+            "failed to resolve entry module: {} does not exist",
+            resolved.display()
+        )))
+    }
 }
 
-fn core_error_to_py(error: CoreError) -> PyErr {
+pub(crate) fn core_error_to_py(error: CoreError) -> PyErr {
     let is_permission = error.is_permission_error();
     let message = error.to_string();
     match error {
@@ -256,7 +303,12 @@ fn core_error_to_py(error: CoreError) -> PyErr {
 #[pymodule]
 fn _libdeno(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(run, module)?)?;
+    module.add_function(wrap_pyfunction!(run_with_output, module)?)?;
+    module.add_function(wrap_pyfunction!(run_source, module)?)?;
+    module.add_function(wrap_pyfunction!(run_source_with_output, module)?)?;
     module.add_class::<Runtime>()?;
+    module.add_class::<RunOutput>()?;
+    module.add_class::<SourceLang>()?;
     let py = module.py();
     module.add("LibdenoError", py.get_type::<LibdenoError>())?;
     module.add("EntryError", py.get_type::<EntryError>())?;

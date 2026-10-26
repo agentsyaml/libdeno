@@ -129,12 +129,17 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+fn client() -> ReqwestHttpClient {
+    bypass_proxy_for_loopback();
+    ReqwestHttpClient::new().unwrap()
+}
+
 #[test]
 fn not_modified_is_reported_not_redirected() {
     // Regression: is_redirection() includes 304, so the 304 branch must be
     // checked first. A stale-cache re-validation must yield NotModified.
     let url = serve("HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n");
-    let client = ReqwestHttpClient::new().unwrap();
+    let client = client();
     runtime().block_on(async {
         let mut headers = HeaderMap::new();
         headers.insert(http::header::IF_NONE_MATCH, "\"v1\"".parse().unwrap());
@@ -149,7 +154,7 @@ fn not_modified_is_reported_not_redirected() {
 #[test]
 fn unsolicited_module_304_is_an_error() {
     let url = serve("HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n");
-    let client = ReqwestHttpClient::new().unwrap();
+    let client = client();
     runtime().block_on(async {
         let error = client
             .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
@@ -164,7 +169,7 @@ fn redirect_returns_location_header() {
     let url = serve(
   "HTTP/1.1 301 Moved Permanently\r\nLocation: https://example.com/new\r\nContent-Length: 0\r\n\r\n",
 );
-    let client = ReqwestHttpClient::new().unwrap();
+    let client = client();
     runtime().block_on(async {
         let resp = client
             .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
@@ -183,7 +188,7 @@ fn redirect_returns_location_header() {
 fn success_returns_body() {
     let url =
         serve("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello");
-    let client = ReqwestHttpClient::new().unwrap();
+    let client = client();
     runtime().block_on(async {
         let resp = client
             .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
@@ -202,7 +207,7 @@ fn success_returns_body() {
 #[test]
 fn not_found_is_an_error() {
     let url = serve("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-    let client = ReqwestHttpClient::new().unwrap();
+    let client = client();
     runtime().block_on(async {
         let err = client
             .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
@@ -220,7 +225,7 @@ fn other_error_status_is_reported() {
     let five_hundred =
         "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     let url = serve_many(vec![five_hundred, five_hundred, five_hundred]);
-    let client = ReqwestHttpClient::new().unwrap();
+    let client = client();
     runtime().block_on(async {
         let err = client
             .send_no_follow(&Url::parse(&url).unwrap(), HeaderMap::new())
@@ -299,7 +304,7 @@ fn npm_download_follows_redirect() {
         "HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: application/octet-stream\r\n\r\nhello",
     );
-    let client = ReqwestHttpClient::new().unwrap();
+    let client = client();
     runtime().block_on(async {
         let resp = client
             .download_with_retries_on_any_tokio_runtime(Url::parse(&url).unwrap(), None, None, None)
@@ -317,7 +322,7 @@ fn npm_download_follows_redirect() {
 fn npm_redirect_drops_original_etag_and_fetches_target_content() {
     let (url, server) = serve_redirect_with_etag_target();
     let url = Url::parse(&url).unwrap();
-    let client = ReqwestHttpClient::new().unwrap();
+    let client = client();
     let response = runtime().block_on(async {
         client
             .download_with_retries_on_any_tokio_runtime(
@@ -339,7 +344,7 @@ fn npm_redirect_drops_original_etag_and_fetches_target_content() {
 #[test]
 fn npm_304_requires_a_conditional_etag_request() {
     let response = "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    let client = ReqwestHttpClient::new().unwrap();
+    let client = client();
     let url = Url::parse(&serve_many(vec![response, response])).unwrap();
     runtime().block_on(async {
         let error = match client
@@ -392,7 +397,7 @@ fn npm_download_preserves_tarball_identity_through_opaque_redirect() {
         "HTTP/1.1 302 Found\r\nLocation: /cdn/opaque\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         response,
     );
-    let client = ReqwestHttpClient::new().unwrap();
+    let client = client();
     let original_url = Url::parse(&format!("{url}pkg/-/pkg-1.0.0.tgz")).unwrap();
     runtime().block_on(async {
         let result = client

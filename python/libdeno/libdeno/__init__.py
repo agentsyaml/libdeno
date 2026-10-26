@@ -8,13 +8,23 @@ from ._libdeno import (
     DenoTimeoutError,
     EntryError,
     LibdenoError,
+    RunOutput,
     Runtime,
+    SourceLang,
     run,
+    run_source,
+    run_source_with_output,
+    run_with_output,
 )
 
 __all__ = [
     "run",
+    "run_with_output",
+    "run_source",
+    "run_source_with_output",
     "Runtime",
+    "RunOutput",
+    "SourceLang",
     "LibdenoError",
     "EntryError",
     "DenoPermissionError",

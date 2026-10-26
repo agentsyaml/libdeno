@@ -67,8 +67,11 @@ Decision priority: broker/hook (if installed) → flag grants → interactive
 prompt when `prompt: true` → deny.
 
 The same permission container guards module fetches, file imports, and worker
-loads. Workers receive the live container, so permission revocations apply to
-them as well. `require()` follows the same read rules.
+loads. A Worker created without explicit `deno.permissions` shares the parent's
+live `PermissionsContainer`, so a revocation in the parent also applies inside
+that worker. A Worker created with explicit permission arguments gets a forked
+copy: grants are narrowed to what the parent already allows, and later parent
+revocations do not reach it. `require()` follows the same read rules.
 
 ## Relative paths
 

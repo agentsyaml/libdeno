@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::collections::HashSet;
 #[cfg(feature = "snapshot")]
 use std::io::Write;
-#[cfg(feature = "snapshot")]
+#[cfg(any(feature = "snapshot", feature = "snapshot-import"))]
 use std::path::Path;
 
 #[cfg(feature = "snapshot")]
@@ -24,9 +24,12 @@ use deno_runtime::snapshot::LazyExtensionFileKind;
 #[path = "build_support/snapshot_arch.rs"]
 mod snapshot_arch;
 
-#[cfg(feature = "snapshot")]
+#[cfg(any(feature = "snapshot", feature = "snapshot-import"))]
 #[path = "build_support/snapshot_bundle.rs"]
 mod snapshot_bundle;
+#[cfg(any(feature = "snapshot", feature = "snapshot-import"))]
+#[path = "build_support/snapshot_identity.rs"]
+mod snapshot_identity;
 #[cfg(feature = "snapshot")]
 #[path = "build_support/snapshot_sources.rs"]
 mod snapshot_sources;
@@ -34,43 +37,64 @@ mod snapshot_sources;
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
-    #[cfg(feature = "snapshot")]
+    #[cfg(any(feature = "snapshot", feature = "snapshot-import"))]
     {
-        println!("cargo:rerun-if-env-changed=DENO_SNAPSHOT_MINIFY_SOURCES");
         println!("cargo:rerun-if-env-changed=LIBDENO_SNAPSHOT_DIR");
-        println!("cargo:rerun-if-env-changed=LIBDENO_SNAPSHOT_EXPORT_DIR");
-        // A bundle carries a snapshot for its own target, so importing one is
-        // also the supported way to build for another architecture.
         let prebuilt = env::var_os("LIBDENO_SNAPSHOT_DIR");
+        #[cfg(feature = "snapshot")]
+        println!("cargo:rerun-if-env-changed=DENO_SNAPSHOT_MINIFY_SOURCES");
+        #[cfg(feature = "snapshot")]
+        println!("cargo:rerun-if-env-changed=LIBDENO_SNAPSHOT_EXPORT_DIR");
+        #[cfg(all(feature = "snapshot-import", not(feature = "snapshot")))]
+        if prebuilt.is_none() {
+            panic!("the `snapshot-import` feature requires LIBDENO_SNAPSHOT_DIR");
+        }
+        #[cfg(feature = "snapshot")]
         if prebuilt.is_none() {
             ensure_snapshot_architecture();
         }
-        // The integration smoke test invokes this exact build-script binary.
-        let marker = out_dir.join("SNAPSHOT_BUILD_SCRIPT_PATH");
-        std::fs::write(
-            &marker,
-            env::current_exe()
-                .unwrap()
-                .as_os_str()
-                .to_string_lossy()
-                .as_bytes(),
-        )
-        .unwrap();
-        println!(
-            "cargo:rustc-env=LIBDENO_SNAPSHOT_BUILD_SCRIPT_MARKER={}",
-            marker.display()
+        let expected_v8 = snapshot_identity::ledger(
+            &PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("Cargo.toml"),
+            "v8-version",
         );
-        match prebuilt {
-            Some(dir) => install_prebuilt_snapshot(Path::new(&dir), &out_dir),
-            None => {
-                let snapshot_path = out_dir.join("CLI_SNAPSHOT.bin");
-                let residual_path = out_dir.join("EXTENSION_RESIDUAL_SOURCES.rs");
-                create_cli_snapshot(&snapshot_path, &residual_path, &out_dir);
-                if let Some(dir) = env::var_os("LIBDENO_SNAPSHOT_EXPORT_DIR") {
-                    export_snapshot_bundle(Path::new(&dir), &snapshot_path, &residual_path);
+        #[cfg(feature = "snapshot")]
+        assert_eq!(
+            deno_runtime_version_string(),
+            expected_v8,
+            "linked V8 version differs from Cargo.toml v8-version ledger"
+        );
+        println!("cargo:rustc-env=LIBDENO_EXPECTED_V8_VERSION={expected_v8}");
+        #[cfg(feature = "snapshot")]
+        {
+            // The integration smoke test invokes this exact build-script binary.
+            let marker = out_dir.join("SNAPSHOT_BUILD_SCRIPT_PATH");
+            std::fs::write(
+                &marker,
+                env::current_exe()
+                    .unwrap()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .as_bytes(),
+            )
+            .unwrap();
+            println!(
+                "cargo:rustc-env=LIBDENO_SNAPSHOT_BUILD_SCRIPT_MARKER={}",
+                marker.display()
+            );
+            match prebuilt {
+                Some(dir) => install_prebuilt_snapshot(Path::new(&dir), &out_dir),
+                None => {
+                    let snapshot_path = out_dir.join("CLI_SNAPSHOT.bin");
+                    let residual_path = out_dir.join("EXTENSION_RESIDUAL_SOURCES.rs");
+                    create_cli_snapshot(&snapshot_path, &residual_path, &out_dir);
+                    if let Some(dir) = env::var_os("LIBDENO_SNAPSHOT_EXPORT_DIR") {
+                        export_snapshot_bundle(Path::new(&dir), &snapshot_path, &residual_path);
+                    }
                 }
             }
         }
+        #[cfg(all(feature = "snapshot-import", not(feature = "snapshot")))]
+        install_prebuilt_snapshot(Path::new(&prebuilt.unwrap()), &out_dir);
     }
 
     // Node-API symbols: the example host binary re-exports napi_* via
@@ -78,7 +102,7 @@ fn main() {
     // from their own binary, e.g. in their build.rs:
     //   deno_napi::print_linker_flags("<host-binary-name>");
 
-    #[cfg(not(feature = "snapshot"))]
+    #[cfg(not(any(feature = "snapshot", feature = "snapshot-import")))]
     {
         // Guard: a no-default-features build produces an empty snapshot and
         // residual tables — the crate compiles but every run panics. The only
@@ -333,6 +357,32 @@ fn snapshot_identity() -> snapshot_bundle::Identity {
     }
 }
 
+#[cfg(any(feature = "snapshot", feature = "snapshot-import"))]
+fn expected_snapshot_identity() -> snapshot_bundle::Identity {
+    let (deno_core, deno_runtime) = declared_deno_versions();
+    snapshot_bundle::Identity {
+        libdeno: env!("CARGO_PKG_VERSION").to_string(),
+        target: env::var("TARGET").expect("Cargo must provide TARGET to the build script"),
+        v8: snapshot_identity::ledger(
+            &PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("Cargo.toml"),
+            "v8-version",
+        ),
+        typescript: expected_typescript_version(),
+        deno_core,
+        deno_runtime,
+    }
+}
+#[cfg(feature = "snapshot")]
+fn expected_typescript_version() -> String {
+    typescript_version().to_string()
+}
+#[cfg(all(feature = "snapshot-import", not(feature = "snapshot")))]
+fn expected_typescript_version() -> String {
+    snapshot_identity::ledger(
+        &PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("Cargo.toml"),
+        "typescript-version",
+    )
+}
 #[cfg(feature = "snapshot")]
 fn deno_runtime_version_string() -> String {
     deno_runtime::deno_core::v8::VERSION_STRING.to_string()
@@ -341,46 +391,27 @@ fn deno_runtime_version_string() -> String {
 /// Versions declared in this crate's own Cargo.toml ledger. A bundle records
 /// them so a snapshot from a different dependency stack is rejected at build
 /// time instead of failing inside V8 or at the first script.
-#[cfg(feature = "snapshot")]
+#[cfg(any(feature = "snapshot", feature = "snapshot-import"))]
 fn declared_deno_versions() -> (String, String) {
     let manifest_path =
         Path::new(&env::var("CARGO_MANIFEST_DIR").expect("Cargo must provide CARGO_MANIFEST_DIR"))
             .join("Cargo.toml");
     println!("cargo:rerun-if-changed={}", manifest_path.display());
-    let manifest = std::fs::read_to_string(&manifest_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display()));
     (
-        declared_version(&manifest, "deno-core-version"),
-        declared_version(&manifest, "deno-runtime-version"),
+        snapshot_identity::ledger(&manifest_path, "deno-core-version"),
+        snapshot_identity::ledger(&manifest_path, "deno-runtime-version"),
     )
 }
 
-#[cfg(feature = "snapshot")]
-fn declared_version(manifest: &str, key: &str) -> String {
-    manifest
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix(key))
-        .find_map(|rest| {
-            rest.strip_prefix(" = \"")
-                .and_then(|rest| rest.strip_suffix('"'))
-        })
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            panic!(
-                "Cargo.toml is missing {key}; it belongs under \
-                 [package.metadata.libdeno.upstream]"
-            )
-        })
-}
-
-#[cfg(feature = "snapshot")]
+#[cfg(any(feature = "snapshot", feature = "snapshot-import"))]
 fn install_prebuilt_snapshot(bundle: &Path, out_dir: &Path) {
-    let identity = snapshot_identity();
+    let identity = expected_snapshot_identity();
+    println!("cargo:rerun-if-changed={}", bundle.display());
     let manifest_path = bundle.join(snapshot_bundle::MANIFEST_FILE);
     let text = std::fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
         panic!(
             "libdeno: LIBDENO_SNAPSHOT_DIR={} has no readable {}: {e}\n\
-             Run a normal build once with LIBDENO_SNAPSHOT_EXPORT_DIR set to create a bundle.",
+             Build a bundle with the `snapshot` feature and LIBDENO_SNAPSHOT_EXPORT_DIR.",
             bundle.display(),
             snapshot_bundle::MANIFEST_FILE
         )

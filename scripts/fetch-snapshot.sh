@@ -37,4 +37,4 @@ mkdir -p "$dest"
 tar -xzf "$tmp/$archive" -C "$dest"
 
 echo
-echo "export LIBDENO_SNAPSHOT_DIR=$PWD/$dest"
+printf 'export LIBDENO_SNAPSHOT_DIR=%q\n' "$PWD/$dest"

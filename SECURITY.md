@@ -38,9 +38,9 @@ uses this classification when mapping `Runtime` / `Core` errors to
 ## Known Upstream-Tracked Advisories
 
 The existing entries are ignored in `.cargo/audit.toml` because only the
-upstream Deno stack can fix them. The three new rustls entries use a separate,
-expiring CI exception described below. Remove exceptions as fixes flow into the
-tree.
+upstream Deno stack can fix them. The rustls and crypto-bigint advisories that
+lack a static ignore there use a separate, expiring CI exception described after
+the table. Remove exceptions as fixes flow into the tree.
 
 | Advisory | Crate | Issue | Upstream |
 |---|---|---|---|
@@ -51,14 +51,24 @@ tree.
 | RUSTSEC-2026-0346 | rustls 0.23.40 | Custom session-store `Debug` output can expose TLS secrets, fixed `>= 0.23.46` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0346) |
 | RUSTSEC-2026-0348 | rustls 0.23.40 | Brotli certificate decompression can allocate up to 1 GiB before authentication, fixed `>= 0.23.46` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0348) |
 | RUSTSEC-2026-0349 | rustls 0.23.40 | Unauthenticated ServerHello can downgrade later connections to classical key exchange, fixed `>= 0.23.46` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0349) |
+| RUSTSEC-2026-0387 | crypto-bigint 0.5.5 | Secret-dependent branches in supposedly constant-time arithmetic, fixed `>= 0.7.6` — `elliptic-curve` 0.13 in the Deno stack still depends on crypto-bigint 0.5 | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0387) |
 
-The CI wrapper temporarily ignores only RUSTSEC-2026-0346, -0348, and -0349
-while `deno_tls` pins rustls 0.23.40. The wrapper applies these ignores only
-when that exact version is present and expires them on 2026-11-17 UTC; other
-audit findings remain fatal. These are real risks: custom session-store logs
-may expose secrets, Brotli-enabled certificate processing can be exhausted by
-a malicious peer, and affected connections may lose post-quantum key exchange.
-Remove the exception as soon as an upstream Deno update brings rustls >=0.23.46.
+The CI wrapper (`audit-with-temporary-exceptions.py`) applies two time-limited
+exceptions, each only while its exact pinned version is in the lockfile:
+
+| Exception | Advisories | Expires (UTC) |
+|---|---|---|
+| rustls 0.23.40 | RUSTSEC-2026-0346, -0348, -0349 | 2026-11-17 |
+| crypto-bigint 0.5.5 | RUSTSEC-2026-0387 | 2026-12-31 |
+
+On or after an expiry date the wrapper fails the audit instead of ignoring the
+advisory; other audit findings remain fatal throughout. These are real risks:
+custom session-store logs may expose secrets, Brotli-enabled certificate
+processing can be exhausted by a malicious peer, affected connections may lose
+post-quantum key exchange, and secret integers used in the affected
+crypto-bigint operations may leak through timing. Remove each exception as soon
+as an upstream Deno update moves past the pinned version (rustls >=0.23.46,
+crypto-bigint >=0.7.6).
 
 Informational (no vulnerability): bincode 1.x (RUSTSEC-2025-0141),
 rustls-pemfile (RUSTSEC-2025-0134), smartstring (RUSTSEC-2026-0249), paste
@@ -86,8 +96,10 @@ preferred route for anything that could be exploited before disclosure.
 
 ## Runtime boundaries
 
-`--allow-*` permissions are checked per operation. Web Workers keep the
-permissions captured when each worker is created.
+`--allow-*` permissions are checked per operation. A Web Worker created without
+explicit `deno.permissions` shares the parent's live permission container, so
+parent revocations apply inside it; a Worker created with explicit permission
+arguments gets a forked copy that later parent changes do not affect.
 
 `max_heap_bytes` requests a best-effort V8 old-generation heap limit (minimum
 8 MiB) for the main worker and Web Workers. It does not cap total V8/native/host

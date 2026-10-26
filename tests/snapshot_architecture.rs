@@ -54,6 +54,7 @@ fn build_script_rejects_cross_arch_before_creating_snapshot_outputs() {
         .env("HOST", format!("{host_arch}-host"))
         .env("TARGET", &target)
         .env("CARGO_CFG_TARGET_ARCH", target_arch)
+        .env_remove("LIBDENO_SNAPSHOT_DIR")
         .env_remove("DOCS_RS")
         .output()
         .unwrap();

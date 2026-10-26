@@ -29,6 +29,7 @@ deno-runtime-version = "0.267.0"
 deno-core-version = "0.412.0"
 deno-resolver-version = "0.90.0"
 deno-graph-version = "0.111.0"
+v8-version = "15.0.245.2-rusty"
 
 [[example]]
 name = "demo"
@@ -116,17 +117,19 @@ phase-diagnostics = []
 # and does not alter the legacy execution entry points.
 execution-control = []
 # Compiles the V8 runtime snapshot (and residual lazy sources) in build.rs.
-# Disable only for documentation builds (see [package.metadata.docs.rs]);
-# without it the crate compiles with an empty snapshot and is not runnable.
+# Disable for docs.rs or when using `snapshot-import` with a supplied bundle;
+# without either feature the crate gets an empty, non-runnable snapshot.
 snapshot = ["dep:deno_runtime", "dep:deno_core"]
+# Reuse a prebuilt bundle without linking Deno/V8 into the build script.
+snapshot-import = []
 
 # docs.rs cannot build the snapshot pipeline: it requires linking the Deno
 # runtime (V8) into the build script, and docs.rs builds offline — the v8
 # crate skips emitting its static library when DOCS_RS is set, so the build
 # script link fails. docs.rs only rustdoc's the lib (never links/runs it), so
 # an empty snapshot + empty residual tables are sufficient. With
-# no-default-features the `snapshot` feature is off and build.rs emits
-# placeholders instead.
+# docs.rs uses no default features and does not enable `snapshot-import`, so
+# build.rs emits placeholders instead.
 [package.metadata.docs.rs]
 no-default-features = true
 

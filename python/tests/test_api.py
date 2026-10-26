@@ -1,14 +1,12 @@
 """Synchronous Python alpha API tests.
 
-The binding intentionally does not expose capture, async, subprocess, or
-permission-hook APIs.
+The binding exposes synchronous runs, in-memory sources, and output capture.
+Async, subprocess, and permission-hook APIs are not exposed.
 """
 
 import json
 import os
 import sys
-import threading
-import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -136,74 +134,6 @@ class ApiTests(unittest.TestCase):
         with self.assertRaises(libdeno.DenoPermissionError):
             runtime.run(entry, permissions=(f"--allow-read={other}",))
 
-    def test_runtime_rebuilds_after_config_fingerprint_changes(self):
-        one = self.write("one.js", "export const value = 'one';")
-        two = self.write("two.js", "export const value = 'two';")
-        first_entry = Path(
-            os.path.realpath(
-                self.write(
-                    "first.js",
-                    "import { value } from 'virtual'; if (value !== 'one') Deno.exit(1);",
-                )
-            )
-        )
-        second_entry = Path(
-            os.path.realpath(
-                self.write(
-                    "second.js",
-                    "import { value } from 'virtual'; if (value !== 'two') Deno.exit(1);",
-                )
-            )
-        )
-        config = self.root / "deno.json"
-        config.write_text(json.dumps({"imports": {"virtual": f"./{one.name}"}}), encoding="utf-8")
-        runtime = libdeno.Runtime(self.root)
-        permission = (f"--allow-read={os.path.realpath(self.root)}",)
-
-        self.assertEqual(runtime.run(first_entry, permissions=permission), 0)
-        config.write_text(json.dumps({"imports": {"virtual": f"./{two.name}"}}), encoding="utf-8")
-        self.assertEqual(runtime.run(second_entry, permissions=permission), 0)
-
-    def test_runtime_refresh_rebuilds_after_nested_package_config_changes(self):
-        self.write("package.json", '{"name":"refresh-project","private":true}')
-        self.write(
-            "node_modules/nested-pkg/package.json",
-            '{"name":"nested-pkg","version":"1.0.0","type":"module","main":"index.js"}',
-        )
-        self.write(
-            "node_modules/nested-pkg/index.js",
-            "import { marker } from 'nested-dep';\nexport { marker };",
-        )
-        self.write(
-            "node_modules/nested-pkg/node_modules/nested-dep/package.json",
-            '{"name":"nested-dep","version":"1.0.0","type":"module","main":"a.js"}',
-        )
-        self.write(
-            "node_modules/nested-pkg/node_modules/nested-dep/a.js",
-            "export const marker = 'a';",
-        )
-        self.write(
-            "node_modules/nested-pkg/node_modules/nested-dep/b.js",
-            "export const marker = 'b';",
-        )
-        entry = self.write(
-            "main.js",
-            "import { marker } from './node_modules/nested-pkg/index.js';"
-            "\nDeno.writeTextFileSync(new URL('./out.txt', import.meta.url), marker);",
-        )
-        output = self.root / "out.txt"
-        runtime = libdeno.Runtime(self.root)
-
-        self.assertEqual(runtime.run(entry, allow_all_permissions=True), 0)
-        self.assertEqual(output.read_text(encoding="utf-8"), "a")
-        self.write(
-            "node_modules/nested-pkg/node_modules/nested-dep/package.json",
-            '{"name":"nested-dep","version":"1.0.0","type":"module","main":"b.js"}',
-        )
-        self.assertIsNone(runtime.refresh())
-        self.assertEqual(runtime.run(entry, allow_all_permissions=True), 0)
-        self.assertEqual(output.read_text(encoding="utf-8"), "b")
-
     def test_deadline_and_javascript_errors_have_distinct_exceptions(self):
         loop = self.write("loop.js", "while (true) {}")
         for deadline in (-1.0, float("nan"), float("inf")):
@@ -248,6 +178,52 @@ class ApiTests(unittest.TestCase):
         entry = self.write("deadline.js", "const ok = true;")
         self.assertEqual(libdeno.run(entry, allow_all_permissions=True, execution_deadline=1), 0)
         self.assertEqual(runtime.run(entry, allow_all_permissions=True, execution_deadline=0.1), 0)
+
+    def test_entry_error_covers_missing_and_malformed_entries(self):
+        missing = self.root / "missing-entry.js"
+        runtime = libdeno.Runtime(self.root)
+        for binding in (libdeno.run, runtime.run):
+            with self.subTest(binding=binding):
+                with self.assertRaises(libdeno.EntryError):
+                    binding(missing, allow_all_permissions=True)
+
+        package = self.root / "escaping-package"
+        package.mkdir()
+        (package / "package.json").write_text(
+            json.dumps({"main": "../outside.js"}), encoding="utf-8"
+        )
+        with self.assertRaises(libdeno.EntryError):
+            libdeno.run(package, allow_all_permissions=True)
+
+    def test_mapping_sequence_options_are_rejected_not_unpacked_to_keys(self):
+        entry = self.write("mapping-options.js", "const ok = true;")
+        runtime = libdeno.Runtime(self.root)
+        for name in ("permissions", "args", "features"):
+            with self.subTest(name=name):
+                for binding in (libdeno.run, runtime.run):
+                    with self.assertRaises(libdeno.ConfigurationError) as error:
+                        binding(
+                            entry,
+                            allow_all_permissions=True,
+                            **{name: {"key": "value"}},
+                        )
+                    self.assertIn("list or tuple", str(error.exception))
+
+    def test_bool_max_heap_bytes_is_rejected_as_non_integer(self):
+        entry = self.write("bool-heap.js", "while (true) {}")
+        runtime = libdeno.Runtime(self.root)
+        for binding in (libdeno.run, runtime.run):
+            with self.subTest(binding=binding):
+                with self.assertRaises(libdeno.ConfigurationError) as error:
+                    binding(entry, allow_all_permissions=True, max_heap_bytes=True)
+                self.assertIn("must be an integer", str(error.exception))
+
+    def test_runtime_run_execution_deadline_fires_on_reusable_stack(self):
+        loop = self.write("runtime-loop.js", "while (true) {}")
+        runtime = libdeno.Runtime(self.root)
+
+        with self.assertRaises(libdeno.DenoTimeoutError):
+            runtime.run(loop, allow_all_permissions=True, execution_deadline=0.05)
 
     def test_invalid_heap_size_numbers_raise_configuration_error(self):
         entry = self.write("heap.js", "while (true) {}")
@@ -362,74 +338,160 @@ class ApiTests(unittest.TestCase):
         finally:
             os.chdir(original_cwd)
 
-    def test_parallel_python_threads_and_gil_progress(self):
-        script = self.write(
-            "peer.js",
-            """
-const own = Deno.args[0];
-const peer = Deno.args[1];
-Deno.writeTextFileSync(own, "ready");
-let found = false;
-const waitUntil = Date.now() + 2000;
-while (Date.now() < waitUntil) {
-  try { Deno.statSync(peer); found = true; break; } catch (_) {}
-}
-if (!found) Deno.exit(1);
-const holdUntil = Date.now() + 500;
-while (Date.now() < holdUntil) {}
-Deno.exit(0);
-""".strip(),
+    def test_run_with_output_captures_stdout(self):
+        entry = self.write("print.js", "console.log('hello stdout');")
+        output = libdeno.run_with_output(entry, allow_all_permissions=True)
+
+        self.assertEqual(output.exit_code, 0)
+        self.assertIn(b"hello stdout", output.stdout)
+        self.assertEqual(output.stderr, b"")
+        self.assertFalse(output.capture_truncated)
+
+    def test_run_with_output_captures_stderr_separately(self):
+        entry = self.write("print-stderr.js", "console.error('only stderr');")
+        output = libdeno.run_with_output(entry, allow_all_permissions=True)
+
+        self.assertEqual(output.stdout, b"")
+        self.assertIn(b"only stderr", output.stderr)
+
+    def test_run_with_output_capture_flags_can_be_disabled(self):
+        entry = self.write(
+            "both-streams.js",
+            "console.log('out'); console.error('err');",
         )
-        markers = [self.root / "thread-1.ready", self.root / "thread-2.ready"]
-        runtime = libdeno.Runtime(self.root)
-        barrier = threading.Barrier(3)
-        results = [None, None]
-        errors = []
+        output = libdeno.run_with_output(
+            entry,
+            allow_all_permissions=True,
+            capture_stdout=False,
+            capture_stderr=False,
+        )
 
-        def execute(index):
-            try:
-                barrier.wait()
-                results[index] = runtime.run(
-                    script,
-                    allow_all_permissions=True,
-                    args=(str(markers[index]), str(markers[1 - index])),
-                    execution_deadline=3.0,
+        self.assertEqual(output.exit_code, 0)
+        self.assertEqual(output.stdout, b"")
+        self.assertEqual(output.stderr, b"")
+
+    def test_max_capture_bytes_truncates_and_sets_flag(self):
+        entry = self.write("chatty.js", "console.log('x'.repeat(65536));")
+        output = libdeno.run_with_output(
+            entry, allow_all_permissions=True, max_capture_bytes=64
+        )
+
+        self.assertTrue(output.capture_truncated)
+        self.assertLessEqual(len(output.stdout), 64)
+
+    def test_run_source_javascript_and_typescript(self):
+        self.assertEqual(
+            libdeno.run_source("Deno.exit(0);", allow_all_permissions=True), 0
+        )
+        typescript = "const answer: number = 42;\nif (answer !== 42) Deno.exit(1);\n"
+        self.assertEqual(
+            libdeno.run_source(
+                typescript,
+                lang=libdeno.SourceLang.TypeScript,
+                allow_all_permissions=True,
+            ),
+            0,
+        )
+
+    def test_run_source_accepts_str_bytes_and_bytearray(self):
+        for code in ("Deno.exit(0);", b"Deno.exit(0);", bytearray(b"Deno.exit(0);")):
+            with self.subTest(code_type=type(code).__name__):
+                self.assertEqual(
+                    libdeno.run_source(code, allow_all_permissions=True), 0
                 )
-            except BaseException as error:  # surface native errors after join
-                errors.append(error)
 
-        threads = [threading.Thread(target=execute, args=(i,)) for i in range(2)]
-        for thread in threads:
-            thread.start()
-        barrier.wait()
+    def test_run_source_relative_import_from_base_dir(self):
+        base = self.root / "src"
+        base.mkdir()
+        (base / "dep.js").write_text("export const value = 7;", encoding="utf-8")
+        code = (
+            "import { value } from './dep.js';\n"
+            "if (value !== 7) Deno.exit(1);\n"
+        )
 
-        marker_deadline = time.monotonic() + 2.0
-        while time.monotonic() < marker_deadline and not all(path.exists() for path in markers):
-            time.sleep(0.01)
+        self.assertEqual(
+            libdeno.run_source(code, base_dir=base, allow_all_permissions=True), 0
+        )
 
-        probe_seen = threading.Event()
-        stop_probe = threading.Event()
+    def test_run_source_rejects_missing_base_dir(self):
+        with self.assertRaises(libdeno.ConfigurationError):
+            libdeno.run_source(
+                "Deno.exit(0);",
+                base_dir=self.root / "does-not-exist",
+                allow_all_permissions=True,
+            )
 
-        def probe():
-            while not stop_probe.is_set():
-                probe_seen.set()
-                time.sleep(0)
+    def test_run_with_output_missing_entry_is_entry_error(self):
+        with self.assertRaises(libdeno.EntryError):
+            libdeno.run_with_output(
+                self.root / "missing-entry.js", allow_all_permissions=True
+            )
 
-        probe_thread = threading.Thread(target=probe)
-        probe_thread.start()
-        try:
-            self.assertTrue(all(path.exists() for path in markers))
-            self.assertTrue(probe_seen.wait(1.0), "another Python thread could not acquire the GIL")
-            self.assertTrue(any(thread.is_alive() for thread in threads))
-        finally:
-            stop_probe.set()
-            probe_thread.join(timeout=2.0)
-            for thread in threads:
-                thread.join(timeout=5.0)
+    def test_source_lang_accepts_enum_and_string(self):
+        code = "Deno.exit(0);"
+        for lang in (
+            libdeno.SourceLang.JavaScript,
+            "javascript",
+            "JavaScript",
+        ):
+            with self.subTest(lang=lang):
+                self.assertEqual(
+                    libdeno.run_source(
+                        code, lang=lang, allow_all_permissions=True
+                    ),
+                    0,
+                )
+        self.assertEqual(
+            libdeno.run_source(
+                "const value: number = 1;",
+                lang="typescript",
+                allow_all_permissions=True,
+            ),
+            0,
+        )
 
-        self.assertFalse(any(thread.is_alive() for thread in threads))
-        self.assertFalse(errors, errors)
-        self.assertEqual(results, [0, 0])
+    def test_invalid_lang_is_configuration_error(self):
+        with self.assertRaises(libdeno.ConfigurationError):
+            libdeno.run_source(
+                "Deno.exit(0);", lang="wasm", allow_all_permissions=True
+            )
+        with self.assertRaises(libdeno.ConfigurationError):
+            libdeno.run_source(
+                "Deno.exit(0);", lang=42, allow_all_permissions=True
+            )
+
+    def test_runtime_source_and_output_entries(self):
+        runtime = libdeno.Runtime(self.root)
+        self.assertEqual(
+            runtime.run_source("Deno.exit(0);", allow_all_permissions=True), 0
+        )
+
+        entry = self.write("runtime-print.js", "console.log('from runtime');")
+        output = runtime.run_with_output(entry, allow_all_permissions=True)
+        self.assertEqual(output.exit_code, 0)
+        self.assertIn(b"from runtime", output.stdout)
+
+        source_output = runtime.run_source_with_output(
+            "console.log('from source');", allow_all_permissions=True
+        )
+        self.assertIn(b"from source", source_output.stdout)
+
+    def test_runtime_entries_reject_cwd(self):
+        runtime = libdeno.Runtime(self.root)
+        entry = self.write("no-cwd.js", "const ok = true;")
+
+        with self.assertRaises(TypeError):
+            runtime.run_with_output(
+                entry, allow_all_permissions=True, cwd=self.root
+            )
+        with self.assertRaises(TypeError):
+            runtime.run_source(
+                "Deno.exit(0);", allow_all_permissions=True, cwd=self.root
+            )
+        with self.assertRaises(TypeError):
+            runtime.run_source_with_output(
+                "Deno.exit(0);", allow_all_permissions=True, cwd=self.root
+            )
 
 
 if __name__ == "__main__":

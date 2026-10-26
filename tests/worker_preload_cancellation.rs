@@ -73,6 +73,9 @@ fn shutting_down_cancels_a_worker_still_preloading_remote_modules() {
             "setTimeout(() => { throw new Error('root failure'); }, 250);",
             "setTimeout(() => Deno.exit(9), 250);",
         ] {
+            // The fixture server is on loopback; keep a configured proxy out
+            // of the way (reqwest reads NO_PROXY when the client is built).
+            std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
             let server = StalledModuleServer::start();
             let dir =
                 std::env::temp_dir().join(format!("libdeno-preload-stop-{}", std::process::id()));
@@ -117,6 +120,7 @@ fn shutting_down_cancels_a_worker_still_preloading_remote_modules() {
             "--nocapture",
         ])
         .env(CHILD, "1")
+        .env("NO_PROXY", "127.0.0.1,localhost")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]

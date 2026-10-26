@@ -25,24 +25,59 @@ non-ASCII paths. `cwd=None` (or an omitted `cwd`) means the process current
 directory. For `Runtime`, that directory is fixed when the object is created;
 the process cwd is never changed. Options after `entry` are keyword-only.
 
-The Python binding does **not** expose output capture, async APIs, subprocess
-helpers, or permission hooks. Script-level Deno APIs still follow the Rust
-runtime's permission model.
+`run_with_output()` captures the script's stdout/stderr into a `RunOutput`
+(`exit_code`, `stdout`, `stderr`, `capture_truncated`). Both streams are
+captured by default; disable one with `capture_stdout=False` /
+`capture_stderr=False`, and bound each with `max_capture_bytes`. Capture
+redirects process-global file descriptors, so a captured run is exclusive and
+a concurrent run raises `ConfigurationError`; it is not supported on Windows.
+
+`run_source()` and `run_source_with_output()` run code held in memory. `code`
+is `str` (encoded as UTF-8), `bytes`, or `bytearray`; `lang` is
+`SourceLang.JavaScript`, `SourceLang.TypeScript`, or the strings
+`"javascript"`/`"typescript"`; `base_dir` is the existing directory the virtual
+entry lives in, so relative imports resolve against it.
+
+```python
+output = libdeno.run_source_with_output(
+    "const answer: number = 42;\nconsole.log(answer);",
+    lang=libdeno.SourceLang.TypeScript,
+    allow_all_permissions=True,
+)
+print(output.stdout)
+```
+
+The Python binding does **not** expose async APIs, subprocess helpers,
+permission hooks, or native addons. Script-level Deno APIs still follow the
+Rust runtime's permission model.
+
+Async callers should wrap the blocking entry points:
+`await asyncio.to_thread(libdeno.run, "entry.js", allow_all_permissions=True)`.
+The GIL is already released for the whole run, so this only moves the call off
+the event loop thread.
 
 ## Options and limits
 
-- `permissions` contains CLI-style `--allow-*` strings. An empty sequence
-  requires `allow_all_permissions=True`; prompting is not exposed.
+- `permissions` contains CLI-style `--allow-*` strings in a list or tuple; any
+  other type (including a mapping) raises `ConfigurationError`. An empty
+  sequence requires `allow_all_permissions=True`; prompting is not exposed.
   `-A`/`--allow-all` grants all capabilities.
-- `args` are exposed through `process.argv`; `features` optionally selects
-  valid Deno unstable feature names. `None` keeps the runtime defaults.
+- `args` and `features` are lists or tuples too, exposed through
+  `process.argv` and the Deno unstable feature set respectively. `features`
+  defaults to `None`, which keeps the runtime defaults.
+- `capture_stdout`, `capture_stderr` (both `True` by default) and
+  `max_capture_bytes` apply to the `*_with_output` entry points. Truncation
+  sets `RunOutput.capture_truncated`.
+- `lang` and `base_dir` apply to the in-memory entry points; `base_dir` must be
+  an existing directory, otherwise `ConfigurationError`.
 - `execution_deadline` is a finite, non-negative number of seconds. A busy
   JavaScript run normally raises `DenoTimeoutError` when the deadline fires,
   but this is best effort: blocking system calls, native code, and blocked
   permission paths can make a run exceed it.
-- `max_heap_bytes` is an optional V8 old-generation constraint. Values below
-  8 MiB are rejected with `ConfigurationError`; the value does not cap native
-  allocations, external memory, host memory, RSS, CPU, or child processes.
+- `max_heap_bytes` is an optional V8 old-generation constraint. It must be an
+  integer (`bool` is rejected). Values below 8 MiB are rejected with
+  `ConfigurationError`; the value does not cap native allocations, external
+  memory, host memory, RSS, CPU, or child processes.
   It is not an OS/process isolation boundary.
 - HTTP body limits apply to reqwest-returned, transport-decoded response-body
   bytes, not wire bytes; upstream decoding may allocate before the limit is
@@ -57,7 +92,9 @@ runtime's permission model.
 
 The facade exports `LibdenoError` and these subclasses:
 
-- `EntryError` — entry resolution failed.
+- `EntryError` — the entry path does not exist or entry resolution fails, such
+  as when `package.json` is malformed or `main` escapes its directory. If
+  `main` names a missing file, module loading fails with `DenoRuntimeError`.
 - `DenoPermissionError` — invalid permission flags or denials carrying typed
   Rust permission provenance. JavaScript exception names/classes/causes are
   not trusted as denial evidence; a JS failure, including a denial whose typed
@@ -96,7 +133,7 @@ virtual environment activated so `python` refers to its interpreter.
 ## Limitations
 
 - Prompting and permission hooks.
-- Output capture, async APIs, and subprocess execution.
+- Async APIs (use `asyncio.to_thread`) and subprocess execution.
 - Python-facing permission/options objects beyond the keyword arguments above.
 - Native addons.
 - Source distributions (`sdist`); releases currently provide wheels.

@@ -485,6 +485,16 @@ impl NpmCacheHttpClient for ReqwestHttpClient {
     }
 }
 
+/// Test-only: fixtures serve on loopback, so the test process must never route
+/// them through a proxy configured in the developer's environment. reqwest
+/// resolves `NO_PROXY` when the client is built, hence one process-wide install
+/// before the first client.
+#[cfg(test)]
+pub(crate) fn bypass_proxy_for_loopback() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("NO_PROXY", "127.0.0.1,localhost"));
+}
+
 #[cfg(test)]
 #[path = "http/tests.rs"]
 mod tests;

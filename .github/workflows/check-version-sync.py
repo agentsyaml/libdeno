@@ -35,6 +35,7 @@ required = {
     "deno-core-version",
     "deno-resolver-version",
     "deno-graph-version",
+    "v8-version",
 }
 if not isinstance(upstream, dict) or not required <= upstream.keys():
     raise SystemExit(
@@ -43,6 +44,10 @@ if not isinstance(upstream, dict) or not required <= upstream.keys():
     )
 for key in required:
     value = upstream[key]
+    if key == "v8-version":
+        if not isinstance(value, str) or not re.fullmatch(r"\d+\.\d+\.\d+\.\d+-rusty", value):
+            raise SystemExit(f"manual upstream check required: invalid {key} = {value!r}")
+        continue
     if not isinstance(value, str) or not re.fullmatch(r"\d+\.\d+\.\d+", value):
         raise SystemExit(f"manual upstream check required: invalid {key} = {value!r}")
 

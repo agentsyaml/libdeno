@@ -23,8 +23,10 @@ This produces `target/debug/examples/demo`, a small host binary that parses
 `--allow-*` permission flags, an entry path, and script arguments.
 
 The V8 snapshot is created by the build-host process. A build whose target CPU
-architecture differs from the host is rejected; build natively for the target.
-Prebuilt snapshot inputs are not supported. Matching architecture alone does
+architecture differs from the host is rejected unless a prebuilt bundle is
+supplied: export one with `LIBDENO_SNAPSHOT_EXPORT_DIR` on a machine that can
+run the target, then build with `LIBDENO_SNAPSHOT_DIR` pointing at it. See
+[Prebuilt snapshots](prebuilt-snapshots.md). Matching architecture alone does
 not certify cross-OS or ABI snapshot compatibility.
 
 ## Run the demo
@@ -98,10 +100,15 @@ subprocess API when the script needs a different process cwd.
 
 ## Writing your own host binary
 
-For `.node` native addons, your host must export the N-API symbols:
+For `.node` native addons, your host must export the N-API symbols. Call this
+from the host crate's `build.rs` (`deno_napi` goes in `[build-dependencies]`),
+because it emits `cargo:rustc-link-arg-bin` directives that only a build script
+can print:
 
 ```rust
+// build.rs
 fn main() {
+  // Scope the exported N-API symbols to this one binary target.
   deno_napi::print_linker_flags("<your-host-binary-name>");
 }
 ```

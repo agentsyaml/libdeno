@@ -125,8 +125,10 @@ runtime.run("app.js", allow_all_permissions=True)
 code, and releases the GIL while Rust runs. `Runtime` reuses resolver state
 across runs; permissions and isolates stay per run.
 
-The binding is alpha and synchronous: no output capture, async APIs,
-subprocess helpers, or native addons. Wheels require Python 3.9+ and exist for
+The binding is alpha and synchronous. It covers path and in-memory entries plus
+output capture (`run_with_output`, `run_source`, `SourceLang`, `RunOutput`); it
+does not expose async APIs, subprocess helpers, permission hooks, or native
+addons. Wheels require Python 3.9+ and exist for
 Linux x86_64/aarch64, macOS x86_64/arm64, and Windows x64. See the
 [Python API guide](docs/python.md) for arguments and exceptions.
 
@@ -178,6 +180,12 @@ See the [full API reference](docs/api.md) or the
   paths it used; check that the `CARGO_HOME` registry checkout is readable
   (offline mirrors, moved vendor directories, junctions, and antivirus
   quarantine can hide it).
+
+To import a prebuilt snapshot without building Deno/V8 as build-script
+dependencies, use `cargo build --no-default-features --features snapshot-import,npm`
+with `LIBDENO_SNAPSHOT_DIR` set to a compatible bundle. This opt-in mode does
+not generate a snapshot; the default build continues to generate one locally.
+Target dependencies, including Deno/V8, are still compiled.
 
 ### Cargo feature: `npm`
 

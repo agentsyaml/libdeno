@@ -39,6 +39,27 @@ jobs:
         with:
           cache-on-failure: false
 
+      - name: Fetch pinned crate sources
+        run: cargo fetch --locked
+
+      - name: Test snapshot helpers and pinned musl patch
+        run: |
+          python3 scripts/test-fetch-snapshot.py
+          python3 scripts/test-snapshot-import.py
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+
+          cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
+          registry = cargo_home / "registry/src"
+          runtime = next(registry.glob("*/deno_runtime-0.267.0"), None)
+          node = next(registry.glob("*/deno_node-0.197.0"), None)
+          if runtime is None or node is None:
+              raise SystemExit("cargo fetch did not provide the pinned musl patch sources")
+          subprocess.run(["python3", "scripts/test-musl-patch.py", str(runtime), str(node)], check=True)
+          PY
+
       - name: Format
         run: cargo fmt --check
 

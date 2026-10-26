@@ -7,9 +7,15 @@ name: Snapshot bundle reuse
 on:
   pull_request:
     paths:
+      - Cargo.toml
       - build.rs
       - "build_support/**"
       - src/lib.rs
+      - "src/snapshot_identity.rs"
+      - "tests/snapshot*.rs"
+      - "docs/prebuilt-snapshots.md"
+      - .github/workflows/check-version-sync.py
+      - scripts/test-snapshot-import.py
       - .github/workflows/snapshot-reuse.yml
   workflow_dispatch:
 
@@ -66,3 +72,52 @@ jobs:
         env:
           LIBDENO_SNAPSHOT_DIR: ${{ runner.temp }}/bundle
         run: cargo test --locked --test smoke
+
+      - name: Build with import-only feature
+        shell: bash
+        env:
+          LIBDENO_SNAPSHOT_DIR: ${{ runner.temp }}/bundle
+        run: |
+          python3 scripts/test-snapshot-import.py
+          cargo build --locked --lib --no-default-features --features snapshot-import,npm
+
+      - name: Run smoke tests with import-only feature
+        shell: bash
+        env:
+          LIBDENO_SNAPSHOT_DIR: ${{ runner.temp }}/bundle
+        run: cargo test --locked --test smoke --no-default-features --features snapshot-import,npm
+
+      - name: Rebuild after same-path bundle mutation
+        shell: bash
+        env:
+          LIBDENO_SNAPSHOT_DIR: ${{ runner.temp }}/bundle
+        run: |
+          set -euo pipefail
+          manifest="$LIBDENO_SNAPSHOT_DIR/libdeno-snapshot.manifest"
+          backup="$RUNNER_TEMP/snapshot-manifest.backup"
+          cp "$manifest" "$backup"
+          restore() { cp "$backup" "$manifest"; }
+          trap restore EXIT
+          python3 - "$manifest" <<'PY'
+          import pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          text = path.read_text()
+          path.write_text(text.replace("v8=", "v8=stale-", 1))
+          PY
+          if cargo build --locked --lib --no-default-features --features snapshot-import,npm >"$RUNNER_TEMP/mutated-build.log" 2>&1; then
+            echo "::error::same-path bundle mutation did not invalidate the build"
+            exit 1
+          fi
+          grep -q "bundle was built with v8" "$RUNNER_TEMP/mutated-build.log"
+          restore
+          trap - EXIT
+
+      - name: Confirm import-only omits Deno build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --locked --no-default-features --features snapshot-import,npm -e build --depth 1 --prefix none)
+          if grep -Eq '^deno_(runtime|core) v' <<<"$tree"; then
+            echo "::error::import-only build tree includes a Deno build dependency"
+            exit 1
+          fi
