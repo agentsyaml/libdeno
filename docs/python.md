@@ -121,6 +121,5 @@ rather than silently ignored.
 
 For those, use the Rust crate.
 
-To build a wheel from this repository, see
-[python/README.md](../python/README.md). The page also lists the current
-limitations (no sdist).
+To build a source distribution or wheel from this repository, see
+[python/README-pypi.md](../python/README-pypi.md).

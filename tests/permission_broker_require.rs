@@ -15,8 +15,9 @@ deno_core::extension!(broker_probe,
 );
 
 #[deno_core::op2(fast)]
-fn op_install_permission_broker(#[string] path: &str) {
-    libdeno::install_permission_broker(path).unwrap();
+fn op_install_permission_broker(#[string] path: &str) -> Result<(), deno_error::JsErrorBox> {
+    libdeno::install_permission_broker(path)
+        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))
 }
 
 struct BrokerServer {
@@ -176,6 +177,61 @@ impl Drop for BrokerServer {
     }
 }
 
+fn run_isolated_test(name: &str, test: impl FnOnce()) {
+    const CHILD: &str = "LIBDENO_BROKER_INSTALL_OP_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        test();
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, "1")
+        .output()
+        .expect("could not launch isolated broker-op test");
+    assert!(
+        output.status.success(),
+        "isolated test failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "isolated test did not run: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn native_op_reports_install_rejection_during_run() {
+    run_isolated_test("native_op_reports_install_rejection_during_run", || {
+        let dir = std::env::temp_dir().join(format!("libdeno-broker-op-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let entry = dir.join("main.js");
+        std::fs::write(
+                &entry,
+                format!("try {{ await globalThis.__testBrokerInstallOp('{}'); throw Error('install unexpectedly succeeded'); }} catch (error) {{ if (!String(error).includes('no active runs or workers')) throw error; }}", socket.display()),
+            ).unwrap();
+        assert_eq!(
+            run(
+                &entry,
+                &LibdenoOptions {
+                    allow_all_permissions: true,
+                    extensions: Some(ExtensionFactory::new(|| vec![broker_probe::init()])),
+                    ..Default::default()
+                }
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
 #[test]
 fn installed_broker_denies_cjs_json_require_despite_allow_all() {
     let dir = std::env::temp_dir().join(format!("libdeno-broker-require-{}", std::process::id()));
@@ -244,7 +300,6 @@ self.onmessage = () => {
          const descriptor = { name: 'read', path: new URL(import.meta.url).pathname };\n\
          if ((await Deno.permissions.query(descriptor)).state !== 'granted') throw Error('read query changed');\n\
          if ((await Deno.permissions.request(descriptor)).state !== 'granted') throw Error('read request changed');\n\
-         globalThis.__installPermissionBroker('__BROKER_SOCKET__');\n\
          if ((await Deno.permissions.query(descriptor)).state !== 'granted') throw Error('broker changed read query');\n\
          if ((await Deno.permissions.request(descriptor)).state !== 'granted') throw Error('broker changed read request');\n\
          try { require('./pkg.json'); throw Error('main require bypassed broker'); } catch (error) { if (error.message === 'main require bypassed broker') throw error; }\n\
@@ -259,12 +314,9 @@ self.onmessage = () => {
          const result = await new Promise((resolve, reject) => { worker.onmessage = event => resolve(event.data); worker.onerror = reject; worker.postMessage(null); });\n\
          if (!result.worker || !result.nested) throw Error('worker require escaped the broker');\n\
           worker.terminate();";
-    std::fs::write(
-        &entry,
-        script.replace("__BROKER_SOCKET__", socket.to_str().unwrap()),
-    )
-    .unwrap();
+    std::fs::write(&entry, script).unwrap();
     let broker = BrokerServer::start(&socket, "pkg.json".to_string());
+    libdeno::install_permission_broker(&socket).unwrap();
 
     let status = run(
         &entry,

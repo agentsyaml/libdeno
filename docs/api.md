@@ -485,6 +485,13 @@ resource-access checks even when local flags grant access. It does not revoke
 local grants or change permission state reported by `Deno.permissions.query()`
 and `request()`. Checks block until the broker responds.
 
+Install only before starting runs or between runs after all workers have
+stopped. Installation returns `LibdenoError::Configuration` immediately if a
+run or worker is active; new runs likewise return a configuration error while
+installation is in progress. The crate serializes its own install APIs and run
+admission, but direct calls to upstream `set_broker` or runtime APIs are outside
+that coordination and must be synchronized by their caller.
+
 The upstream constructor may call `process::exit(87)` if the initial connection
 fails; later bridge failures may also terminate the process. These exits cannot
 be returned as `LibdenoError`, so use a trusted, reliable broker. To pass the
@@ -504,6 +511,9 @@ Installs an in-process hook on Unix; on Windows, use
 deny it. Like the broker, the hook is process-global, install-once, and the sole
 authority for permission checks once installed. It cannot be combined with the
 broker.
+
+Like broker installation, hook installation is rejected during active runs or
+while workers remain, and runs are rejected until installation completes.
 
 The hook runs synchronously on an internal thread; a slow callback stalls
 permission checks and can delay `execution_deadline`. An unwinding panic is

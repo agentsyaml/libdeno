@@ -7,7 +7,7 @@ name = "libdeno"
 version = "0.3.7"
 requires-python = ">=3.9"
 description = "Private alpha Python bindings for embedding the Deno runtime"
-readme = "README.md"
+readme = "README-pypi.md"
 license = { text = "MIT" }
 authors = [
     { name = "Zhenxing Sun", email = "zhenxing.sun@irootech.com" },
@@ -30,7 +30,7 @@ classifiers = [
 
 [project.urls]
 Repository = "https://github.com/agentsyaml/libdeno"
-Documentation = "https://github.com/agentsyaml/libdeno/tree/main/python"
+Documentation = "https://github.com/agentsyaml/libdeno/blob/main/python/README-pypi.md"
 
 [tool.maturin]
 module-name = "libdeno._libdeno"

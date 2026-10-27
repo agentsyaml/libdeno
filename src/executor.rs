@@ -1908,6 +1908,7 @@ impl ExecutorDispatch {
             Err(error) => return Err(self.failure(started, None, error, timing)),
         };
 
+        let requested_execution_deadline = options.execution_deadline;
         let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         if remaining.is_some_and(|timeout| timeout.is_zero()) {
             return Err(self.failure(
@@ -1918,10 +1919,10 @@ impl ExecutorDispatch {
             ));
         }
         options.execution_deadline = min_deadline(options.execution_deadline, remaining);
-        let option_deadline = match options.execution_deadline {
-            Some(duration) => match started.checked_add(duration) {
-                Some(deadline) => Some(deadline),
-                None => {
+        let in_process_deadline = if matches!(&self.state, ExecutorBackend::InProcess(_)) {
+            match absolute_execution_deadline(started, deadline, requested_execution_deadline) {
+                Ok(deadline) => deadline,
+                Err(()) => {
                     return Err(self.failure(
                         started,
                         None,
@@ -1931,11 +1932,7 @@ impl ExecutorDispatch {
                         timing,
                     ))
                 }
-            },
-            None => None,
-        };
-        let in_process_deadline = if matches!(&self.state, ExecutorBackend::InProcess(_)) {
-            min_absolute_deadline(deadline, option_deadline)
+            }
         } else {
             None
         };
@@ -2218,6 +2215,18 @@ fn min_absolute_deadline(first: Option<Instant>, second: Option<Instant>) -> Opt
         (None, Some(second)) => Some(second),
         (None, None) => None,
     }
+}
+
+#[cfg(feature = "execution-control")]
+fn absolute_execution_deadline(
+    started: Instant,
+    request_deadline: Option<Instant>,
+    execution_duration: Option<Duration>,
+) -> Result<Option<Instant>, ()> {
+    let option_deadline = execution_duration
+        .map(|duration| started.checked_add(duration).ok_or(()))
+        .transpose()?;
+    Ok(min_absolute_deadline(request_deadline, option_deadline))
 }
 
 #[derive(Clone)]
@@ -2671,6 +2680,35 @@ impl ExecutorBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "execution-control")]
+    #[test]
+    fn request_deadline_is_not_reduced_by_option_normalization_time() {
+        let started = Instant::now();
+        let normalized_at = started + Duration::from_secs(3);
+        let request_deadline = started + Duration::from_secs(5);
+        assert_eq!(
+            request_deadline.saturating_duration_since(normalized_at),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            absolute_execution_deadline(started, Some(request_deadline), None).unwrap(),
+            Some(request_deadline)
+        );
+        assert_eq!(
+            absolute_execution_deadline(started, None, Some(Duration::from_secs(4))).unwrap(),
+            Some(started + Duration::from_secs(4))
+        );
+        assert_eq!(
+            absolute_execution_deadline(started, Some(started), Some(Duration::from_secs(4)))
+                .unwrap(),
+            Some(started)
+        );
+        assert_eq!(
+            absolute_execution_deadline(started, None, None).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn cloned_io_errors_preserve_native_codes_and_custom_sources() {

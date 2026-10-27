@@ -3,6 +3,9 @@ name = "libdeno-python"
 version = "0.3.7"
 edition = "2021"
 publish = false
+# The Python README is added by Maturin under a distinct name in the sdist.
+readme = false
+include = ["pyproject.toml", "src/**", "libdeno/**/*.py", "libdeno/**/*.pyi", "libdeno/**/py.typed", "tests/**/*.py", "fixture.js"]
 
 [lib]
 name = "_libdeno"

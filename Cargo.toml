@@ -14,7 +14,8 @@ repository = "https://github.com/agentsyaml/libdeno"
 keywords = ["deno", "runtime", "embed", "npm", "javascript"]
 categories = ["api-bindings", "development-tools"]
 authors = ["Zhenxing Sun <zhenxing.sun@irootech.com>"]
-exclude = ["项目完整缺陷与优化审计报告.md"]
+# Maturin places the Python README at the sdist root under README-pypi.md.
+exclude = ["项目完整缺陷与优化审计报告.md", "python/README.md", "python/README-pypi.md"]
 
 # Checked-in compatibility ledger for the upstream Deno snapshot. Cargo does
 # not expose the Deno CLI or bundled TypeScript compiler versions, so these

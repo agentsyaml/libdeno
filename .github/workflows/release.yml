@@ -322,6 +322,12 @@ jobs:
     permissions:
       contents: read
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.source_sha }}
+          path: source
+
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
@@ -332,6 +338,12 @@ jobs:
           pattern: libdeno-wheel-*
           path: dist
           merge-multiple: true
+
+      - name: Download source distribution artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: libdeno-sdist
+          path: dist
 
       - name: Check wheel versions against the release tag
         shell: bash
@@ -411,6 +423,11 @@ jobs:
               )
           print(f"validated version {version} across {len(names)} wheels")
           PY
+
+      - name: Validate source distribution contents and version
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+        run: python source/scripts/validate_sdist.py "${RELEASE_TAG#v}" dist/*.tar.gz --wheels dist/*.whl
 
   publish-crates:
     name: publish to crates.io
@@ -510,6 +527,12 @@ jobs:
           pattern: libdeno-wheel-*
           path: dist
           merge-multiple: true
+
+      - name: Download source distribution artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: libdeno-sdist
+          path: dist
 
       # Confirmed full SHA for the official PyPI Docker action.
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086

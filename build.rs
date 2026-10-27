@@ -388,9 +388,9 @@ fn deno_runtime_version_string() -> String {
     deno_runtime::deno_core::v8::VERSION_STRING.to_string()
 }
 
-/// Versions declared in this crate's own Cargo.toml ledger. A bundle records
-/// them so a snapshot from a different dependency stack is rejected at build
-/// time instead of failing inside V8 or at the first script.
+/// These are declared ledger versions, not Cargo's resolved dependency graph.
+/// They detect version changes but cannot prove that snapshot-relevant
+/// dependency versions, features, or source patches match the bundle.
 #[cfg(any(feature = "snapshot", feature = "snapshot-import"))]
 fn declared_deno_versions() -> (String, String) {
     let manifest_path =
@@ -436,9 +436,15 @@ fn install_prebuilt_snapshot(bundle: &Path, out_dir: &Path) {
             bundle.display()
         )
     });
+    let table = String::from_utf8_lossy(&table_bytes);
+    snapshot_bundle::verify_residuals(&manifest, &table, bundle).unwrap_or_else(|e| {
+        panic!(
+            "libdeno: the prebuilt snapshot in {} cannot be used: {e}",
+            bundle.display()
+        )
+    });
     std::fs::write(out_dir.join(snapshot_bundle::SNAPSHOT_FILE), &snapshot).unwrap();
     std::fs::write(out_dir.join(snapshot_bundle::TABLE_FILE), &table_bytes).unwrap();
-    let table = String::from_utf8_lossy(&table_bytes);
     for name in snapshot_bundle::table_sources(&table) {
         let source = bundle.join(&name);
         let target = out_dir.join(&name);
@@ -486,7 +492,10 @@ fn export_snapshot_bundle(bundle: &Path, snapshot_path: &Path, table_path: &Path
     }
     std::fs::write(bundle.join(snapshot_bundle::SNAPSHOT_FILE), &snapshot).unwrap();
     std::fs::write(bundle.join(snapshot_bundle::TABLE_FILE), &table_bytes).unwrap();
-    let manifest = snapshot_bundle::describe(&snapshot_identity(), &snapshot, &table_bytes);
+    let mut manifest = snapshot_bundle::describe(&snapshot_identity(), &snapshot, &table_bytes);
+    manifest.residuals =
+        snapshot_bundle::describe_residuals(&table, snapshot_path.parent().unwrap())
+            .unwrap_or_else(|e| panic!("failed to fingerprint exported residual source: {e}"));
     std::fs::write(
         bundle.join(snapshot_bundle::MANIFEST_FILE),
         snapshot_bundle::render(&manifest),

@@ -109,46 +109,31 @@ use timing::{ExecutionTiming, Phase};
 /// capture belongs in the subprocess model, where each process has its own
 /// fds.
 ///
-/// `RUN_STATE` tracks ordinary runs and the capture marker. A second live-worker
-/// count keeps capture exclusive even if an async caller drops its run future
-/// while a child worker is still terminating.
+/// `RUN_STATE` tracks ordinary runs and exclusive capture/install markers.
+/// Live workers keep captures and broker installation exclusive after a run drops.
 const CAPTURE_MARKER: usize = usize::MAX;
+const BROKER_INSTALL_MARKER: usize = usize::MAX - 1;
 static RUN_STATE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// RAII lease taken for the duration of a run (before spawning any thread).
+/// RAII admission lease for runs, capture, and permission-broker installation.
 struct RunLease {
-    /// Whether this lease holds the capture marker (must restore to 0).
-    captured: bool,
+    /// Exclusive captures/installs restore their marker; ordinary runs decrement.
+    exclusive_marker: Option<usize>,
 }
 
 impl RunLease {
     fn acquire(captured: bool) -> Result<Self, LibdenoError> {
         use std::sync::atomic::Ordering::*;
         if captured {
-            if crate::worker_lifecycle::active_worker_count() != 0 {
-                return Err(capture_blocked_by_worker());
-            }
-            if RUN_STATE
-                .compare_exchange(0, CAPTURE_MARKER, AcqRel, Relaxed)
-                .is_err()
-            {
-                return Err(capture_blocked_by_worker());
-            }
-            if crate::worker_lifecycle::active_worker_count() != 0 {
-                RUN_STATE.store(0, Release);
-                return Err(capture_blocked_by_worker());
-            }
+            return Self::acquire_exclusive(CAPTURE_MARKER);
         } else {
             loop {
                 let cur = RUN_STATE.load(Acquire);
                 if cur == CAPTURE_MARKER {
-                    return Err(LibdenoError::Configuration(
-                        "a captured run is active; output capture is \
-                         process-global and would steal this run's stdout. \
-                         Use run_in_subprocess_with_output for the captured \
-                         script, or wait for the captured run to finish"
-                            .to_string(),
-                    ));
+                    return Err(capture_blocked_by_worker());
+                }
+                if cur == BROKER_INSTALL_MARKER {
+                    return Err(broker_install_in_progress());
                 }
                 if RUN_STATE
                     .compare_exchange(cur, cur + 1, AcqRel, Relaxed)
@@ -158,7 +143,41 @@ impl RunLease {
                 }
             }
         }
-        Ok(Self { captured })
+        Ok(Self {
+            exclusive_marker: None,
+        })
+    }
+
+    pub(crate) fn acquire_broker_install() -> Result<Self, LibdenoError> {
+        Self::acquire_exclusive(BROKER_INSTALL_MARKER)
+    }
+
+    fn acquire_exclusive(marker: usize) -> Result<Self, LibdenoError> {
+        use std::sync::atomic::Ordering::*;
+        let conflict = || {
+            if marker == BROKER_INSTALL_MARKER {
+                broker_install_blocked()
+            } else {
+                capture_blocked_by_worker()
+            }
+        };
+        if crate::worker_lifecycle::active_worker_count() != 0 {
+            return Err(conflict());
+        }
+        if let Err(state) = RUN_STATE.compare_exchange(0, marker, AcqRel, Relaxed) {
+            return Err(if state == BROKER_INSTALL_MARKER {
+                broker_install_in_progress()
+            } else {
+                conflict()
+            });
+        }
+        if crate::worker_lifecycle::active_worker_count() != 0 {
+            RUN_STATE.store(0, Release);
+            return Err(conflict());
+        }
+        Ok(Self {
+            exclusive_marker: Some(marker),
+        })
     }
 }
 
@@ -168,10 +187,22 @@ fn capture_blocked_by_worker() -> LibdenoError {
     )
 }
 
+fn broker_install_in_progress() -> LibdenoError {
+    LibdenoError::Configuration(
+        "a permission broker or hook is being installed; runs cannot start until installation completes".into(),
+    )
+}
+
+fn broker_install_blocked() -> LibdenoError {
+    LibdenoError::Configuration(
+        "permission broker or hook installation requires no active runs or workers".into(),
+    )
+}
+
 impl Drop for RunLease {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::*;
-        if self.captured {
+        if self.exclusive_marker.is_some() {
             RUN_STATE.store(0, Release);
         } else {
             RUN_STATE.fetch_sub(1, AcqRel);

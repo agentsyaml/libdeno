@@ -2,14 +2,15 @@
 //
 // A bundle holds the V8 startup snapshot plus the residual lazy-extension
 // sources that the runtime needs alongside it. It is valid only on the same
-// target triple, V8 version, and libdeno/deno stack, so every field below is
-// compared before the bundle is used.
+// target triple, V8 version, and declared dependency versions. Those version
+// fields are not a binding to Cargo's resolved graph, features, or source
+// patches; callers must use a matching snapshot-relevant dependency setup.
 
 #![allow(dead_code)]
 
 use std::path::Path;
 
-pub const FORMAT: &str = "libdeno-snapshot-1";
+pub const FORMAT: &str = "libdeno-snapshot-2";
 pub const MANIFEST_FILE: &str = "libdeno-snapshot.manifest";
 pub const SNAPSHOT_FILE: &str = "CLI_SNAPSHOT.bin";
 pub const TABLE_FILE: &str = "EXTENSION_RESIDUAL_SOURCES.rs";
@@ -31,6 +32,14 @@ pub struct Manifest {
     pub snapshot_hash: String,
     pub table_bytes: usize,
     pub table_hash: String,
+    pub residuals: Vec<Residual>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Residual {
+    pub name: String,
+    pub bytes: usize,
+    pub hash: String,
 }
 
 /// FNV-1a over the file bytes. This detects truncated or corrupted transfers;
@@ -71,6 +80,47 @@ pub fn missing_sources(table: &str, dir: &Path) -> Vec<String> {
     missing.dedup();
     missing
 }
+
+pub fn describe_residuals(table: &str, dir: &Path) -> Result<Vec<Residual>, String> {
+    let mut names = table_sources(table);
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .map(|name| {
+            let bytes = std::fs::read(dir.join(&name))
+                .map_err(|e| format!("cannot read residual source {name}: {e}"))?;
+            Ok(Residual {
+                name,
+                bytes: bytes.len(),
+                hash: fingerprint(&bytes),
+            })
+        })
+        .collect()
+}
+
+pub fn verify_residuals(manifest: &Manifest, table: &str, dir: &Path) -> Result<(), String> {
+    let mut expected: Vec<_> = table_sources(table);
+    expected.sort();
+    expected.dedup();
+    let mut recorded: Vec<_> = manifest.residuals.iter().map(|r| r.name.clone()).collect();
+    recorded.sort();
+    recorded.dedup();
+    if recorded != expected || recorded.len() != manifest.residuals.len() {
+        return Err("residual source list does not match the residual table".into());
+    }
+    for residual in &manifest.residuals {
+        let bytes = std::fs::read(dir.join(&residual.name))
+            .map_err(|e| format!("missing residual source {}: {e}", residual.name))?;
+        if bytes.len() != residual.bytes || fingerprint(&bytes) != residual.hash {
+            return Err(format!(
+                "residual source {} does not match the manifest",
+                residual.name
+            ));
+        }
+    }
+    Ok(())
+}
 pub fn render(manifest: &Manifest) -> String {
     let identity = &manifest.identity;
     format!(
@@ -84,7 +134,7 @@ pub fn render(manifest: &Manifest) -> String {
          snapshot-bytes={}\n\
          snapshot-hash={}\n\
          table-bytes={}\n\
-         table-hash={}\n",
+         table-hash={}\n{}",
         identity.libdeno,
         identity.target,
         identity.v8,
@@ -95,6 +145,11 @@ pub fn render(manifest: &Manifest) -> String {
         manifest.snapshot_hash,
         manifest.table_bytes,
         manifest.table_hash,
+        manifest
+            .residuals
+            .iter()
+            .map(|r| format!("residual={}\t{}\t{}\n", r.name, r.bytes, r.hash))
+            .collect::<String>(),
     )
 }
 
@@ -105,11 +160,13 @@ pub fn describe(identity: &Identity, snapshot: &[u8], table: &[u8]) -> Manifest 
         snapshot_hash: fingerprint(snapshot),
         table_bytes: table.len(),
         table_hash: fingerprint(table),
+        residuals: Vec::new(),
     }
 }
 
 pub fn parse(text: &str) -> Result<Manifest, String> {
     let mut fields = std::collections::BTreeMap::new();
+    let mut residuals = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -118,6 +175,21 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         let Some((key, value)) = line.split_once('=') else {
             return Err(format!("line {} is not key=value: {line:?}", index + 1));
         };
+        if key == "residual" {
+            let mut parts = value.split('\t');
+            let name = parts.next().unwrap_or_default();
+            let bytes = parts.next().and_then(|v| v.parse().ok());
+            let hash = parts.next();
+            if name.is_empty() || bytes.is_none() || hash.is_none() || parts.next().is_some() {
+                return Err("invalid residual manifest entry".into());
+            }
+            residuals.push(Residual {
+                name: name.into(),
+                bytes: bytes.unwrap(),
+                hash: hash.unwrap().into(),
+            });
+            continue;
+        }
         match key {
             "format" | "libdeno" | "target" | "v8" | "typescript" | "deno-core"
             | "deno-runtime" | "snapshot-bytes" | "snapshot-hash" | "table-bytes"
@@ -157,6 +229,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         snapshot_hash: get("snapshot-hash")?,
         table_bytes: number("table-bytes")?,
         table_hash: get("table-hash")?,
+        residuals,
     })
 }
 
@@ -253,10 +326,39 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_keys() {
         let text = render(&describe(&identity(), b"", b"")).replace(
-            "format=libdeno-snapshot-1",
-            "format=libdeno-snapshot-1\nextra=1",
+            &format!("format={FORMAT}"),
+            &format!("format={FORMAT}\nextra=1"),
         );
         assert!(parse(&text).unwrap_err().contains("extra"));
+    }
+
+    #[test]
+    fn rejects_legacy_format_with_regeneration_instruction() {
+        let text = render(&describe(&identity(), b"", b"")).replace(FORMAT, "libdeno-snapshot-1");
+        assert!(parse(&text).unwrap_err().contains("regenerate"));
+    }
+
+    #[test]
+    fn residual_integrity_roundtrip_and_failures() {
+        let dir =
+            std::env::temp_dir().join(format!("libdeno-residual-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let table = "include_str!(\"residual.js\")";
+        std::fs::write(dir.join("residual.js"), b"abc").unwrap();
+        let mut manifest = describe(&identity(), b"snapshot", table.as_bytes());
+        manifest.residuals = describe_residuals(table, &dir).unwrap();
+        let parsed = parse(&render(&manifest)).unwrap();
+        verify_residuals(&parsed, table, &dir).unwrap();
+        std::fs::write(dir.join("residual.js"), b"abd").unwrap();
+        assert!(verify_residuals(&parsed, table, &dir)
+            .unwrap_err()
+            .contains("does not match"));
+        std::fs::remove_file(dir.join("residual.js")).unwrap();
+        assert!(verify_residuals(&parsed, table, &dir)
+            .unwrap_err()
+            .contains("missing"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

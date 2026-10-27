@@ -11,7 +11,12 @@ A bundle contains:
 - `EXTENSION_RESIDUAL_SOURCES.rs` — the generated table of lazy extension
   sources that are not compiled into the snapshot.
 - `residual_sources/**` — those sources, already transpiled.
-- `libdeno-snapshot.manifest` — identity, sizes, and fingerprints.
+- `libdeno-snapshot.manifest` — identity, sizes, and fingerprints for the
+  snapshot, residual table, and every referenced residual source.
+
+The manifest uses format `libdeno-snapshot-2`. Format v1 bundles are rejected;
+export a new bundle with the same build inputs. Fingerprints detect accidental
+corruption, not compatibility, authenticity, or trustworthiness.
 
 ## Export
 
@@ -57,21 +62,29 @@ A bundle is accepted only when all of these match the current build:
 |---|---|
 | `target` | Cargo's `TARGET` triple, e.g. `aarch64-unknown-linux-musl` |
 | `v8` | V8 version linked into this build |
-| `deno-core`, `deno-runtime` | `[package.metadata.libdeno.upstream]` in `Cargo.toml` |
+| `deno-core`, `deno-runtime` | Declared versions in `[package.metadata.libdeno.upstream]` in `Cargo.toml` |
 | `typescript` | TS compiler version the snapshot was created with |
 | `libdeno` | Crate version |
 
-The snapshot and the residual table must also match their recorded size and
-fingerprint, and every file the table references must be present.
+The snapshot, residual table, and every referenced residual file must match
+their recorded size and fingerprint. These checks detect corruption; they do
+not establish dependency compatibility.
 
 Because the crate version is part of the identity, a new libdeno release
 needs a new bundle.
 
-The manifest cannot see modifications to the dependency crates. If you patch
-`deno_core`, `deno_runtime`, or `deno_node`, the declared versions still match
-and a stock bundle will be accepted even though its snapshot no longer matches
-your code. Generate your own bundle on a matching-architecture machine in that
-case.
+The manifest records declared ledger versions, not Cargo's full resolved
+dependency graph. Matching V8 and declared versions is necessary, but not
+sufficient: use the same snapshot-relevant dependency versions, features, and
+source patches, and regenerate the snapshot if any differ. Published bundles
+use the root `Cargo.lock` and snapshot build settings from the corresponding
+release source revision (`cargo build --locked --release --lib`). Match its
+snapshot-relevant dependencies and target, not the entire application lockfile.
+Downstream `--locked` fixes the application's own resolution; it does not adopt
+libdeno's release dependency versions. A patch to
+`deno_core`, `deno_runtime`, `deno_node`, or another snapshot-relevant crate can
+leave the declared versions unchanged while making a published snapshot
+incompatible; build a bundle for that dependency combination instead.
 
 A snapshot is executable input, not data: it defines the JavaScript builtins
 and the extension sources a runtime starts with. Treat a bundle you did not

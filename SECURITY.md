@@ -27,7 +27,11 @@ for decisions interactively.
 `install_permission_broker` and `install_permission_hook` install a
 process-global, install-once decision path that becomes the authority for
 permission checks. Hooks cannot cross a subprocess boundary; use the broker
-when decisions must involve another process. See [Permission behavior](docs/permissions.md).
+when decisions must involve another process. Install before runs or between
+runs after workers stop: libdeno rejects installation during a run and rejects
+new runs while installation is underway. Direct upstream/runtime broker
+installations are outside this coordination and require caller-side
+synchronization. See [Permission behavior](docs/permissions.md).
 
 `LibdenoError::is_permission_error()` trusts concrete Rust permission error
 types carried by `Runtime` or `Core` errors. JavaScript exception names, class
@@ -38,9 +42,9 @@ uses this classification when mapping `Runtime` / `Core` errors to
 ## Known Upstream-Tracked Advisories
 
 The existing entries are ignored in `.cargo/audit.toml` because only the
-upstream Deno stack can fix them. The rustls and crypto-bigint advisories that
-lack a static ignore there use a separate, expiring CI exception described after
-the table. Remove exceptions as fixes flow into the tree.
+upstream Deno stack can fix them. Advisories without a static ignore use
+separate, expiring CI exceptions described after the table. Remove exceptions as
+fixes flow into the tree.
 
 | Advisory | Crate | Issue | Upstream |
 |---|---|---|---|
@@ -53,13 +57,14 @@ the table. Remove exceptions as fixes flow into the tree.
 | RUSTSEC-2026-0349 | rustls 0.23.40 | Unauthenticated ServerHello can downgrade later connections to classical key exchange, fixed `>= 0.23.46` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0349) |
 | RUSTSEC-2026-0387 | crypto-bigint 0.5.5 | Secret-dependent branches in supposedly constant-time arithmetic, fixed `>= 0.7.6` — `elliptic-curve` 0.13 in the Deno stack still depends on crypto-bigint 0.5 | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0387) |
 
-The CI wrapper (`audit-with-temporary-exceptions.py`) applies two time-limited
+The CI wrapper (`audit-with-temporary-exceptions.py`) applies time-limited
 exceptions, each only while its exact pinned version is in the lockfile:
 
 | Exception | Advisories | Expires (UTC) |
 |---|---|---|
 | rustls 0.23.40 | RUSTSEC-2026-0346, -0348, -0349 | 2026-11-17 |
 | crypto-bigint 0.5.5 | RUSTSEC-2026-0387 | 2026-12-31 |
+| zstd 0.13.2, zstd-safe 7.2.4, zstd-sys 2.0.16+zstd.1.5.7 | RUSTSEC-2026-0391, -0395, -0396, -0397, -0398, -0399, -0400, -0401, -0402, -0403, -0404, -0405, -0406, -0410 | 2026-11-26 |
 
 On or after an expiry date the wrapper fails the audit instead of ignoring the
 advisory; other audit findings remain fatal throughout. These are real risks:
@@ -68,7 +73,12 @@ processing can be exhausted by a malicious peer, affected connections may lose
 post-quantum key exchange, and secret integers used in the affected
 crypto-bigint operations may leak through timing. Remove each exception as soon
 as an upstream Deno update moves past the pinned version (rustls >=0.23.46,
-crypto-bigint >=0.7.6).
+crypto-bigint >=0.7.6). The accepted zstd risks include memory-safety defects in
+streaming/seekable APIs and a WebAssembly allocator-shim corruption on allocation
+failure; they are not fixed locally. Deno node 0.197.0 pins this chain, and 0.198.0
+plus upstream main still retain it, so the fixes remain unavailable through
+Deno. Remove this exception when upstream Deno selects zstd >=0.14.3,
+zstd-safe >=8.2.0, and zstd-sys >=2.1.2, or by 2026-11-26.
 
 Informational (no vulnerability): bincode 1.x (RUSTSEC-2025-0141),
 rustls-pemfile (RUSTSEC-2025-0134), smartstring (RUSTSEC-2026-0249), paste

@@ -43,6 +43,35 @@ EXCEPTIONS = (
             "crypto-bigint 0.5, while the advisory is fixed in 0.7.6"
         ),
     ),
+    Exception(
+        package="zstd",
+        version="0.13.2",
+        advisories=("RUSTSEC-2026-0391",),
+        expires=date(2026, 11, 26),
+        reason=(
+            "deno_node 0.197.0 pins zstd 0.13.2; 0.198.0 and upstream main "
+            "still do, and the fixed 0.14.3 chain is not yet available through Deno"
+        ),
+    ),
+    Exception(
+        package="zstd-safe",
+        version="7.2.4",
+        advisories=(
+            "RUSTSEC-2026-0403", "RUSTSEC-2026-0398", "RUSTSEC-2026-0395",
+            "RUSTSEC-2026-0402", "RUSTSEC-2026-0406", "RUSTSEC-2026-0404",
+            "RUSTSEC-2026-0400", "RUSTSEC-2026-0399", "RUSTSEC-2026-0401",
+            "RUSTSEC-2026-0405", "RUSTSEC-2026-0397", "RUSTSEC-2026-0396",
+        ),
+        expires=date(2026, 11, 26),
+        reason="Deno's zstd 0.13.2 pin selects zstd-safe 7.2.4; fixed 8.2.0 is not yet available through Deno",
+    ),
+    Exception(
+        package="zstd-sys",
+        version="2.0.16+zstd.1.5.7",
+        advisories=("RUSTSEC-2026-0410",),
+        expires=date(2026, 11, 26),
+        reason="Deno's zstd 0.13.2 pin selects zstd-sys 2.0.16; fixed 2.1.2 is not yet available through Deno",
+    ),
 )
 
 

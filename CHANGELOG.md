@@ -9,6 +9,7 @@ breaking changes are highlighted per release with migration notes.
 
 ### Added
 
+- Python releases now include a source distribution alongside the five wheels.
 - Python: `run_with_output`, `run_source`, `run_source_with_output`, the
   `RunOutput` result type (`exit_code`, `stdout`, `stderr`,
   `capture_truncated`), and the `SourceLang` enum (`JavaScript`,

@@ -2,4 +2,5 @@
 /tests/fixtures/native-extension-consumer/Cargo.lock
 /tests/fixtures/native-extension-consumer/target/
 node_modules/
+__pycache__/
 .slim/deepwork/

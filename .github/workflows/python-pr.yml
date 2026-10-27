@@ -9,6 +9,8 @@ on:
       - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "scripts/validate_sdist.py"
+      - "scripts/test-validate-sdist.py"
       - ".github/workflows/python.yml"
       - ".github/workflows/python-pr.yml"
   workflow_dispatch:
@@ -73,3 +75,61 @@ jobs:
           python -m venv "$smoke_venv"
           "$smoke_venv/bin/python" -m pip install --no-index --no-deps "${wheels[0]}"
           "$smoke_venv/bin/python" -m unittest discover -s python/tests -p 'test_*.py'
+
+
+  sdist-smoke:
+    name: Python source distribution smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch (2026-08-05)
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: false
+
+      - name: Install host libclang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libclang-dev
+
+      - name: Test sdist validator
+        run: python scripts/test-validate-sdist.py
+
+      - name: Build and validate source distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install 'maturin==1.13.3'
+          (cd python && maturin sdist --out target/pr-sdist)
+          expected="$(python -c 'import tomllib; print(tomllib.load(open("python/pyproject.toml", "rb"))["project"]["version"])')"
+          python scripts/validate_sdist.py "$expected" python/target/pr-sdist/*.tar.gz
+
+      - name: Build sdist wheel, validate metadata, and run Python tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(python/target/pr-sdist/*.tar.gz)
+          test "${#archives[@]}" -eq 1
+          sdist_venv="$RUNNER_TEMP/libdeno-sdist-smoke-venv"
+          python -m venv "$sdist_venv"
+          cd "$RUNNER_TEMP"
+          wheel_dir="$RUNNER_TEMP/libdeno-sdist-wheels"
+          "$sdist_venv/bin/python" -m pip wheel --no-deps --wheel-dir "$wheel_dir" "${GITHUB_WORKSPACE}/${archives[0]}"
+          shopt -s nullglob
+          wheels=("$wheel_dir"/*.whl)
+          test "${#wheels[@]}" -eq 1
+          expected="$(python -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$GITHUB_WORKSPACE/python/pyproject.toml")"
+          python "$GITHUB_WORKSPACE/scripts/validate_sdist.py" "$expected" "${GITHUB_WORKSPACE}/${archives[0]}" --wheels "${wheels[@]}"
+          "$sdist_venv/bin/python" -m pip install --no-index --no-deps "${wheels[0]}"
+          "$sdist_venv/bin/python" -m unittest discover -s "$GITHUB_WORKSPACE/python/tests" -p 'test_*.py'

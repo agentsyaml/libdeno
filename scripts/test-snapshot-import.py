@@ -46,9 +46,10 @@ def main():
         bundle.mkdir()
         snapshot = b"snapshot bytes"
         table = b'("residual", include_str!(concat!(env!("OUT_DIR"), "/residual.js"))),\n'
+        residual = b"residual source"
         (bundle / "CLI_SNAPSHOT.bin").write_bytes(snapshot)
         (bundle / "EXTENSION_RESIDUAL_SOURCES.rs").write_bytes(table)
-        (bundle / "residual.js").write_bytes(b"residual source")
+        (bundle / "residual.js").write_bytes(residual)
         identity = {
             "libdeno": manifest["package"]["version"], "target": "test-target",
             "v8": ledger["v8-version"], "typescript": ledger["typescript-version"],
@@ -59,12 +60,13 @@ def main():
         def write_manifest(changes=None, snapshot_bytes=snapshot):
             fields = dict(identity)
             fields.update(changes or {})
-            fields.update({"format": "libdeno-snapshot-1",
+            fields.update({"format": "libdeno-snapshot-2",
                            "snapshot-bytes": str(len(snapshot)),
                            "snapshot-hash": fingerprint(snapshot),
                            "table-bytes": str(len(table)), "table-hash": fingerprint(table)})
             (bundle / "libdeno-snapshot.manifest").write_text(
-                "".join(f"{key}={value}\n" for key, value in fields.items()))
+                "".join(f"{key}={value}\n" for key, value in fields.items())
+                + f"residual=residual.js\t{len(residual)}\t{fingerprint(residual)}\n")
             if snapshot_bytes != snapshot:
                 (bundle / "CLI_SNAPSHOT.bin").write_bytes(snapshot_bytes)
 
@@ -87,6 +89,11 @@ def main():
         assert valid.returncode == 0, valid.stderr
         assert f"cargo:rerun-if-changed={bundle}" in valid.stdout
         assert (out / "residual.js").read_bytes() == b"residual source"
+        (bundle / "residual.js").write_bytes(b"residual sourcf")
+        assert "does not match the manifest" in run(temp / "corrupt-residual").stderr
+        (bundle / "residual.js").unlink()
+        assert "missing residual source" in run(temp / "missing-residual").stderr
+        (bundle / "residual.js").write_bytes(residual)
         write_manifest({"v8": "wrong-v8"})
         assert "v8" in run(temp / "mismatch").stderr
         write_manifest(snapshot_bytes=b"corrupted")

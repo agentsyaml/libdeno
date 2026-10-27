@@ -92,6 +92,7 @@ pub fn install_permission_broker(path: impl AsRef<Path>) -> Result<(), LibdenoEr
                 .to_string(),
         ));
     }
+    let _run_lease = crate::RunLease::acquire_broker_install()?;
     // NOTE: PermissionBroker::new exits the process (code 87) if it cannot
     // connect to `path` — upstream deno_permissions behavior, not ours. The
     // upstream constructor is not try_new, so this cannot be converted into a
@@ -200,6 +201,7 @@ fn install_permission_hook_unix(hook: PermissionPrompt) -> Result<(), LibdenoErr
                 .to_string(),
         ));
     }
+    let _run_lease = crate::RunLease::acquire_broker_install()?;
     // Private 0700 dir under temp: the socket file inherits the directory's
     // permissions, so a world-writable /tmp (Linux, default umask would
     // otherwise leave the socket world-connectable) cannot expose the hook to

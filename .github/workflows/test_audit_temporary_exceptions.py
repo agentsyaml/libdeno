@@ -12,7 +12,7 @@ SPEC = importlib.util.spec_from_file_location("audit_exceptions", SCRIPT)
 AUDIT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(AUDIT)
 
-RUSTLS, CRYPTO_BIGINT = AUDIT.EXCEPTIONS
+EXCEPTIONS = AUDIT.EXCEPTIONS
 
 
 class AuditExceptionTests(unittest.TestCase):
@@ -37,23 +37,48 @@ class AuditExceptionTests(unittest.TestCase):
 
     def test_exception_is_limited_to_the_pinned_versions(self):
         lock = self.audit_lock(
-            [("rustls", "0.23.40"), ("crypto-bigint", "0.5.5"), ("crypto-bigint", "0.7.8")],
+            [
+                ("rustls", "0.23.40"),
+                ("crypto-bigint", "0.5.5"),
+                ("crypto-bigint", "0.7.8"),
+                ("zstd", "0.13.2"), ("zstd", "0.14.3"),
+                ("zstd-safe", "7.2.4"), ("zstd-safe", "8.2.0"),
+                ("zstd-sys", "2.0.16+zstd.1.5.7"),
+                ("zstd-sys", "2.1.2"),
+            ],
             date(2026, 11, 16),
         )
         with patch.object(AUDIT.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
             self.assertEqual(AUDIT.audit(lock, date(2026, 11, 16)), 0)
         self.assertEqual(
-            self.ignored(run), list(RUSTLS.advisories) + list(CRYPTO_BIGINT.advisories)
+            self.ignored(run),
+            [advisory for exception in AUDIT.EXCEPTIONS for advisory in exception.advisories],
         )
 
-    def test_only_the_older_crypto_bigint_pins_an_exception(self):
-        lock = self.audit_lock([("crypto-bigint", "0.7.8")], date(2026, 11, 16))
+    def test_unexcepted_audit_failure_is_propagated(self):
+        lock = self.audit_lock([("unrelated-crate", "1.0.0")], date(2026, 11, 16))
         with patch.object(AUDIT.subprocess, "run", return_value=subprocess.CompletedProcess([], 17)) as run:
             self.assertEqual(AUDIT.audit(lock, date(2026, 11, 16)), 17)
         self.assertEqual(self.ignored(run), [])
 
+    def test_each_exception_is_scoped_to_its_exact_package_and_version(self):
+        for exception in EXCEPTIONS:
+            with self.subTest(package=exception.package):
+                exact = self.audit_lock(
+                    [(exception.package, exception.version)], date(2026, 11, 16)
+                )
+                other = self.audit_lock(
+                    [(exception.package, "99.99.99")], date(2026, 11, 16)
+                )
+                with patch.object(AUDIT.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+                    self.assertEqual(AUDIT.audit(exact, date(2026, 11, 16)), 0)
+                    self.assertEqual(self.ignored(run), list(exception.advisories))
+                with patch.object(AUDIT.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+                    self.assertEqual(AUDIT.audit(other, date(2026, 11, 16)), 0)
+                    self.assertEqual(self.ignored(run), [])
+
     def test_each_exception_expires_on_its_own_date(self):
-        for exception in (RUSTLS, CRYPTO_BIGINT):
+        for exception in EXCEPTIONS:
             lock = self.audit_lock(
                 [(exception.package, exception.version)], exception.expires
             )
@@ -63,7 +88,14 @@ class AuditExceptionTests(unittest.TestCase):
 
     def test_upgraded_versions_need_no_exception_even_after_expiry(self):
         lock = self.audit_lock(
-            [("rustls", "0.23.46"), ("crypto-bigint", "0.7.8")], date(2027, 12, 31)
+            [
+                ("rustls", "0.23.46"),
+                ("crypto-bigint", "0.7.8"),
+                ("zstd", "0.14.3"),
+                ("zstd-safe", "8.2.0"),
+                ("zstd-sys", "2.1.2"),
+            ],
+            date(2027, 12, 31),
         )
         with patch.object(AUDIT.subprocess, "run", return_value=subprocess.CompletedProcess([], 17)) as run:
             self.assertEqual(AUDIT.audit(lock, date(2027, 12, 31)), 17)

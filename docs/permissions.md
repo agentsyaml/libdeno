@@ -63,6 +63,12 @@ one does not revoke those grants or change the permission state reported by
 broker uses a Unix socket or Windows named pipe; the in-process hook is
 Unix-only. See the [API reference](api.md) for setup and failure behavior.
 
+Install before starting runs or between runs after all workers have stopped.
+An active run or lingering worker makes installation return a configuration
+error immediately; runs are also rejected while installation is in progress.
+This coordination covers libdeno's run and install APIs. Callers that install
+through upstream or other runtime APIs must coordinate those calls themselves.
+
 Decision priority: broker/hook (if installed) → flag grants → interactive
 prompt when `prompt: true` → deny.
 

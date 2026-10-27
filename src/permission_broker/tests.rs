@@ -221,6 +221,92 @@ fn broker_line_boundary_and_id_parsing() {
 }
 
 #[test]
+fn active_run_rejects_both_installers_before_connecting() {
+    run_in_isolated_test(
+        "permission_broker::tests::active_run_rejects_both_installers_before_connecting",
+        "active-run",
+        || {
+            use std::os::unix::net::UnixListener;
+            let dir = TestTempDir::new("broker-active-run");
+            let socket = dir.0.join("broker.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let run = crate::RunLease::acquire(false).unwrap();
+            for error in [
+                install_permission_broker(&socket).unwrap_err(),
+                install_permission_hook(Arc::new(|_| true)).unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, LibdenoError::Configuration(ref text) if text.contains("no active runs or workers"))
+                );
+            }
+            assert!(
+                matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+            assert!(!has_broker());
+            drop(run);
+        },
+    );
+}
+
+#[test]
+fn lingering_worker_rejects_both_installers() {
+    run_in_isolated_test(
+        "permission_broker::tests::lingering_worker_rejects_both_installers",
+        "lingering-worker",
+        || {
+            use std::os::unix::net::UnixListener;
+            let dir = TestTempDir::new("broker-lingering-worker");
+            let socket = dir.0.join("broker.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let registry = crate::worker_lifecycle::WorkerLifecycleRegistry::new();
+            let registration = registry.reserve(u32::MAX, 0).unwrap();
+            for error in [
+                install_permission_broker(&socket).unwrap_err(),
+                install_permission_hook(Arc::new(|_| true)).unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, LibdenoError::Configuration(ref text) if text.contains("no active runs or workers"))
+                );
+            }
+            assert!(
+                matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+            drop(registration);
+        },
+    );
+}
+
+#[test]
+fn broker_install_lease_rejects_runs_until_released() {
+    run_in_isolated_test(
+        "permission_broker::tests::broker_install_lease_rejects_runs_until_released",
+        "install-lease",
+        || {
+            let dir = TestTempDir::new("broker-install-lease");
+            let entry = dir.0.join("main.js");
+            std::fs::write(&entry, "postMessage('ran');").unwrap();
+            let install = crate::RunLease::acquire_broker_install().unwrap();
+            assert!(crate::RunLease::acquire(true).is_err());
+            let error = crate::run(
+                &entry,
+                &crate::LibdenoOptions {
+                    allow_all_permissions: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, LibdenoError::Configuration(ref text) if text.contains("being installed"))
+            );
+            drop(install);
+            drop(crate::RunLease::acquire(false).unwrap());
+        },
+    );
+}
+
+#[test]
 fn failed_hook_start_can_retry_install() {
     run_in_isolated_test(
         "permission_broker::tests::failed_hook_start_can_retry_install",
