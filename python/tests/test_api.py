@@ -13,6 +13,13 @@ from tempfile import TemporaryDirectory
 
 import libdeno
 
+# In-process capture is rejected on Windows: Rust std writes through
+# GetStdHandle there, bypassing the CRT fd that dup2 redirects.
+CAPTURE_UNSUPPORTED = sys.platform == "win32"
+capture_only = unittest.skipIf(
+    CAPTURE_UNSUPPORTED, "in-process output capture is not supported on Windows"
+)
+
 
 class ApiTests(unittest.TestCase):
     def setUp(self):
@@ -339,6 +346,7 @@ class ApiTests(unittest.TestCase):
         finally:
             os.chdir(original_cwd)
 
+    @capture_only
     def test_run_with_output_captures_stdout(self):
         entry = self.write("print.js", "console.log('hello stdout');")
         output = libdeno.run_with_output(entry, allow_all_permissions=True)
@@ -348,6 +356,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(output.stderr, b"")
         self.assertFalse(output.capture_truncated)
 
+    @capture_only
     def test_run_with_output_captures_stderr_separately(self):
         entry = self.write("print-stderr.js", "console.error('only stderr');")
         output = libdeno.run_with_output(entry, allow_all_permissions=True)
@@ -371,6 +380,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(output.stdout, b"")
         self.assertEqual(output.stderr, b"")
 
+    @capture_only
     def test_max_capture_bytes_truncates_and_sets_flag(self):
         entry = self.write("chatty.js", "console.log('x'.repeat(65536));")
         output = libdeno.run_with_output(
@@ -466,6 +476,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(
             runtime.run_source("Deno.exit(0);", allow_all_permissions=True), 0
         )
+        if CAPTURE_UNSUPPORTED:
+            return
 
         entry = self.write("runtime-print.js", "console.log('from runtime');")
         output = runtime.run_with_output(entry, allow_all_permissions=True)

@@ -29,10 +29,13 @@ class OptionValidationTests(unittest.TestCase):
                     binding(missing, allow_all_permissions=True, max_heap_bytes=1)
             with self.subTest(binding=binding, option="execution_deadline"):
                 with self.assertRaises(libdeno.ConfigurationError):
+                    # 1e300 seconds exceeds Duration's range on every platform;
+                    # a near-u64 value is representable on Windows, whose
+                    # Instant starts from a smaller epoch.
                     binding(
                         missing,
                         allow_all_permissions=True,
-                        execution_deadline=1.8446744e19,
+                        execution_deadline=1e300,
                     )
 
     def test_valid_options_keep_the_missing_entry_error(self):
