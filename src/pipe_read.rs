@@ -27,18 +27,25 @@ pub(crate) fn from_raw_fd(fd: std::os::fd::RawFd) -> WaitHandle {
 }
 
 #[cfg(windows)]
-pub(crate) type WaitHandle = std::os::windows::io::RawHandle;
+#[derive(Clone, Copy)]
+pub(crate) struct WaitHandle(std::os::windows::io::RawHandle);
+
+// SAFETY: the handle is only an OS identifier. The pipe object it names stays
+// owned by the reader thread, which receives this value at spawn time, so
+// moving the identifier between threads does not move the pipe.
+#[cfg(windows)]
+unsafe impl Send for WaitHandle {}
 
 #[cfg(windows)]
 pub(crate) fn from_std<R: std::os::windows::io::AsRawHandle>(reader: &R) -> WaitHandle {
-    std::os::windows::io::AsRawHandle::as_raw_handle(reader)
+    WaitHandle(std::os::windows::io::AsRawHandle::as_raw_handle(reader))
 }
 
 #[cfg(windows)]
 pub(crate) fn from_raw_fd(fd: libc::c_int) -> WaitHandle {
     // SAFETY: `fd` is a live CRT descriptor owned by the caller for at least
     // the lifetime of the returned handle (the reader thread owns the pipe).
-    unsafe { libc::get_osfhandle(fd) as WaitHandle }
+    WaitHandle(unsafe { libc::get_osfhandle(fd) as std::os::windows::io::RawHandle })
 }
 
 /// Waits until `handle` is readable or `stop` is set.
@@ -75,6 +82,7 @@ pub(crate) fn wait_readable(handle: WaitHandle, stop: &AtomicBool) -> io::Result
         use windows_sys::Win32::Foundation::{GetLastError, ERROR_BROKEN_PIPE};
         use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
+        let handle = handle.0;
         loop {
             if stop.load(Ordering::Acquire) {
                 return Ok(false);
