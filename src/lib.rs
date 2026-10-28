@@ -18,6 +18,7 @@
 //! ```
 
 mod analysis_cache;
+mod budget;
 mod deno_resolver_adapter;
 mod deno_runtime_adapter;
 mod executor;
@@ -30,6 +31,7 @@ mod npm_cache;
 mod output;
 mod permission_broker;
 mod permissions;
+mod pipe_read;
 mod runtime_guards;
 // Public so `libdeno::runtime::run_with_output` (capture on a reusable
 // resolver stack) is reachable; the root re-exports `run_with` /
@@ -43,6 +45,7 @@ mod subprocess;
 mod supervisor;
 mod thread_messaging;
 mod timing;
+mod token;
 mod worker_factory;
 mod worker_lifecycle;
 
@@ -731,7 +734,9 @@ pub async fn run_source_with_output_async(
     check_async_context()?;
     let entry = entry_source_memory(code, lang, base_dir, &effective_cwd(options)?)?;
     let timing = ExecutionTiming::disabled();
-    run_with_output_async_guarded(options, timing.clone(), run_inner(&entry, options, timing)).await
+    run_with_output_async_guarded(options, timing.clone(), run_inner(&entry, options, timing))
+        .await
+        .map_err(output::CapturedRunError::into_error)
 }
 
 /// Runs `entry` to completion, returning the exit code together with the
@@ -788,10 +793,11 @@ pub(crate) fn run_with_output_observed_cancellable(
     options: &LibdenoOptions,
     timing: ExecutionTiming,
     cancellation: Option<limits::CancellationContext>,
-) -> Result<RunOutput, LibdenoError> {
+) -> Result<RunOutput, output::CapturedRunError> {
     let _lease = {
         let _admission = timing.span(Phase::Admission);
-        RunLease::acquire(options.capture_stdout || options.capture_stderr)?
+        RunLease::acquire(options.capture_stdout || options.capture_stderr)
+            .map_err(output::CapturedRunError::new)?
     };
     let entry = entry.clone();
     let options = options.clone();
@@ -800,7 +806,8 @@ pub(crate) fn run_with_output_observed_cancellable(
         join_worker(|| {
             std::thread::Builder::new()
                 .spawn(move || run_sync_output_cancellable(&entry, &options, timing, cancellation))
-        })?
+        })
+        .map_err(output::CapturedRunError::new)?
     } else {
         run_sync_output_cancellable(&entry, &options, timing, cancellation)
     }
@@ -814,10 +821,10 @@ pub(crate) fn run_with_output_observed_cancellable_until(
     timing: ExecutionTiming,
     cancellation: Option<limits::CancellationContext>,
     absolute_deadline: Option<std::time::Instant>,
-) -> Result<RunOutput, LibdenoError> {
+) -> Result<RunOutput, output::CapturedRunError> {
     let deadline_guard =
         limits::AbsoluteDeadlineGuard::new(absolute_deadline, cancellation.clone())
-            .map_err(LibdenoError::Io)?;
+            .map_err(|error| output::CapturedRunError::new(LibdenoError::Io(error)))?;
     let result = crate::runtime::run_with_output_observed_cancellable(
         runtime,
         entry,
@@ -835,33 +842,21 @@ fn run_sync_output_cancellable(
     options: &LibdenoOptions,
     timing: ExecutionTiming,
     cancellation: Option<limits::CancellationContext>,
-) -> Result<RunOutput, LibdenoError> {
+) -> Result<RunOutput, output::CapturedRunError> {
     #[cfg(windows)]
     if options.capture_stdout || options.capture_stderr {
-        return Err(LibdenoError::Configuration(
+        return Err(output::CapturedRunError::new(LibdenoError::Configuration(
             CAPTURE_UNSUPPORTED_ON_WINDOWS.to_string(),
-        ));
+        )));
     }
     let capture = output::OutputCapture::new(
         options.capture_stdout,
         options.capture_stderr,
         options.max_capture_bytes,
     )
-    .map_err(LibdenoError::Io)?;
+    .map_err(|error| output::CapturedRunError::new(LibdenoError::Io(error)))?;
     let result = run_sync_cancellable(entry, options, timing.clone(), cancellation);
-    let capture_result = capture.finish().map_err(LibdenoError::Io);
-    match result {
-        Err(error) => Err(error),
-        Ok(exit_code) => {
-            let (stdout, stderr, capture_truncated) = capture_result?;
-            Ok(RunOutput {
-                exit_code,
-                stdout,
-                stderr,
-                capture_truncated,
-            })
-        }
-    }
+    output::finish_capture(capture, result, options, &timing)
 }
 
 #[cfg(feature = "execution-control")]
@@ -917,24 +912,8 @@ fn run_sync_output(
     )
     .map_err(LibdenoError::Io)?;
     let result = run_sync(entry, options, timing.clone());
-    let capture_result = if options.capture_stdout || options.capture_stderr {
-        let _output_drain = timing.span(Phase::OutputDrain);
-        capture.finish().map_err(LibdenoError::Io)
-    } else {
-        capture.finish().map_err(LibdenoError::Io)
-    };
-    match result {
-        Err(error) => Err(error),
-        Ok(exit_code) => {
-            let (stdout, stderr, capture_truncated) = capture_result?;
-            Ok(RunOutput {
-                exit_code,
-                stdout,
-                stderr,
-                capture_truncated,
-            })
-        }
-    }
+    output::finish_capture(capture, result, options, &timing)
+        .map_err(output::CapturedRunError::into_error)
 }
 
 /// Runs `entry` on the **caller's** tokio runtime. Identical semantics to
@@ -991,7 +970,9 @@ pub async fn run_with_output_async(
     check_async_context()?;
     let entry = EntrySource::from_path(entry.as_ref());
     let timing = ExecutionTiming::disabled();
-    run_with_output_async_guarded(options, timing.clone(), run_inner(&entry, options, timing)).await
+    run_with_output_async_guarded(options, timing.clone(), run_inner(&entry, options, timing))
+        .await
+        .map_err(output::CapturedRunError::into_error)
 }
 
 /// Thread-local guard: one `run_async` at a time per thread (see
@@ -1045,7 +1026,7 @@ pub(crate) async fn run_with_output_async_guarded<F>(
     options: &LibdenoOptions,
     timing: ExecutionTiming,
     run: F,
-) -> Result<RunOutput, LibdenoError>
+) -> Result<RunOutput, output::CapturedRunError>
 where
     F: std::future::Future<Output = Result<i32, LibdenoError>>,
 {
@@ -1053,45 +1034,46 @@ where
     // the isolate to its creating thread). The process-global lease cannot see
     // this thread-local hazard, so the RAII guard turns it into a recoverable
     // Configuration error. Dropping the future releases the guard.
-    let _guard = AsyncRunGuard::acquire()?;
+    let _guard = AsyncRunGuard::acquire().map_err(output::CapturedRunError::new)?;
     // Same lease protocol as the sync path: capture is process-global and
     // exclusive; the lease is an atomic RAII guard, so it is safe to hold
     // across awaits.
     let _lease = {
         let _admission = timing.span(Phase::Admission);
-        RunLease::acquire(options.capture_stdout || options.capture_stderr)?
+        RunLease::acquire(options.capture_stdout || options.capture_stderr)
+            .map_err(output::CapturedRunError::new)?
     };
     #[cfg(windows)]
     if options.capture_stdout || options.capture_stderr {
-        return Err(LibdenoError::Configuration(
+        return Err(output::CapturedRunError::new(LibdenoError::Configuration(
             CAPTURE_UNSUPPORTED_ON_WINDOWS.to_string(),
-        ));
+        )));
     }
     let capture = output::OutputCapture::new(
         options.capture_stdout,
         options.capture_stderr,
         options.max_capture_bytes,
     )
-    .map_err(LibdenoError::Io)?;
+    .map_err(|error| output::CapturedRunError::new(LibdenoError::Io(error)))?;
     let result = run.await;
+    // Restore fd 1/2 here, on the caller's thread: the redirect is
+    // process-global state, so it must not outlive the run by however long a
+    // blocking-pool task waits to be scheduled. Only the (up to 500ms) reader
+    // drain moves off the executor thread.
+    let pending = capture.restore();
     let capture_result = if options.capture_stdout || options.capture_stderr {
         let _output_drain = timing.span(Phase::OutputDrain);
-        capture.finish().map_err(LibdenoError::Io)
-    } else {
-        capture.finish().map_err(LibdenoError::Io)
-    };
-    match result {
-        Err(error) => Err(error),
-        Ok(exit_code) => {
-            let (stdout, stderr, capture_truncated) = capture_result?;
-            Ok(RunOutput {
-                exit_code,
-                stdout,
-                stderr,
-                capture_truncated,
+        tokio::task::spawn_blocking(move || pending.collect())
+            .await
+            .unwrap_or_else(|error| {
+                Err(std::io::Error::other(format!(
+                    "output collection task failed: {error}"
+                )))
             })
-        }
-    }
+    } else {
+        pending.collect()
+    };
+    output::combine_capture(result, capture_result)
 }
 
 /// The actual run: a fresh current-thread runtime and the run lifecycle. Must
@@ -1176,6 +1158,17 @@ pub(crate) async fn run_inner_with_cancellation(
     // converge here, so invalid resource limits cannot reach backend defaults.
     limits::validate_max_heap_bytes(options.max_heap_bytes)?;
     limits::validate_execution_deadline(options.execution_deadline)?;
+    // A zero budget means "do not execute": reject before resolver setup and
+    // V8 bootstrap so no script side effect can happen. `run_with_termination`
+    // repeats this check for the paths that skip this function.
+    if options
+        .execution_deadline
+        .is_some_and(|duration| duration.is_zero())
+    {
+        return Err(LibdenoError::Timeout(
+            "execution deadline of 0ns exceeded; script was not started".to_string(),
+        ));
+    }
 
     // rustls needs an explicit CryptoProvider (aws-lc-rs and ring are both
     // enabled in the dep graph); the deno CLI does the same. Only install when
@@ -1352,16 +1345,12 @@ fn resolve_main_module(
             // is not a shadowing guard — the map is the run's in-memory overlay
             // and is consulted before disk, so a same-named real file could not
             // win either way.
-            let mut suffix = [0u8; 8];
-            getrandom::fill(&mut suffix).map_err(|e| {
+            let suffix = crate::token::random_hex(8).map_err(|e| {
                 LibdenoError::Runtime(deno_core::anyhow::anyhow!(
                     "failed to generate a virtual in-memory entry name: {e}"
                 ))
             })?;
-            let virtual_path = base_dir.join(format!(
-                "$deno$__libdeno_virtual_{:016x}.{ext}",
-                u64::from_ne_bytes(suffix)
-            ));
+            let virtual_path = base_dir.join(format!("$deno$__libdeno_virtual_{suffix}.{ext}"));
             let url = ModuleSpecifier::from_file_path(&virtual_path).map_err(|_| {
                 LibdenoError::Entry(deno_core::anyhow::anyhow!(
                     "Invalid in-memory entry path: {}",

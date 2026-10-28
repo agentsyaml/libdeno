@@ -21,7 +21,7 @@ mod output;
 mod runtime;
 mod source;
 
-use options::{apply_capture, entry_base, options_from_python};
+use options::{apply_capture, entry_base, options_from_python, validate_options};
 use output::RunOutput;
 use runtime::Runtime;
 use source::{source_bytes, source_lang_from_python, SourceLang};
@@ -62,7 +62,11 @@ fn run(
     )?;
     // Option validation comes first so a bad deadline/heap still reports
     // ConfigurationError, matching the documented argument contract.
-    check_entry_exists(&entry, &entry_base(&options)?)?;
+    validate_options(&options)?;
+    let base = py
+        .detach(|| entry_base(&options))
+        .map_err(DenoIOError::new_err)?;
+    check_entry_detached(py, &entry, &base)?;
     let result = py.detach(|| libdeno::run(entry, &options));
     result.map_err(core_error_to_py)
 }
@@ -97,13 +101,17 @@ fn run_with_output(
         execution_deadline.as_ref(),
         features.as_ref().map(|value| value.bind(py)),
     )?;
+    validate_options(&options)?;
     apply_capture(
         &mut options,
         capture_stdout,
         capture_stderr,
         max_capture_bytes.as_ref(),
     )?;
-    check_entry_exists(&entry, &entry_base(&options)?)?;
+    let base = py
+        .detach(|| entry_base(&options))
+        .map_err(DenoIOError::new_err)?;
+    check_entry_detached(py, &entry, &base)?;
     let result = py.detach(|| libdeno::run_with_output(entry, &options));
     result.map(RunOutput::from).map_err(core_error_to_py)
 }
@@ -268,7 +276,7 @@ pub(crate) fn string_sequence(value: &Bound<'_, PyAny>, name: &str) -> PyResult<
 // shortcut: only the path itself is checked, so a directory whose package.json
 // `main` names a missing file still reports DenoRuntimeError; upgrade by
 // resolving `main` here if that case must be EntryError too.
-pub(crate) fn check_entry_exists(entry: &Path, cwd: &Path) -> PyResult<()> {
+pub(crate) fn check_entry_exists(entry: &Path, cwd: &Path) -> Result<(), String> {
     let resolved = if entry.is_absolute() {
         entry.to_path_buf()
     } else {
@@ -277,11 +285,18 @@ pub(crate) fn check_entry_exists(entry: &Path, cwd: &Path) -> PyResult<()> {
     if resolved.exists() {
         Ok(())
     } else {
-        Err(EntryError::new_err(format!(
+        Err(format!(
             "failed to resolve entry module: {} does not exist",
             resolved.display()
-        )))
+        ))
     }
+}
+
+/// Runs the entry stat with the GIL released: a stalled network filesystem must
+/// not freeze every other Python thread during preparation.
+pub(crate) fn check_entry_detached(py: Python<'_>, entry: &Path, cwd: &Path) -> PyResult<()> {
+    py.detach(|| check_entry_exists(entry, cwd))
+        .map_err(EntryError::new_err)
 }
 
 pub(crate) fn core_error_to_py(error: CoreError) -> PyErr {

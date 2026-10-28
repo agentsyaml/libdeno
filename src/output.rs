@@ -21,42 +21,19 @@ const MAX_ACTIVE_CAPTURE_READERS: usize = 64;
 static ACTIVE_CAPTURE_READERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-struct CaptureReaderBudget;
-
-impl Drop for CaptureReaderBudget {
-    fn drop(&mut self) {
-        let previous = ACTIVE_CAPTURE_READERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        debug_assert!(
-            previous > 0,
-            "capture reader budget released without a reservation"
-        );
-    }
-}
+type CaptureReaderBudget = crate::budget::BudgetGuard;
 
 #[cfg(test)]
 fn active_capture_readers() -> usize {
-    ACTIVE_CAPTURE_READERS.load(std::sync::atomic::Ordering::Acquire)
+    crate::budget::active(&ACTIVE_CAPTURE_READERS)
 }
 
 fn reserve_capture_reader() -> Result<CaptureReaderBudget, std::io::Error> {
-    use std::sync::atomic::Ordering::{AcqRel, Acquire};
-
-    let mut active = ACTIVE_CAPTURE_READERS.load(Acquire);
-    loop {
-        if active >= MAX_ACTIVE_CAPTURE_READERS {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                format!(
-                    "output capture reader/pipe resource budget exhausted: {} active, maximum {}",
-                    active, MAX_ACTIVE_CAPTURE_READERS
-                ),
-            ));
-        }
-        match ACTIVE_CAPTURE_READERS.compare_exchange_weak(active, active + 1, AcqRel, Acquire) {
-            Ok(_) => return Ok(CaptureReaderBudget),
-            Err(next) => active = next,
-        }
-    }
+    crate::budget::reserve(
+        &ACTIVE_CAPTURE_READERS,
+        MAX_ACTIVE_CAPTURE_READERS,
+        "output capture reader/pipe",
+    )
 }
 
 // Fds are plain libc::c_int (CRT fds) on every platform: libc's pipe/dup/
@@ -77,6 +54,16 @@ impl OutputCapture {
         capture_stderr: bool,
         max_bytes: Option<usize>,
     ) -> Result<Self, std::io::Error> {
+        // Flush the host's Rust-level stdio buffers *before* the fd changes
+        // hands: anything still buffered would otherwise be written to the
+        // pipe and reported as the script's output. Nothing is redirected yet,
+        // so a flush failure is safe to return as-is.
+        if capture_stdout {
+            std::io::Write::flush(&mut std::io::stdout())?;
+        }
+        if capture_stderr {
+            std::io::Write::flush(&mut std::io::stderr())?;
+        }
         // Validate targets on Unix; all internal descriptors are kept >= 3.
         let saved_stdout = if capture_stdout {
             Some(SavedFd::duplicate(1)?)
@@ -106,16 +93,43 @@ impl OutputCapture {
     /// Call unconditionally after the run, even on error, so the redirection
     /// never outlives the run. Reader errors are returned after both streams
     /// have had a chance to restore their fds.
-    pub(crate) fn finish(mut self) -> Result<(Vec<u8>, Vec<u8>, bool), std::io::Error> {
+    pub(crate) fn finish(self) -> Result<(Vec<u8>, Vec<u8>, bool), std::io::Error> {
+        self.restore().collect()
+    }
+
+    /// Restores both fds on the calling thread and returns the still-pending
+    /// reader collection. Async hosts use this to keep the (up to 500ms,
+    /// blocking) drain off their executor thread while never letting the fd
+    /// redirect outlive the run.
+    pub(crate) fn restore(mut self) -> PendingCapture {
+        let stdout = self.stdout.take().map(|mut stream| {
+            stream.restore();
+            stream
+        });
+        let stderr = self.stderr.take().map(|mut stream| {
+            stream.restore();
+            stream
+        });
+        PendingCapture { stdout, stderr }
+    }
+}
+
+/// A capture whose fds are restored; only the reader drain is left.
+pub(crate) struct PendingCapture {
+    stdout: Option<StreamCapture>,
+    stderr: Option<StreamCapture>,
+}
+
+impl PendingCapture {
+    /// Same contract as [`OutputCapture::finish`] minus the redirection.
+    pub(crate) fn collect(self) -> Result<(Vec<u8>, Vec<u8>, bool), std::io::Error> {
         let stdout = self
             .stdout
-            .take()
-            .map(|stream| stream.finish())
+            .map(|stream| stream.collect())
             .unwrap_or_else(|| Ok((Vec::new(), false)));
         let stderr = self
             .stderr
-            .take()
-            .map(|stream| stream.finish())
+            .map(|stream| stream.collect())
             .unwrap_or_else(|| Ok((Vec::new(), false)));
         match (stdout, stderr) {
             (Err(error), _) => Err(error),
@@ -131,11 +145,93 @@ impl Drop for OutputCapture {
     fn drop(&mut self) {
         // Panic-safety: restore whatever was not finished.
         if let Some(stream) = self.stdout.take() {
-            let _ = stream.finish();
+            drop(stream);
         }
         if let Some(stream) = self.stderr.take() {
-            let _ = stream.finish();
+            drop(stream);
         }
+    }
+}
+
+/// Bytes a run had already printed when it failed.
+pub(crate) struct CapturedOutput {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) truncated: bool,
+}
+
+/// A failed captured run. The output travels with the error because a crash
+/// after a few log lines is undebuggable if the lines are dropped at the
+/// capture boundary.
+pub(crate) struct CapturedRunError {
+    pub(crate) error: crate::LibdenoError,
+    /// `None` when capture never started or its reader failed, so there is
+    /// nothing truthful to report.
+    pub(crate) output: Option<CapturedOutput>,
+}
+
+impl CapturedRunError {
+    pub(crate) fn new(error: crate::LibdenoError) -> Self {
+        Self {
+            error,
+            output: None,
+        }
+    }
+
+    pub(crate) fn into_error(self) -> crate::LibdenoError {
+        self.error
+    }
+}
+
+/// Shared tail of every capture wrapper: restore the fds, keep the bytes, and
+/// fold the run outcome into one value so the four wrappers cannot drift.
+/// Error precedence: the run's own error wins over a capture error, since a
+/// failed run is the reason the capture ended early.
+pub(crate) fn finish_capture(
+    capture: OutputCapture,
+    result: Result<i32, crate::LibdenoError>,
+    options: &crate::LibdenoOptions,
+    timing: &crate::ExecutionTiming,
+) -> Result<crate::RunOutput, CapturedRunError> {
+    let capture_result = if options.capture_stdout || options.capture_stderr {
+        let _output_drain = timing.span(crate::timing::Phase::OutputDrain);
+        capture.finish()
+    } else {
+        capture.finish()
+    };
+    combine_capture(result, capture_result)
+}
+
+/// Folds a run outcome and its capture outcome into one value.
+pub(crate) fn combine_capture(
+    result: Result<i32, crate::LibdenoError>,
+    capture_result: Result<(Vec<u8>, Vec<u8>, bool), std::io::Error>,
+) -> Result<crate::RunOutput, CapturedRunError> {
+    match (result, capture_result) {
+        (Ok(exit_code), Ok((stdout, stderr, truncated))) => Ok(crate::RunOutput {
+            exit_code,
+            stdout,
+            stderr,
+            capture_truncated: truncated,
+        }),
+        (Ok(_), Err(error)) => Err(CapturedRunError::new(crate::LibdenoError::Io(error))),
+        // A failure with no captured bytes has nothing to add; reporting an
+        // empty buffer as "partial output" would be noise for every plain
+        // exception.
+        (Err(error), Ok((stdout, stderr, truncated)))
+            if !stdout.is_empty() || !stderr.is_empty() || truncated =>
+        {
+            Err(CapturedRunError {
+                error,
+                output: Some(CapturedOutput {
+                    stdout,
+                    stderr,
+                    truncated,
+                }),
+            })
+        }
+        (Err(error), Ok(_)) => Err(CapturedRunError::new(error)),
+        (Err(error), Err(_)) => Err(CapturedRunError::new(error)),
     }
 }
 
@@ -153,6 +249,8 @@ struct StreamCapture {
     /// Set by the reader thread when the byte cap was hit (truncated).
     overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Deferred stdio flush failure, reported by [`Self::collect`].
+    flush_error: Option<std::io::Error>,
 }
 
 struct SavedFd(libc::c_int);
@@ -321,7 +419,19 @@ impl StreamCapture {
                 let mut total: usize = 0;
                 let mut discarding = false;
                 let mut read_error = None;
+                // Interruptible wait: a plain blocking read cannot observe the
+                // stop flag, so a descendant holding the pipe write end would
+                // pin this thread and its budget slot forever.
+                let wait_handle = crate::pipe_read::from_raw_fd(read_fd);
                 loop {
+                    match crate::pipe_read::wait_readable(wait_handle, &stop_flag) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => {
+                            read_error = Some(error);
+                            break;
+                        }
+                    }
                     // read()'s count type differs per platform: size_t on unix,
                     // unsigned int on Windows. Mutually exclusive cfg bindings
                     // (a shadowed binding would trip -D warnings on Windows).
@@ -414,12 +524,15 @@ impl StreamCapture {
             rx,
             overflow,
             stop,
+            flush_error: None,
         })
     }
 
     /// Restores the original fd (which closes the last pipe write end and so
-    /// unblocks the reader thread) and collects the captured bytes or a reader
-    /// I/O error.
+    /// unblocks the reader thread) and returns the captured bytes.
+    ///
+    /// Split from [`Self::restore`] so a host can restore stdio immediately
+    /// and move the (up to 500ms) drain to a blocking pool.
     ///
     /// The wait is capped at a *total* budget from entry: on macOS
     /// `posix_spawn` inherits every fd regardless of FD_CLOEXEC, so a child
@@ -433,14 +546,21 @@ impl StreamCapture {
     /// caller forever. A silent descendant that keeps the write end open can
     /// still leave the detached reader blocked in read() until it writes or
     /// exits (one thread + fd per such run — documented trade-off).
-    fn finish(mut self) -> Result<(Vec<u8>, bool), std::io::Error> {
-        // Defensive: finish() consumes self, so this can only trigger on a
-        // double-finish bookkeeping bug. Never dup2 a closed fd number.
+    fn restore(&mut self) {
+        // Defensive: restore() may only run once; the (possibly reused) fd
+        // number must never be dup2'd a second time.
         let Some(saved) = self.saved.take() else {
-            return Ok((
-                Vec::new(),
-                self.overflow.load(std::sync::atomic::Ordering::Relaxed),
-            ));
+            return;
+        };
+        // Flush host-level stdio buffers while the redirect is still in place:
+        // bytes the host wrote during the run belong to the captured stream,
+        // and flushing after the restore would leak them into the host's real
+        // stdout out of order. A flush failure must not skip the restore
+        // below, so it is recorded and reported only if collection succeeded.
+        self.flush_error = if self.target == 1 {
+            std::io::Write::flush(&mut std::io::stdout()).err()
+        } else {
+            std::io::Write::flush(&mut std::io::stderr()).err()
         };
         // SAFETY: `saved` is a valid open fd; failure to restore leaves the
         // host's fd 1/2 pointed at the pipe with no way back — the host's
@@ -460,7 +580,24 @@ impl StreamCapture {
         unsafe {
             libc::close(saved);
         }
-        collect_blocks(&self.rx, &self.overflow)
+    }
+
+    /// Restore + collect in one step (test-only; production paths use the
+    /// split `restore`/`collect` pair).
+    #[cfg(test)]
+    fn finish(mut self) -> Result<(Vec<u8>, bool), std::io::Error> {
+        self.restore();
+        self.collect()
+    }
+
+    /// Drains the reader after [`Self::restore`]; reports a deferred flush
+    /// error only when collection itself succeeded.
+    fn collect(mut self) -> Result<(Vec<u8>, bool), std::io::Error> {
+        let flush_error = self.flush_error.take();
+        collect_blocks(&self.rx, &self.overflow).and_then(|collected| match flush_error {
+            Some(error) => Err(error),
+            None => Ok(collected),
+        })
     }
 }
 
@@ -514,22 +651,8 @@ impl Drop for StreamCapture {
         // finish() ever running, leaving the host's fd 1/2 pointed at a pipe
         // with no reader — host stdout would be swallowed, then block once
         // the pipe buffer fills. Restore the fd here so the redirect never
-        // outlives its capture. `take()` guards against double-restore: after
-        // finish() ran, `saved` is None, so the (possibly reused) fd number
-        // is never touched again.
-        if let Some(saved) = self.saved.take() {
-            #[cfg(unix)]
-            if let Err(error) = restore_target(self.target, saved, self.target_flags) {
-                abort_restore(self.target, &error);
-            }
-            #[cfg(windows)]
-            if unsafe { libc::dup2(saved, self.target) } < 0 {
-                abort_restore(self.target, &std::io::Error::last_os_error());
-            }
-            unsafe {
-                libc::close(saved);
-            }
-        }
+        // outlives its capture. `restore()` is a no-op after it already ran.
+        self.restore();
         self.stop.store(true, std::sync::atomic::Ordering::Release);
     }
 }
@@ -608,6 +731,7 @@ mod tests {
     use super::active_capture_readers;
     use super::collect_blocks;
     use super::collect_blocks_until;
+    use super::combine_capture;
     use super::reserve_capture_reader;
     use super::MAX_ACTIVE_CAPTURE_READERS;
 
@@ -727,6 +851,37 @@ mod tests {
         let (bytes, truncated) = collect_blocks(&rx, &overflow).unwrap();
         assert!(bytes.is_empty());
         assert!(!truncated);
+    }
+
+    #[test]
+    fn failed_run_keeps_captured_bytes_and_bare_failures_stay_bare() {
+        let error = || crate::LibdenoError::Runtime(deno_core::anyhow::anyhow!("boom"));
+        let failed = combine_capture(
+            Err(error()),
+            Ok((b"printed".to_vec(), b"warned".to_vec(), true)),
+        )
+        .unwrap_err();
+        let output = failed.output.expect("captured bytes must survive");
+        assert_eq!(output.stdout, b"printed");
+        assert_eq!(output.stderr, b"warned");
+        assert!(output.truncated);
+        assert_eq!(failed.error.to_string(), "boom");
+
+        // A plain exception with no output must not fabricate an empty buffer.
+        let bare = combine_capture(Err(error()), Ok((Vec::new(), Vec::new(), false))).unwrap_err();
+        assert!(bare.output.is_none());
+        assert_eq!(bare.error.to_string(), "boom");
+    }
+
+    #[test]
+    fn capture_error_does_not_mask_the_run_error() {
+        let failed = combine_capture(
+            Err(crate::LibdenoError::Timeout("deadline".into())),
+            Err(std::io::Error::other("reader failed")),
+        )
+        .unwrap_err();
+        assert!(failed.output.is_none());
+        assert!(matches!(failed.error, crate::LibdenoError::Timeout(_)));
     }
 
     #[test]
@@ -882,6 +1037,45 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_buffered_output_does_not_leak_into_the_capture() {
+        const CHILD: &str = "LIBDENO_STDIO_FLUSH_CHILD";
+        if std::env::var(CHILD).ok().as_deref() == Some("1") {
+            use std::io::Write;
+            // No newline: stays in Rust's line buffer until flushed.
+            print!("host-before-capture");
+            let capture = super::OutputCapture::new(true, false, None).unwrap();
+            print!("script-line");
+            let (stdout, _, _) = capture.finish().unwrap();
+            // The script's buffered bytes must be captured (flushed into the
+            // pipe before the restore), and the host's pre-capture bytes must
+            // not be (flushed to the real fd before the redirect).
+            assert_eq!(String::from_utf8_lossy(&stdout), "script-line");
+            let mut stderr = std::io::stderr();
+            writeln!(stderr, "LIBDENO_STDIO_FLUSH_OK").unwrap();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "output::tests::host_buffered_output_does_not_leak_into_the_capture",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated stdio flush child failed: stdout={stdout} stderr={stderr}"
+        );
+        assert!(stderr.contains("LIBDENO_STDIO_FLUSH_OK"), "{stderr}");
+        assert!(stdout.contains("host-before-capture"), "{stdout}");
+        assert!(!stdout.contains("script-line"), "{stdout}");
     }
 
     #[cfg(unix)]

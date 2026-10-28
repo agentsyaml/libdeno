@@ -103,6 +103,44 @@ fn handshake_start_barrier_terminal_mapping_and_env_stripping() {
 
 #[cfg(unix)]
 #[test]
+fn large_startup_output_does_not_deadlock_the_handshake() {
+    // The child prints 256 KiB before reading its request. A parent that writes
+    // the request first blocks on a full stdin pipe while the child blocks on a
+    // full stdout pipe, and a healthy host times out.
+    let dir = temp_dir("startup-output");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('done');").unwrap();
+    // The request must also exceed the stdin pipe buffer (64 KiB on macOS), so
+    // the parent's write itself blocks while the child is stuck on stdout.
+    let args: Vec<String> = (0..20000).map(|index| format!("arg-{index:06}")).collect();
+    let (result, elapsed) = with_child_host(|| {
+        // Set under the host-env lock: the variable is process-global, so
+        // setting it before the lock could leak into another test's child.
+        let _startup = EnvVarGuard::set("LIBDENO_TEST_STARTUP_OUTPUT", "262144");
+        let started = Instant::now();
+        let result = run_in_subprocess_with_output(
+            &entry,
+            &LibdenoOptions {
+                capture_stdout: true,
+                max_capture_bytes: Some(1024 * 1024),
+                execution_deadline: Some(Duration::from_secs(30)),
+                args,
+                ..allow_all()
+            },
+        );
+        (result, started.elapsed())
+    });
+    let output = result.expect("startup output must not deadlock the handshake");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("done"));
+    assert!(stdout.len() > 65536, "startup output was not drained");
+    assert!(elapsed < Duration::from_secs(30));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
 fn supervised_exit_code_preserves_raw_value_after_unix_status_normalization() {
     let dir = temp_dir("exit-code-normalization");
     let entry = dir.join("main.js");

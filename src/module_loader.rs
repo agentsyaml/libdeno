@@ -44,12 +44,14 @@ use deno_media_type::MediaType;
 use deno_resolver::loader::LoadedModuleOrAsset;
 use deno_resolver::loader::LoadedModuleSource;
 use deno_resolver::loader::RequestedModuleType as ResolverRequestedModuleType;
+use deno_resolver::npm::DenoInNpmPackageChecker;
 use deno_semver::package::PackageNv;
 use node_resolver::InNpmPackageChecker;
 use node_resolver::NodeResolutionKind;
 use node_resolver::ResolutionMode;
 use url::Url;
 
+use deno_runtime::deno_permissions::OpenAccessKind;
 use deno_runtime::deno_permissions::PermissionsContainer;
 
 use crate::graph::GraphResolver;
@@ -312,6 +314,61 @@ async fn wait_for_lifecycle_close(mut closing: tokio::sync::watch::Receiver<bool
     }
 }
 
+/// Re-checks a file read when a dynamic import actually runs. Statically
+/// analyzable dynamic dependencies are fetched during the root graph build, so
+/// without this a `Deno.permissions.revoke` after startup would not stop a
+/// literal `import("./x.js")` that is already cached in the graph.
+fn check_dynamic_import_read(
+    permissions: &PermissionsContainer,
+    specifier: &ModuleSpecifier,
+    in_npm_pkg_checker: &DenoInNpmPackageChecker,
+) -> Result<(), JsErrorBox> {
+    // npm sources are owned by `check_npm_source_read`; other schemes are not
+    // file reads.
+    if specifier.scheme() != "file" || in_npm_pkg_checker.in_npm_package(specifier) {
+        return Ok(());
+    }
+    // Without a broker the pre-existing policy stands: a fully granted read
+    // skips local checks.
+    if !crate::permission_broker::is_installed() && permissions.query_read_all() {
+        return Ok(());
+    }
+    let Ok(path) = specifier.to_file_path() else {
+        return Ok(());
+    };
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+    permissions
+        .check_open(Cow::Owned(canonical), OpenAccessKind::Read, Some("import"))
+        .map_err(JsErrorBox::from_err)?;
+    Ok(())
+}
+
+/// Upstream's npm module loader reads package files with a raw `sys.fs_read`
+/// and no permission check, and npm sources never reach the permission-gated
+/// graph loader (`include_npm_sources` is false). An installed broker is the
+/// authority for every read, so gate the concrete file here and hand the
+/// upstream loader the checked canonical path.
+fn check_npm_source_read(
+    permissions: &PermissionsContainer,
+    specifier: ModuleSpecifier,
+    in_npm_pkg_checker: &DenoInNpmPackageChecker,
+) -> Result<ModuleSpecifier, JsErrorBox> {
+    if !crate::permission_broker::is_installed() || !in_npm_pkg_checker.in_npm_package(&specifier) {
+        return Ok(specifier);
+    }
+    let Ok(path) = specifier.to_file_path() else {
+        return Ok(specifier);
+    };
+    // Canonicalize first so the check and the read see the same resolved path.
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+    let checked = permissions
+        .check_open(Cow::Owned(canonical), OpenAccessKind::Read, Some("import"))
+        .map_err(JsErrorBox::from_err)?
+        .into_owned_path();
+    ModuleSpecifier::from_file_path(&checked)
+        .map_err(|_| JsErrorBox::generic(format!("Invalid npm module path: {specifier}")))
+}
+
 impl ModuleLoader for GraphModuleLoader {
     fn resolve(
         &self,
@@ -383,6 +440,7 @@ impl ModuleLoader for GraphModuleLoader {
         let requested_specifier = module_specifier.clone();
         let maybe_referrer = maybe_referrer.map(|r| r.specifier.clone());
         let requested_module_type = options.requested_module_type.clone();
+        let is_dynamic_import = options.is_dynamic_import;
 
         deno_core::ModuleLoadResponse::Async(Box::pin(async move {
             // npm: specifiers (from package.json deps or bare imports) resolve to
@@ -416,13 +474,23 @@ impl ModuleLoader for GraphModuleLoader {
                 requested_specifier.clone()
             };
 
-            let graph_guard = graph.lock().await;
-            let requested = as_deno_resolver_requested_module_type(&requested_module_type);
             let in_npm_pkg_checker = services
                 .resolver_factory
                 .in_npm_package_checker()
                 .map_err(|e| JsErrorBox::generic(e.to_string()))?
                 .clone();
+            if is_dynamic_import {
+                check_dynamic_import_read(&permissions, &specifier, &in_npm_pkg_checker)?;
+            }
+            // Upstream's npm module loader reads package files with a raw
+            // `sys.fs_read` and no permission check, and npm sources never
+            // reach the permission-gated graph loader (`include_npm_sources`
+            // is false). With a broker installed it is the authority for every
+            // read, so gate the concrete file before the upstream read. Do it
+            // before taking the graph lock: a broker round-trip blocks.
+            let specifier = check_npm_source_read(&permissions, specifier, &in_npm_pkg_checker)?;
+            let graph_guard = graph.lock().await;
+            let requested = as_deno_resolver_requested_module_type(&requested_module_type);
             let loaded = services
                 .resolver_factory
                 .module_loader()
@@ -623,6 +691,9 @@ async fn build_graph_attempt(
         .map(|lockfile| FrozenGraphLocker::new(lockfile.as_ref()));
     let build_options = BuildOptions {
         is_dynamic: false,
+        // Dynamic dependencies stay eagerly filled: the graph retry path relies
+        // on the importer's tree being present. The revocation hole is closed
+        // at load time instead (see `check_dynamic_import_read`).
         skip_dynamic_deps: false,
         unstable_bytes_imports: false,
         unstable_css_imports: false,

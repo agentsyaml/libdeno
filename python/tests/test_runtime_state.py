@@ -93,6 +93,46 @@ class RuntimeStateTests(unittest.TestCase):
         self.assertEqual(runtime.run(entry, allow_all_permissions=True), 0)
         self.assertEqual(output.read_text(encoding="utf-8"), "b")
 
+    def test_entry_preparation_does_not_stall_other_threads(self):
+        # A stalled filesystem cannot be simulated portably, so this covers the
+        # reachable part: preparation-only calls (missing entry) keep working
+        # from another thread while a run is in flight. Whether the stat itself
+        # runs detached is verified by code review, not by this test.
+        script = self.write(
+            "hold-preparation.js",
+            "const until = Date.now() + 1000; while (Date.now() < until) {}",
+        )
+        missing = self.root / "missing.js"
+        runtime = libdeno.Runtime(self.root)
+        results = []
+        errors = []
+
+        def execute():
+            try:
+                results.append(
+                    runtime.run(script, allow_all_permissions=True, execution_deadline=5.0)
+                )
+            except BaseException as error:  # surface native errors after join
+                errors.append(error)
+
+        thread = threading.Thread(target=execute)
+        thread.start()
+        checked = 0
+        try:
+            deadline = time.monotonic() + 2.0
+            while thread.is_alive() and time.monotonic() < deadline:
+                with self.assertRaises(libdeno.EntryError):
+                    libdeno.run(missing, allow_all_permissions=True)
+                checked += 1
+                time.sleep(0.01)
+        finally:
+            thread.join(timeout=10.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(errors, errors)
+        self.assertEqual(results, [0])
+        self.assertGreater(checked, 0)
+
     def test_parallel_python_threads_and_gil_progress(self):
         script = self.write(
             "peer.js",

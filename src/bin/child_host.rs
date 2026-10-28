@@ -27,6 +27,25 @@ fn main() {
     }
     // SAFETY: this test host is launched only by the trusted libdeno test harness.
     unsafe { libdeno::initialize_node_ipc_from_env() }.unwrap();
+    // Test hook: emit startup output before the protocol request is read, so a
+    // parent that writes the request before draining the pipes deadlocks on a
+    // full pipe buffer.
+    if let Some(bytes) = std::env::var_os("LIBDENO_TEST_STARTUP_OUTPUT")
+        .and_then(|value| value.to_str().and_then(|value| value.parse::<usize>().ok()))
+    {
+        use std::io::Write;
+        let block = vec![b'x'; 8192];
+        let mut stdout = std::io::stdout();
+        let mut written = 0;
+        while written < bytes {
+            let take = block.len().min(bytes - written);
+            if stdout.write_all(&block[..take]).is_err() {
+                break;
+            }
+            written += take;
+        }
+        let _ = stdout.flush();
+    }
     libdeno::maybe_handle_child_mode();
     #[cfg(feature = "execution-control")]
     libdeno::maybe_handle_supervisor_mode();

@@ -308,13 +308,10 @@ fn rss_bytes() -> Option<u64> {
 
 #[cfg(all(feature = "phase-diagnostics", target_os = "macos"))]
 fn rss_bytes() -> Option<u64> {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-    if result != 0 {
-        return None;
-    }
-    let usage = unsafe { usage.assume_init() };
-    u64::try_from(usage.ru_maxrss).ok()
+    // getrusage reports ru_maxrss (peak since process start), not the current
+    // RSS, so a before/after pair would show a flat line and understate real
+    // growth. Report nothing rather than a misleading number.
+    None
 }
 
 #[cfg(all(

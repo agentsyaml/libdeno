@@ -15,6 +15,40 @@ fn write_cjs(entry: &Path, marker: &Path, value: &str, pad: usize) -> usize {
 }
 
 #[test]
+fn zero_execution_deadline_does_not_start_the_script() {
+    let dir = std::env::temp_dir().join(format!("libdeno-zero-deadline-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("main.js");
+    let marker = dir.join("started.txt");
+    fs::write(
+        &entry,
+        format!(
+            "Deno.writeTextFileSync({:?}, 'started');",
+            marker.display().to_string()
+        ),
+    )
+    .unwrap();
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        execution_deadline: Some(std::time::Duration::ZERO),
+        ..Default::default()
+    };
+    // A zero budget means "do not execute": it must be rejected before resolver
+    // setup or V8 bootstrap, so no script side effect can happen.
+    let error = run(&entry, &options).unwrap_err();
+    assert!(
+        matches!(error, libdeno::LibdenoError::Timeout(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("script was not started"));
+    assert!(
+        !marker.exists(),
+        "a zero deadline must not start the script"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn long_cjs_edits_execute_for_run_and_reusable_runtime() {
     let dir = std::env::temp_dir().join(format!("libdeno-cjs-regression-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();

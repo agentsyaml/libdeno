@@ -137,7 +137,9 @@ impl LibdenoRuntime {
         options: &LibdenoOptions,
     ) -> Result<crate::RunOutput, LibdenoError> {
         let entry = EntrySource::from_path(entry.as_ref());
-        run_with_output_async_observed(self, &entry, options, ExecutionTiming::disabled()).await
+        run_with_output_async_observed(self, &entry, options, ExecutionTiming::disabled())
+            .await
+            .map_err(crate::output::CapturedRunError::into_error)
     }
 
     /// Runs an **in-memory** JS/TS source (see [`crate::run_source`]) on the
@@ -175,7 +177,9 @@ impl LibdenoRuntime {
     ) -> Result<crate::RunOutput, LibdenoError> {
         check_source_preconditions_async(self, options)?;
         let entry = crate::entry_source_memory(code, lang, base_dir, &self.cwd)?;
-        run_with_output_async_observed(self, &entry, options, ExecutionTiming::disabled()).await
+        run_with_output_async_observed(self, &entry, options, ExecutionTiming::disabled())
+            .await
+            .map_err(crate::output::CapturedRunError::into_error)
     }
 }
 
@@ -184,9 +188,9 @@ pub(crate) async fn run_with_output_async_observed(
     entry: &EntrySource,
     options: &LibdenoOptions,
     timing: ExecutionTiming,
-) -> Result<crate::RunOutput, LibdenoError> {
-    crate::check_async_context()?;
-    reject_unusable_cwd(runtime, options)?;
+) -> Result<crate::RunOutput, crate::output::CapturedRunError> {
+    crate::check_async_context().map_err(crate::output::CapturedRunError::new)?;
+    reject_unusable_cwd(runtime, options).map_err(crate::output::CapturedRunError::new)?;
     let entry = entry.clone();
     crate::run_with_output_async_guarded(options, timing.clone(), async move {
         let shared = shared_for_run(runtime, timing.clone()).await?;
@@ -266,6 +270,7 @@ pub fn run_with_output_source(
     check_source_preconditions(runtime, options, true)?;
     let entry = crate::entry_source_memory(code, lang, base_dir, &runtime.cwd)?;
     run_with_output_observed(runtime, &entry, options, ExecutionTiming::disabled())
+        .map_err(crate::output::CapturedRunError::into_error)
 }
 
 // Exit-code-only path: rejects capture flags (same error message as before),
@@ -392,6 +397,7 @@ pub fn run_with_output(
         options,
         ExecutionTiming::disabled(),
     )
+    .map_err(crate::output::CapturedRunError::into_error)
 }
 
 pub(crate) fn run_with_output_observed(
@@ -399,7 +405,7 @@ pub(crate) fn run_with_output_observed(
     entry: &EntrySource,
     options: &LibdenoOptions,
     timing: ExecutionTiming,
-) -> Result<crate::RunOutput, LibdenoError> {
+) -> Result<crate::RunOutput, crate::output::CapturedRunError> {
     run_with_output_observed_cancellable(runtime, entry, options, timing, None)
 }
 
@@ -409,11 +415,12 @@ pub(crate) fn run_with_output_observed_cancellable(
     options: &LibdenoOptions,
     timing: ExecutionTiming,
     cancellation: Option<crate::limits::CancellationContext>,
-) -> Result<crate::RunOutput, LibdenoError> {
-    reject_unusable_cwd(runtime, options)?;
+) -> Result<crate::RunOutput, crate::output::CapturedRunError> {
+    reject_unusable_cwd(runtime, options).map_err(crate::output::CapturedRunError::new)?;
     let _lease = {
         let _admission = timing.span(Phase::Admission);
-        RunLease::acquire(options.capture_stdout || options.capture_stderr)?
+        RunLease::acquire(options.capture_stdout || options.capture_stderr)
+            .map_err(crate::output::CapturedRunError::new)?
     };
     let entry = entry.clone();
     let options = options.clone();
@@ -423,7 +430,8 @@ pub(crate) fn run_with_output_observed_cancellable(
             std::thread::Builder::new().spawn(move || {
                 run_with_sync_output_cancellable(&runtime, &entry, &options, timing, cancellation)
             })
-        })?
+        })
+        .map_err(crate::output::CapturedRunError::new)?
     } else {
         run_with_sync_output_cancellable(&runtime, &entry, &options, timing, cancellation)
     }
@@ -437,11 +445,11 @@ fn run_with_sync_output_cancellable(
     options: &LibdenoOptions,
     timing: ExecutionTiming,
     cancellation: Option<crate::limits::CancellationContext>,
-) -> Result<crate::RunOutput, LibdenoError> {
+) -> Result<crate::RunOutput, crate::output::CapturedRunError> {
     #[cfg(windows)]
     if options.capture_stdout || options.capture_stderr {
-        return Err(LibdenoError::Configuration(
-            crate::CAPTURE_UNSUPPORTED_ON_WINDOWS.to_string(),
+        return Err(crate::output::CapturedRunError::new(
+            LibdenoError::Configuration(crate::CAPTURE_UNSUPPORTED_ON_WINDOWS.to_string()),
         ));
     }
     let capture = crate::output::OutputCapture::new(
@@ -449,26 +457,9 @@ fn run_with_sync_output_cancellable(
         options.capture_stderr,
         options.max_capture_bytes,
     )
-    .map_err(LibdenoError::Io)?;
+    .map_err(|error| crate::output::CapturedRunError::new(LibdenoError::Io(error)))?;
     let result = run_with_sync_cancellable(runtime, entry, options, timing.clone(), cancellation);
-    let capture_result = if options.capture_stdout || options.capture_stderr {
-        let _output_drain = timing.span(Phase::OutputDrain);
-        capture.finish().map_err(LibdenoError::Io)
-    } else {
-        capture.finish().map_err(LibdenoError::Io)
-    };
-    match result {
-        Err(error) => Err(error),
-        Ok(exit_code) => {
-            let (stdout, stderr, capture_truncated) = capture_result?;
-            Ok(crate::RunOutput {
-                exit_code,
-                stdout,
-                stderr,
-                capture_truncated,
-            })
-        }
-    }
+    crate::output::finish_capture(capture, result, options, &timing)
 }
 
 /// The actual run against a prebuilt resolver stack: its own block_on on a

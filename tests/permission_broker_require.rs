@@ -1,8 +1,9 @@
 #![cfg(unix)]
 
 use libdeno::{run, ExtensionFactory, LibdenoOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
@@ -177,26 +178,106 @@ impl Drop for BrokerServer {
     }
 }
 
+struct ChildTestOutput {
+    status: ExitStatus,
+    timed_out: bool,
+    stdout: String,
+    stderr: String,
+}
+
+fn drain_output<R: Read + Send + 'static>(mut reader: R) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        output
+    })
+}
+
+fn run_child_test(name: &str, mode: &str, timeout: Duration) -> ChildTestOutput {
+    const CHILD: &str = "LIBDENO_BROKER_INSTALL_OP_CHILD";
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, mode)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("could not launch isolated broker-op test");
+    let stdout = drain_output(child.stdout.take().unwrap());
+    let stderr = drain_output(child.stderr.take().unwrap());
+    let deadline = std::time::Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                timed_out = true;
+                let _ = child.kill();
+                break child
+                    .wait()
+                    .expect("could not reap timed-out broker-op test");
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("could not wait for isolated broker-op test: {error}");
+            }
+        }
+    };
+    let stdout = String::from_utf8_lossy(&stdout.join().unwrap()).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr.join().unwrap()).into_owned();
+    ChildTestOutput {
+        status,
+        timed_out,
+        stdout,
+        stderr,
+    }
+}
+
 fn run_isolated_test(name: &str, test: impl FnOnce()) {
     const CHILD: &str = "LIBDENO_BROKER_INSTALL_OP_CHILD";
     if std::env::var_os(CHILD).is_some() {
         test();
         return;
     }
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env(CHILD, "1")
-        .output()
-        .expect("could not launch isolated broker-op test");
+    let output = run_child_test(name, "1", Duration::from_secs(90));
     assert!(
-        output.status.success(),
-        "isolated test failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        !output.timed_out,
+        "isolated test timed out: stdout={} stderr={}",
+        output.stdout, output.stderr
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        output.status.success(),
+        "isolated test failed: stdout={} stderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stdout.contains("1 passed"),
         "isolated test did not run: {}",
-        String::from_utf8_lossy(&output.stdout)
+        output.stdout
+    );
+}
+
+#[test]
+fn isolated_child_timeout_kills_and_reaps_blocked_child() {
+    const CHILD: &str = "LIBDENO_BROKER_INSTALL_OP_CHILD";
+    if std::env::var(CHILD).ok().as_deref() == Some("block") {
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+    let output = run_child_test(
+        "isolated_child_timeout_kills_and_reaps_blocked_child",
+        "block",
+        Duration::from_millis(200),
+    );
+    assert!(output.timed_out, "blocked child exited: {}", output.stdout);
+    assert!(
+        !output.status.success(),
+        "timed-out child exited successfully"
     );
 }
 

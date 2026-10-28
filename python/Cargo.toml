@@ -1,6 +1,6 @@
 [package]
 name = "libdeno-python"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 publish = false
 # The Python README is added by Maturin under a distinct name in the sdist.
@@ -12,9 +12,13 @@ name = "_libdeno"
 crate-type = ["cdylib"]
 
 [dependencies]
-libdeno = { path = "..", version = "=0.3.7" }
+libdeno = { path = "..", version = "=0.3.8" }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
-tokio = { version = "1", features = ["rt", "time"] }
+# Only `rt` is used directly. `enable_all()` still installs a timer driver
+# because features unify per crate: libdeno itself depends on tokio with
+# `time` (src/limits.rs uses `tokio::time::timeout`), so the timer code is in
+# this build graph regardless of what is declared here.
+tokio = { version = "1", features = ["rt"] }
 
 # Keep this prototype as an independent Cargo package; the parent crate is a
 # path dependency, not a workspace member.

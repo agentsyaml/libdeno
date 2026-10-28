@@ -48,6 +48,10 @@ error rather than reporting incomplete output as success. `capture_truncated`
 indicates that the output byte cap was reached; it is distinct from incomplete
 pipe collection.
 
+`run_with_output` still returns `Err` when the script fails, so the bytes it
+printed before failing are reachable only through the executor API:
+`Executor::execute` reports them as `ExecutionFailure::partial_output()`.
+
 ## `run_source`
 
 ```rust

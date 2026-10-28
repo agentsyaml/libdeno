@@ -87,6 +87,7 @@ fn capped_reader_stops_after_collection_drop() {
                 release: release_rx,
                 dropped: dropped_tx,
             },
+            None,
             max_bytes,
         )
         .unwrap();

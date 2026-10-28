@@ -7,6 +7,7 @@ name: Snapshot bundle reuse
 on:
   pull_request:
     paths:
+      - Cargo.lock
       - Cargo.toml
       - build.rs
       - "build_support/**"
@@ -15,6 +16,10 @@ on:
       - "tests/snapshot*.rs"
       - "docs/prebuilt-snapshots.md"
       - .github/workflows/check-version-sync.py
+      - scripts/snapshot_compat.py
+      - scripts/snapshot_compat_path_tests.py
+      - scripts/snapshot_compat_publication_tests.py
+      - scripts/test-snapshot-compat.py
       - scripts/test-snapshot-import.py
       - .github/workflows/snapshot-reuse.yml
   workflow_dispatch:
@@ -52,16 +57,25 @@ jobs:
       - name: Export a snapshot bundle
         shell: bash
         env:
-          LIBDENO_SNAPSHOT_EXPORT_DIR: ${{ runner.temp }}/bundle
-        run: cargo build --locked --lib
+          BUNDLE: ${{ runner.temp }}/bundle
+        run: |
+          set -euo pipefail
+          target="$(rustc -vV | awk '$1 == "host:" {print $2}')"
+          python3 scripts/snapshot_compat.py export \
+            --manifest-path Cargo.toml --target "$target" --bundle "$BUNDLE" -- \
+            cargo build --locked --manifest-path Cargo.toml --target "$target" --lib
 
       - name: Rebuild from the bundle
         shell: bash
         env:
-          LIBDENO_SNAPSHOT_DIR: ${{ runner.temp }}/bundle
+          BUNDLE: ${{ runner.temp }}/bundle
         run: |
           set -euo pipefail
-          cargo build --locked --lib 2>&1 | tee "$RUNNER_TEMP/reuse.log"
+          target="$(rustc -vV | awk '$1 == "host:" {print $2}')"
+          python3 scripts/snapshot_compat.py import \
+            --manifest-path Cargo.toml --target "$target" --bundle "$BUNDLE" -- \
+            cargo build --locked --manifest-path Cargo.toml --target "$target" --lib \
+            2>&1 | tee "$RUNNER_TEMP/reuse.log"
           if ! grep -q "reused the prebuilt snapshot" "$RUNNER_TEMP/reuse.log"; then
             echo "::error::the second build did not report reusing the prebuilt snapshot"
             exit 1
@@ -70,41 +84,72 @@ jobs:
       - name: Run smoke tests against the reused snapshot
         shell: bash
         env:
-          LIBDENO_SNAPSHOT_DIR: ${{ runner.temp }}/bundle
-        run: cargo test --locked --test smoke
+          BUNDLE: ${{ runner.temp }}/bundle
+        run: |
+          target="$(rustc -vV | awk '$1 == "host:" {print $2}')"
+          python3 scripts/snapshot_compat.py import --manifest-path Cargo.toml \
+            --target "$target" --bundle "$BUNDLE" -- cargo test --locked \
+            --manifest-path Cargo.toml --target "$target" --test smoke
 
       - name: Build with import-only feature
         shell: bash
         env:
-          LIBDENO_SNAPSHOT_DIR: ${{ runner.temp }}/bundle
+          BUNDLE: ${{ runner.temp }}/bundle
         run: |
+          set -euo pipefail
           python3 scripts/test-snapshot-import.py
-          cargo build --locked --lib --no-default-features --features snapshot-import,npm
+          target="$(rustc -vV | awk '$1 == "host:" {print $2}')"
+          python3 scripts/snapshot_compat.py import --manifest-path Cargo.toml \
+            --target "$target" --bundle "$BUNDLE" -- cargo build --locked \
+            --manifest-path Cargo.toml --target "$target" --lib \
+            --no-default-features --features snapshot-import,npm
 
       - name: Run smoke tests with import-only feature
         shell: bash
         env:
-          LIBDENO_SNAPSHOT_DIR: ${{ runner.temp }}/bundle
-        run: cargo test --locked --test smoke --no-default-features --features snapshot-import,npm
+          BUNDLE: ${{ runner.temp }}/bundle
+        run: |
+          target="$(rustc -vV | awk '$1 == "host:" {print $2}')"
+          python3 scripts/snapshot_compat.py import --manifest-path Cargo.toml \
+            --target "$target" --bundle "$BUNDLE" -- cargo test --locked \
+            --manifest-path Cargo.toml --target "$target" --test smoke \
+            --no-default-features --features snapshot-import,npm
 
       - name: Rebuild after same-path bundle mutation
         shell: bash
         env:
-          LIBDENO_SNAPSHOT_DIR: ${{ runner.temp }}/bundle
+          BUNDLE: ${{ runner.temp }}/bundle
         run: |
           set -euo pipefail
-          manifest="$LIBDENO_SNAPSHOT_DIR/libdeno-snapshot.manifest"
+          manifest="$BUNDLE/libdeno-snapshot.manifest"
+          sidecar="$BUNDLE/libdeno-snapshot.sources"
           backup="$RUNNER_TEMP/snapshot-manifest.backup"
+          sidecar_backup="$RUNNER_TEMP/snapshot-sources.backup"
           cp "$manifest" "$backup"
-          restore() { cp "$backup" "$manifest"; }
+          cp "$sidecar" "$sidecar_backup"
+          restore() { cp "$backup" "$manifest"; cp "$sidecar_backup" "$sidecar"; }
           trap restore EXIT
           python3 - "$manifest" <<'PY'
           import pathlib, sys
           path = pathlib.Path(sys.argv[1])
-          text = path.read_text()
-          path.write_text(text.replace("v8=", "v8=stale-", 1))
+          data = path.read_bytes()
+          path.write_bytes(data.replace(b"v8=", b"v8=stale-", 1))
           PY
-          if cargo build --locked --lib --no-default-features --features snapshot-import,npm >"$RUNNER_TEMP/mutated-build.log" 2>&1; then
+          python3 - "$manifest" "$sidecar" <<'PY'
+          import sys
+          sys.path.insert(0, "scripts")
+          import snapshot_compat
+          from pathlib import Path
+          manifest, sidecar = map(Path, sys.argv[1:])
+          fields = dict(line.split("=", 1) for line in sidecar.read_text(encoding="utf-8").splitlines())
+          fields["manifest-hash"] = snapshot_compat.fnv(manifest.read_bytes())
+          sidecar.write_bytes("".join(f"{key}={value}\n" for key, value in fields.items()).encode("utf-8"))
+          PY
+          target="$(rustc -vV | awk '$1 == "host:" {print $2}')"
+          if python3 scripts/snapshot_compat.py import --manifest-path Cargo.toml \
+            --target "$target" --bundle "$BUNDLE" -- cargo build --locked \
+            --manifest-path Cargo.toml --target "$target" --lib \
+            --no-default-features --features snapshot-import,npm >"$RUNNER_TEMP/mutated-build.log" 2>&1; then
             echo "::error::same-path bundle mutation did not invalidate the build"
             exit 1
           fi

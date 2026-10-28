@@ -169,9 +169,9 @@ See the [full API reference](docs/api.md) or the
 
 - Requires Rust 1.95 or newer; the crate uses edition 2021. The first build compiles the dependencies and V8 snapshot.
 - V8 snapshots are created on the build host, so cross-architecture builds are
-  rejected unless you supply a snapshot bundle: `LIBDENO_SNAPSHOT_DIR` reuses
-  one and `LIBDENO_SNAPSHOT_EXPORT_DIR` writes one. Matching CPU architecture
-  alone does not certify OS/ABI compatibility; see
+  rejected unless you import a compatible bundle through the snapshot wrapper.
+  Directly setting `LIBDENO_SNAPSHOT_DIR` is no longer sufficient. Matching CPU
+  architecture alone does not certify OS/ABI compatibility; see
   [Prebuilt snapshots](docs/prebuilt-snapshots.md).
 - Hosts that load `.node` addons must export `napi_*` symbols; see [`docs/getting-started.md`](docs/getting-started.md) for linker setup.
 - The compiled binary is self-contained: runtime extension scripts are embedded,
@@ -182,9 +182,11 @@ See the [full API reference](docs/api.md) or the
   quarantine can hide it).
 
 To import a prebuilt snapshot without building Deno/V8 as build-script
-dependencies, use `cargo build --no-default-features --features snapshot-import,npm`
-with `LIBDENO_SNAPSHOT_DIR` set to a compatible bundle. This opt-in mode does
-not generate a snapshot; the default build continues to generate one locally.
+dependencies, invoke `/path/to/libdeno/scripts/snapshot_compat.py` from the
+consumer's package directory with its manifest, target, bundle path, and Cargo
+feature selection.
+The direct environment-variable import is rejected. See
+[Prebuilt snapshots](docs/prebuilt-snapshots.md) for consumer-project commands.
 Target dependencies, including Deno/V8, are still compiled.
 
 ### Cargo feature: `npm`

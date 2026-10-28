@@ -45,6 +45,7 @@ jobs:
       - name: Test snapshot helpers and pinned musl patch
         run: |
           python3 scripts/test-fetch-snapshot.py
+          python3 scripts/test-snapshot-compat.py
           python3 scripts/test-snapshot-import.py
           python3 - <<'PY'
           import os

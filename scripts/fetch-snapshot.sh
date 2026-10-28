@@ -10,7 +10,7 @@ set -euo pipefail
 version="${1:-}"
 target="${2:-$(rustc -vV | sed -n 's/^host: //p')}"
 if [ -z "$version" ] || [ -z "$target" ]; then
-  echo "usage: $0 <version, e.g. 0.3.7> [target triple]" >&2
+  echo "usage: $0 <version, e.g. 0.3.8> [target triple]" >&2
   exit 2
 fi
 

@@ -2,11 +2,11 @@ use std::path::PathBuf;
 
 use pyo3::prelude::*;
 
-use crate::options::{apply_capture, options_from_python};
+use crate::options::{apply_capture, options_from_python, validate_options};
 use crate::output::RunOutput;
 use crate::source::{source_bytes, source_lang_from_python};
 use crate::{
-    base_dir_from_python, check_entry_exists, core_error_to_py, empty_tuple, path_from_python,
+    base_dir_from_python, check_entry_detached, core_error_to_py, empty_tuple, path_from_python,
     DenoIOError, DenoRuntimeError,
 };
 
@@ -26,25 +26,26 @@ impl Runtime {
     fn new(py: Python<'_>, cwd: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
         let cwd = match cwd {
             Some(cwd) => path_from_python(&cwd, "cwd")?,
-            None => std::env::current_dir().map_err(|error| {
+            None => py.detach(std::env::current_dir).map_err(|error| {
                 DenoIOError::new_err(format!("failed to get current directory: {error}"))
             })?,
         };
-        // Canonicalize like LibdenoRuntime::new so the entry check resolves
-        // against the same base the reusable stack uses, and so a later
-        // process-cwd change cannot move it.
-        let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-        let result: Result<libdeno::LibdenoRuntime, String> = py.detach(|| {
+        let result: Result<(libdeno::LibdenoRuntime, PathBuf), String> = py.detach(|| {
+            // Canonicalize like LibdenoRuntime::new so the entry check resolves
+            // against the same base the reusable stack uses, and so a later
+            // process-cwd change cannot move it.
+            let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
             let tokio_runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| format!("failed to create Tokio runtime: {error}"))?;
-            tokio_runtime
+            let inner = tokio_runtime
                 .block_on(libdeno::LibdenoRuntime::new(cwd.clone()))
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            Ok((inner, cwd))
         });
         result
-            .map(|inner| Self { inner, cwd })
+            .map(|(inner, cwd)| Self { inner, cwd })
             .map_err(DenoRuntimeError::new_err)
     }
 
@@ -78,7 +79,8 @@ impl Runtime {
             features.as_ref(),
         )?;
         // Same ordering as `run()`: argument validation first, then the entry.
-        check_entry_exists(&entry, &self.cwd)?;
+        validate_options(&options)?;
+        check_entry_detached(py, &entry, &self.cwd)?;
         let result = py.detach(|| libdeno::run_with(&self.inner, entry, &options));
         result.map_err(core_error_to_py)
     }
@@ -112,13 +114,14 @@ impl Runtime {
             execution_deadline.as_ref(),
             features.as_ref(),
         )?;
+        validate_options(&options)?;
         apply_capture(
             &mut options,
             capture_stdout,
             capture_stderr,
             max_capture_bytes.as_ref(),
         )?;
-        check_entry_exists(&entry, &self.cwd)?;
+        check_entry_detached(py, &entry, &self.cwd)?;
         let result = py.detach(|| libdeno::runtime::run_with_output(&self.inner, entry, &options));
         result.map(RunOutput::from).map_err(core_error_to_py)
     }

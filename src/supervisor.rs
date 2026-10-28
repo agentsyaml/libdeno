@@ -1,5 +1,4 @@
 #![cfg(feature = "execution-control")]
-#![allow(dead_code)]
 
 use std::fmt;
 use std::io::{self, Read};
@@ -7,7 +6,8 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -310,6 +310,8 @@ pub(crate) fn read_optional_frame_until(
     }
 }
 
+/// Test-only: production paths always write frames under an explicit deadline.
+#[cfg(test)]
 pub(crate) fn write_frame(stream: &mut TcpStream, frame: &SupervisorFrame) -> io::Result<()> {
     let deadline = Instant::now()
         .checked_add(SUPERVISOR_FRAME_TIMEOUT)
@@ -1229,13 +1231,10 @@ pub(crate) fn validate_supervisor_terminal_shape(terminal: &SupervisorTerminal) 
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CancelReason {
-    User,
-    Deadline,
-    Shutdown,
-}
+/// Cancellation causes travel over the supervisor wire protocol, so the enum
+/// lives with the cancellation bridge and is re-exported here under the name
+/// the subprocess/supervisor code uses.
+pub(crate) use crate::limits::CancellationReason as CancelReason;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1353,6 +1352,7 @@ impl SupervisorParentSession {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn send_start(&mut self) -> io::Result<()> {
         if self.state != SupervisorParentState::Accepted {
             return Err(invalid_data("supervisor START is out of order"));
@@ -1521,6 +1521,7 @@ impl SupervisorChildSession {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn state(&self) -> SupervisorChildState {
         self.state
     }
@@ -1602,12 +1603,13 @@ impl SupervisorChildSession {
 }
 
 /// Cancellation state shared by the parent control worker and the existing
-/// runtime cancellation bridge. The reason is kept separately because the
-/// runtime bridge intentionally carries only a boolean request.
+/// runtime cancellation bridge. The reason lives only in the shared
+/// `CancellationContext`, which is already first-reason-wins; keeping a second
+/// copy here allowed the two to disagree (a concurrent user request and a
+/// deadline could be cached in the opposite order from the context).
 #[derive(Clone)]
 pub(crate) struct SupervisorCancellation {
     context: crate::limits::CancellationContext,
-    reason: Arc<Mutex<Option<CancelReason>>>,
     default_reason: CancelReason,
 }
 
@@ -1616,10 +1618,8 @@ impl SupervisorCancellation {
         context: crate::limits::CancellationContext,
         default_reason: CancelReason,
     ) -> Self {
-        let inherited_reason = context.reason().map(cancel_reason_from_context);
         Self {
             context,
-            reason: Arc::new(Mutex::new(inherited_reason)),
             default_reason,
         }
     }
@@ -1629,13 +1629,7 @@ impl SupervisorCancellation {
     }
 
     pub(crate) fn request(&self, reason: CancelReason) {
-        let reason = self.requested_reason().unwrap_or(reason);
-        self.reason
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get_or_insert(reason);
-        self.context
-            .request_with_reason(cancel_reason_to_context(reason));
+        self.context.request_with_reason(reason);
     }
 
     pub(crate) fn reason(&self) -> CancelReason {
@@ -1643,30 +1637,11 @@ impl SupervisorCancellation {
     }
 
     pub(crate) fn requested_reason(&self) -> Option<CancelReason> {
-        self.reason
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .or_else(|| self.context.reason().map(cancel_reason_from_context))
+        self.context.reason()
     }
 
     pub(crate) fn context(&self) -> crate::limits::CancellationContext {
         self.context.clone()
-    }
-}
-
-fn cancel_reason_from_context(reason: crate::limits::CancellationReason) -> CancelReason {
-    match reason {
-        crate::limits::CancellationReason::User => CancelReason::User,
-        crate::limits::CancellationReason::Deadline => CancelReason::Deadline,
-        crate::limits::CancellationReason::Shutdown => CancelReason::Shutdown,
-    }
-}
-
-fn cancel_reason_to_context(reason: CancelReason) -> crate::limits::CancellationReason {
-    match reason {
-        CancelReason::User => crate::limits::CancellationReason::User,
-        CancelReason::Deadline => crate::limits::CancellationReason::Deadline,
-        CancelReason::Shutdown => crate::limits::CancellationReason::Shutdown,
     }
 }
 

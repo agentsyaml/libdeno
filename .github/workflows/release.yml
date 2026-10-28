@@ -619,10 +619,29 @@ jobs:
       - name: Build with exported snapshot bundle
         shell: bash
         env:
-          LIBDENO_SNAPSHOT_EXPORT_DIR: ${{ runner.temp }}/bundle
+          BUNDLE: ${{ runner.temp }}/bundle
+          EXPECTED_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          cargo build --locked --release --lib
+          target="$(rustc -vV | awk '$1 == "host:" {print $2}')"
+          test "$target" = "$EXPECTED_TARGET"
+          python3 scripts/snapshot_compat.py export \
+            --manifest-path Cargo.toml --target "$target" --bundle "$BUNDLE" -- \
+            cargo build --locked --manifest-path Cargo.toml --target "$target" \
+            --release --lib
+
+      - name: Import the exported bundle and run smoke tests
+        shell: bash
+        env:
+          BUNDLE: ${{ runner.temp }}/bundle
+        run: |
+          set -euo pipefail
+          target="$(rustc -vV | awk '$1 == "host:" {print $2}')"
+          # --release reuses the release artifacts from the export build above.
+          python3 scripts/snapshot_compat.py import --manifest-path Cargo.toml \
+            --target "$target" --bundle "$BUNDLE" -- cargo test --locked --release \
+            --manifest-path Cargo.toml --target "$target" --test smoke \
+            --no-default-features --features snapshot-import,npm
 
       - name: Package and upload snapshot bundle
         shell: bash

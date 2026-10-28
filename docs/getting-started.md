@@ -24,10 +24,11 @@ This produces `target/debug/examples/demo`, a small host binary that parses
 
 The V8 snapshot is created by the build-host process. A build whose target CPU
 architecture differs from the host is rejected unless a prebuilt bundle is
-supplied: export one with `LIBDENO_SNAPSHOT_EXPORT_DIR` on a machine that can
-run the target, then build with `LIBDENO_SNAPSHOT_DIR` pointing at it. See
-[Prebuilt snapshots](prebuilt-snapshots.md). Matching architecture alone does
-not certify cross-OS or ABI snapshot compatibility.
+exported and imported through the compatibility wrapper. Invoke the wrapper
+from the consumer package directory, using that package's manifest, target, and
+feature selection; setting `LIBDENO_SNAPSHOT_DIR` alone is rejected. See
+[Prebuilt snapshots](prebuilt-snapshots.md) for commands. Matching architecture
+alone does not certify cross-OS or ABI snapshot compatibility.
 
 ## Run the demo
 

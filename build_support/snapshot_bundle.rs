@@ -54,6 +54,14 @@ pub fn fingerprint(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
+/// The `OUT_DIR`-relative include path written into the residual table, with
+/// `/` separators on every platform. A `\` would be escaped into the generated
+/// Rust literal and then read back verbatim by `table_sources`, so a bundle
+/// exported on Windows would name `a\b.js` on a Unix importer.
+pub fn table_path(rel: &Path) -> String {
+    format!("/{}", rel.to_string_lossy().replace('\\', "/"))
+}
+
 /// File names referenced by the generated residual table, as written into
 /// `OUT_DIR`. The bundle must carry each of them.
 pub fn table_sources(table: &str) -> Vec<String> {
@@ -121,6 +129,26 @@ pub fn verify_residuals(manifest: &Manifest, table: &str, dir: &Path) -> Result<
     }
     Ok(())
 }
+
+pub fn copy_verified_residuals(
+    manifest: &Manifest,
+    table: &str,
+    source_dir: &Path,
+    output_dir: &Path,
+) -> Result<(), String> {
+    for name in table_sources(table) {
+        let source = source_dir.join(&name);
+        let target = output_dir.join(&name);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        }
+        std::fs::copy(&source, &target)
+            .map_err(|error| format!("does not contain the residual source {name}: {error}"))?;
+    }
+    verify_residuals(manifest, table, output_dir)
+}
+
 pub fn render(manifest: &Manifest) -> String {
     let identity = &manifest.identity;
     format!(
@@ -362,9 +390,62 @@ mod tests {
     }
 
     #[test]
+    fn copied_residuals_are_checked_against_the_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "libdeno-copy-residual-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = root.join("source");
+        let output = root.join("out");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let table = "include_str!(\"residual.js\")";
+        std::fs::write(source.join("residual.js"), b"abc").unwrap();
+        let mut manifest = describe(&identity(), b"snapshot", table.as_bytes());
+        manifest.residuals = describe_residuals(table, &source).unwrap();
+        verify_residuals(&manifest, table, &source).unwrap();
+        copy_verified_residuals(&manifest, table, &source, &output).unwrap();
+        assert_eq!(std::fs::read(output.join("residual.js")).unwrap(), b"abc");
+
+        std::fs::write(source.join("residual.js"), b"abd").unwrap();
+        let error = copy_verified_residuals(&manifest, table, &source, &output).unwrap_err();
+        assert!(
+            error.contains("residual source residual.js does not match"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(output.join("residual.js")).unwrap(), b"abd");
+
+        std::fs::remove_file(source.join("residual.js")).unwrap();
+        let error = copy_verified_residuals(&manifest, table, &source, &output).unwrap_err();
+        assert!(
+            error.contains("does not contain the residual source residual.js"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn table_sources_lists_included_files() {
         let table = "pub static A: &[(&str, &str)] = &[\n  (\"a\", include_str!(concat!(env!(\"OUT_DIR\"), \"/a_b.js\"))),\n];\n";
         assert_eq!(table_sources(table), vec!["a_b.js"]);
+    }
+
+    #[test]
+    fn table_paths_use_forward_slashes() {
+        assert_eq!(
+            table_path(Path::new("residual_sources/file.js")),
+            "/residual_sources/file.js"
+        );
+        // Windows separators must not reach the generated literal, where they
+        // would be escaped to `\\` and read back verbatim by table_sources.
+        let windows = table_path(Path::new(r"residual_sources\file.js"));
+        assert_eq!(windows, "/residual_sources/file.js");
+        assert!(!windows.contains('\\'), "{windows}");
+        assert_eq!(table_path(Path::new(r"a\b\c.js")), "/a/b/c.js");
     }
 
     #[test]

@@ -35,6 +35,14 @@ File imports, including static and dynamic imports, require `--allow-read` for
 each file. The entry file is checked too; a read grant on its directory covers
 the entry and its imports.
 
+A dynamic import is checked when it runs, not when the importing module loads.
+Revoking read after startup therefore denies a later `import("./file.js")`,
+whether the specifier is a literal or computed.
+
+npm package sources are checked the same way: with a broker or hook installed,
+the module file under `node_modules` goes through the broker before it is read,
+so a denied read fails the import.
+
 Unknown flags are rejected. `--deny-*` and `--ignore-*` are not supported.
 
 `LibdenoError::is_permission_error()` recognizes typed Rust permission denials.

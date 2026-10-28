@@ -11,7 +11,8 @@ from zipfile import ZipFile
 REQUIRED = {
     "pyproject.toml", "Cargo.toml", "Cargo.lock", "build.rs",
     "build_support/snapshot_arch.rs", "build_support/snapshot_bundle.rs",
-    "build_support/snapshot_identity.rs", "build_support/snapshot_sources.rs",
+    "build_support/snapshot_compat.rs", "build_support/snapshot_identity.rs",
+    "build_support/snapshot_sources.rs",
     "src/lib.rs", "python/Cargo.toml",
     "python/Cargo.lock", "python/src/lib.rs", "python/libdeno/__init__.py",
     "README-pypi.md",

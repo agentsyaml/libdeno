@@ -5,7 +5,7 @@ breaking changes are highlighted per release with migration notes.
 
 [keep a changelog]: https://keepachangelog.com/en/1.1.0/
 
-## Unreleased
+## 0.3.8
 
 ### Added
 
@@ -26,13 +26,57 @@ breaking changes are highlighted per release with migration notes.
   document building and exporting a snapshot bundle for musl targets,
   which the published bundles do not cover because the Deno crates do
   not compile for musl unpatched.
+- Snapshot imports now require a wrapper-verified source sidecar based on the
+  selected Deno/engine dependency family; residuals are checked again after
+  copying, and concurrent exports to one destination are serialized. Directly
+  setting `LIBDENO_SNAPSHOT_DIR` is rejected. The main manifest remains v2.
+  Published v0.3.7 v1 assets remain rejected and cannot be upgraded in place;
+  create a new bundle from a guard-containing source revision and matching Deno
+  dependency sources.
 
 ### Fixed
 
+- A captured run that fails now reports the bytes it printed before failing
+  through `ExecutionFailure::partial_output()` instead of dropping them.
+- A zero `execution_deadline` is rejected before resolver setup or V8
+  bootstrap, so it cannot start the script it was meant to prevent.
+- A dynamic `import()` is checked when it runs: a statically analyzable
+  literal no longer gets fetched during the root build, so revoking read after
+  startup still denies it.
+- npm package sources go through the installed permission broker before
+  upstream's unchecked `fs_read`.
+- A peer that connects to the supervisor's loopback port but fails
+  authentication is dropped, and the handshake keeps waiting for the real
+  child within one fixed budget, so any local process can no longer abort a
+  supervised run.
+- The subprocess handshake drains the child's stdout/stderr before writing the
+  request, so a host that prints more than a pipe buffer during startup no
+  longer deadlocks.
+- Capture readers wait for readability in short slices, so a descendant that
+  inherits a pipe write end can no longer pin a reader thread and its budget
+  slot forever.
+- Async capture restores fd 1/2 on the caller's thread and drains the pipes on
+  the blocking pool, so a slow drain no longer stalls the executor and the
+  redirect cannot outlive the run.
+- Host stdio is flushed before and after fd redirection, so bytes buffered
+  before a captured run no longer leak into its output and bytes written during
+  it are not lost after the restore.
+- Snapshot creation now requires the full target triple to equal the host
+  triple; a matching architecture was not enough (macOS -> Linux, glibc ->
+  musl).
+- `phase-diagnostics` no longer reports macOS RSS: `getrusage` returns the
+  process lifetime peak, not the current value, so before/after samples showed
+  a flat line. The field is `None` there until a current-RSS source exists.
+- Reject repeated snapshot target options and forward Cargo configuration
+  overrides consistently to source inspection and builds.
+- Bound broker callback regression subprocesses and kill/reap them on timeout.
 - Python: a missing entry path now raises the documented `EntryError` (it was
   unreachable before); `permissions`/`args`/`features` must be a list or tuple,
   so a mapping no longer contributes only its keys; `max_heap_bytes=True` is
-  rejected as a non-integer instead of being read as 1 byte.
+  rejected as a non-integer instead of being read as 1 byte; invalid
+  `max_heap_bytes`/`execution_deadline` are reported as `ConfigurationError`
+  before the entry check, so a missing file cannot mask a bad option; and
+  filesystem work during preparation runs without the GIL.
 - Restrict the `deno_node` argv constructor to non-musl builds and keep the
   patch recipe aligned with the pinned `deno_node` and `deno_runtime` sources.
 - Watch imported bundle contents, including residual sources, so same-path

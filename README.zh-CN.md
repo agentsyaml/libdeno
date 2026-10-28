@@ -153,14 +153,14 @@ Tokio 宿主可使用 `run_async` / `run_with_output_async`；future 是 `!Send`
 
 - 需要 Rust 1.95 或更新版本，crate 使用 edition 2021。首次构建会编译依赖并生成 V8 快照。
 - V8 快照在构建宿主上生成，因此跨 CPU 架构构建默认被拒绝；可用快照包绕过：
-  `LIBDENO_SNAPSHOT_DIR` 复用已有快照，`LIBDENO_SNAPSHOT_EXPORT_DIR` 导出快照包。
-  CPU 架构相同也不代表跨操作系统或 ABI 兼容，详见[预编译快照](docs/prebuilt-snapshots.md)。
+  通过快照兼容性包装器导入兼容包。直接设置 `LIBDENO_SNAPSHOT_DIR` 已不足以
+  导入。CPU 架构相同也不代表跨操作系统或 ABI 兼容，详见[预编译快照](docs/prebuilt-snapshots.md)。
 - 加载 `.node` 插件的宿主需要导出 `napi_*` 符号；链接配置见英文[入门文档](docs/getting-started.md)。
 
-若要导入预构建快照并避免在构建脚本依赖中构建 Deno/V8，请使用
-`cargo build --no-default-features --features snapshot-import,npm`，并将
-`LIBDENO_SNAPSHOT_DIR` 设置为兼容的快照包路径。此可选模式不会生成快照；默认构建仍会在本机生成快照。
-目标依赖（包括 Deno/V8）仍会编译。
+若要导入预构建快照并避免在构建脚本依赖中构建 Deno/V8，请从消费者项目的
+package 目录调用 libdeno checkout 中的 `scripts/snapshot_compat.py`，传入消费者
+manifest、目标、bundle 路径及其 Cargo feature 选择。直接设置环境变量会被拒绝。
+具体命令见英文[预编译快照文档](docs/prebuilt-snapshots.md)。目标依赖（包括 Deno/V8）仍会编译。
 
 ### Cargo feature：`npm`
 

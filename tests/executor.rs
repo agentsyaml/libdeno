@@ -335,6 +335,38 @@ fn runtime_failure_has_no_partial_output() {
 }
 
 #[test]
+fn runtime_failure_keeps_captured_output() {
+    let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("runtime-failure-captured");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "console.log('before-crash'); console.error('bad'); throw new Error('executor-failure');",
+    )
+    .unwrap();
+    let executor = build(Executor::builder(&dir));
+    let failure = executor
+        .execute(ExecutionRequest::new(
+            &entry,
+            LibdenoOptions {
+                capture_stdout: true,
+                capture_stderr: true,
+                ..allow_all()
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(failure.error(), ExecutionError::Libdeno(_)));
+    assert!(failure.error().to_string().contains("executor-failure"));
+    let partial = failure
+        .partial_output()
+        .expect("captured bytes must survive the failed run");
+    assert!(String::from_utf8_lossy(partial.stdout()).contains("before-crash"));
+    assert!(String::from_utf8_lossy(partial.stderr()).contains("bad"));
+    assert!(!partial.capture_truncated());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn execution_failure_exposes_standard_source_chain() {
     use std::error::Error;
 

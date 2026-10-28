@@ -53,6 +53,12 @@ class SdistValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "filename"):
                 validate([archive], "2.0.0")
 
+    def test_rejects_missing_snapshot_compat_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = self.make_archive(directory, missing="build_support/snapshot_compat.rs")
+            with self.assertRaisesRegex(ValueError, "snapshot_compat.rs"):
+                validate([archive], "1.2.3")
+
     def test_requires_exactly_one_archive(self):
         with self.assertRaisesRegex(ValueError, "exactly one"):
             validate([], "1.2.3")

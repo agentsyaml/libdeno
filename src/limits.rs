@@ -45,7 +45,8 @@ use deno_runtime::worker::MainWorker;
 use crate::timing::{ExecutionTiming, Phase};
 
 #[cfg(feature = "execution-control")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum CancellationReason {
     User,
     Deadline,
@@ -327,6 +328,15 @@ where
 
     if deadline.is_none() && cancellation.is_none() {
         return Ok(fut.await);
+    }
+
+    // An already-expired budget means "do not execute". Without this the
+    // future is still polled once (the watchdog needs a scheduling turn and
+    // the select below allows GRACE), so a fast script could run to completion
+    // or leave side effects despite a zero deadline. Executor submissions
+    // reject the same input before dispatch; keep both entry points equal.
+    if deadline.is_some_and(|duration| duration.is_zero()) {
+        return Err(ExecutionTermination::Deadline(Duration::ZERO));
     }
 
     if let (Some(cancellation), Some(isolate_handle)) = (&cancellation, &isolate_handle) {

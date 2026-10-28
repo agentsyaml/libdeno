@@ -1,9 +1,11 @@
 from os import PathLike
-from typing import ClassVar, Sequence, Union
+from typing import ClassVar, List, Tuple, Union
 
 
 _PathArg = Union[str, bytes, PathLike[str], PathLike[bytes]]
 _SourceArg = Union[str, bytes, bytearray]
+# The binding accepts only list/tuple here (a dict would be iterated as keys).
+_StrList = Union[List[str], Tuple[str, ...]]
 
 
 class LibdenoError(Exception): ...
@@ -50,26 +52,26 @@ class RunOutput:
 def run(
     entry: _PathArg,
     *,
-    permissions: Sequence[str] = ...,
+    permissions: _StrList = ...,
     allow_all_permissions: bool = ...,
-    args: Sequence[str] = ...,
+    args: _StrList = ...,
     cwd: Union[_PathArg, None] = ...,
     max_heap_bytes: Union[int, None] = ...,
     execution_deadline: Union[float, None] = ...,
-    features: Union[Sequence[str], None] = ...,
+    features: Union[_StrList, None] = ...,
 ) -> int: ...
 
 
 def run_with_output(
     entry: _PathArg,
     *,
-    permissions: Sequence[str] = ...,
+    permissions: _StrList = ...,
     allow_all_permissions: bool = ...,
-    args: Sequence[str] = ...,
+    args: _StrList = ...,
     cwd: Union[_PathArg, None] = ...,
     max_heap_bytes: Union[int, None] = ...,
     execution_deadline: Union[float, None] = ...,
-    features: Union[Sequence[str], None] = ...,
+    features: Union[_StrList, None] = ...,
     capture_stdout: bool = ...,
     capture_stderr: bool = ...,
     max_capture_bytes: Union[int, None] = ...,
@@ -81,12 +83,12 @@ def run_source(
     *,
     lang: _LangArg = SourceLang.JavaScript,
     base_dir: _PathArg = ".",
-    permissions: Sequence[str] = ...,
+    permissions: _StrList = ...,
     allow_all_permissions: bool = ...,
-    args: Sequence[str] = ...,
+    args: _StrList = ...,
     max_heap_bytes: Union[int, None] = ...,
     execution_deadline: Union[float, None] = ...,
-    features: Union[Sequence[str], None] = ...,
+    features: Union[_StrList, None] = ...,
 ) -> int: ...
 
 
@@ -95,12 +97,12 @@ def run_source_with_output(
     *,
     lang: _LangArg = SourceLang.JavaScript,
     base_dir: _PathArg = ".",
-    permissions: Sequence[str] = ...,
+    permissions: _StrList = ...,
     allow_all_permissions: bool = ...,
-    args: Sequence[str] = ...,
+    args: _StrList = ...,
     max_heap_bytes: Union[int, None] = ...,
     execution_deadline: Union[float, None] = ...,
-    features: Union[Sequence[str], None] = ...,
+    features: Union[_StrList, None] = ...,
     capture_stdout: bool = ...,
     capture_stderr: bool = ...,
     max_capture_bytes: Union[int, None] = ...,
@@ -116,24 +118,24 @@ class Runtime:
         self,
         entry: _PathArg,
         *,
-        permissions: Sequence[str] = ...,
+        permissions: _StrList = ...,
         allow_all_permissions: bool = ...,
-        args: Sequence[str] = ...,
+        args: _StrList = ...,
         max_heap_bytes: Union[int, None] = ...,
         execution_deadline: Union[float, None] = ...,
-        features: Union[Sequence[str], None] = ...,
+        features: Union[_StrList, None] = ...,
     ) -> int: ...
 
     def run_with_output(
         self,
         entry: _PathArg,
         *,
-        permissions: Sequence[str] = ...,
+        permissions: _StrList = ...,
         allow_all_permissions: bool = ...,
-        args: Sequence[str] = ...,
+        args: _StrList = ...,
         max_heap_bytes: Union[int, None] = ...,
         execution_deadline: Union[float, None] = ...,
-        features: Union[Sequence[str], None] = ...,
+        features: Union[_StrList, None] = ...,
         capture_stdout: bool = ...,
         capture_stderr: bool = ...,
         max_capture_bytes: Union[int, None] = ...,
@@ -145,12 +147,12 @@ class Runtime:
         *,
         lang: _LangArg = SourceLang.JavaScript,
         base_dir: _PathArg = ".",
-        permissions: Sequence[str] = ...,
+        permissions: _StrList = ...,
         allow_all_permissions: bool = ...,
-        args: Sequence[str] = ...,
+        args: _StrList = ...,
         max_heap_bytes: Union[int, None] = ...,
         execution_deadline: Union[float, None] = ...,
-        features: Union[Sequence[str], None] = ...,
+        features: Union[_StrList, None] = ...,
     ) -> int: ...
 
     def run_source_with_output(
@@ -159,12 +161,12 @@ class Runtime:
         *,
         lang: _LangArg = SourceLang.JavaScript,
         base_dir: _PathArg = ".",
-        permissions: Sequence[str] = ...,
+        permissions: _StrList = ...,
         allow_all_permissions: bool = ...,
-        args: Sequence[str] = ...,
+        args: _StrList = ...,
         max_heap_bytes: Union[int, None] = ...,
         execution_deadline: Union[float, None] = ...,
-        features: Union[Sequence[str], None] = ...,
+        features: Union[_StrList, None] = ...,
         capture_stdout: bool = ...,
         capture_stderr: bool = ...,
         max_capture_bytes: Union[int, None] = ...,

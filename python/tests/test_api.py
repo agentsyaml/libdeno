@@ -201,13 +201,14 @@ class ApiTests(unittest.TestCase):
         for name in ("permissions", "args", "features"):
             with self.subTest(name=name):
                 for binding in (libdeno.run, runtime.run):
-                    with self.assertRaises(libdeno.ConfigurationError) as error:
-                        binding(
-                            entry,
-                            allow_all_permissions=True,
-                            **{name: {"key": "value"}},
-                        )
-                    self.assertIn("list or tuple", str(error.exception))
+                    for value in ({"key": "value"}, "hello"):
+                        with self.assertRaises(libdeno.ConfigurationError) as error:
+                            binding(
+                                entry,
+                                allow_all_permissions=True,
+                                **{name: value},
+                            )
+                        self.assertIn("list or tuple", str(error.exception))
 
     def test_bool_max_heap_bytes_is_rejected_as_non_integer(self):
         entry = self.write("bool-heap.js", "while (true) {}")

@@ -28,6 +28,9 @@ mod snapshot_arch;
 #[path = "build_support/snapshot_bundle.rs"]
 mod snapshot_bundle;
 #[cfg(any(feature = "snapshot", feature = "snapshot-import"))]
+#[path = "build_support/snapshot_compat.rs"]
+mod snapshot_compat;
+#[cfg(any(feature = "snapshot", feature = "snapshot-import"))]
 #[path = "build_support/snapshot_identity.rs"]
 mod snapshot_identity;
 #[cfg(feature = "snapshot")]
@@ -35,16 +38,31 @@ mod snapshot_identity;
 mod snapshot_sources;
 
 fn main() {
+    // Read in the no-snapshot branch below; without this directive, removing
+    // DOCS_RS reuses the cached build-script output and keeps the placeholder.
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
     #[cfg(any(feature = "snapshot", feature = "snapshot-import"))]
     {
         println!("cargo:rerun-if-env-changed=LIBDENO_SNAPSHOT_DIR");
+        println!("cargo:rerun-if-env-changed=LIBDENO_SNAPSHOT_COMPATIBILITY_FILE");
         let prebuilt = env::var_os("LIBDENO_SNAPSHOT_DIR");
         #[cfg(feature = "snapshot")]
         println!("cargo:rerun-if-env-changed=DENO_SNAPSHOT_MINIFY_SOURCES");
         #[cfg(feature = "snapshot")]
         println!("cargo:rerun-if-env-changed=LIBDENO_SNAPSHOT_EXPORT_DIR");
+        #[cfg(feature = "snapshot")]
+        if prebuilt.is_none() {
+            if let Some(bundle) = env::var_os("LIBDENO_SNAPSHOT_EXPORT_DIR") {
+                let sidecar = Path::new(&bundle).join(snapshot_compat::SIDECAR);
+                if sidecar.exists() {
+                    std::fs::remove_file(&sidecar).unwrap_or_else(|e| {
+                        panic!("failed to remove stale {}: {e}", sidecar.display())
+                    });
+                }
+            }
+        }
         #[cfg(all(feature = "snapshot-import", not(feature = "snapshot")))]
         if prebuilt.is_none() {
             panic!("the `snapshot-import` feature requires LIBDENO_SNAPSHOT_DIR");
@@ -337,7 +355,7 @@ fn write_residual_table(
         writeln!(
             f,
             "  ({specifier:?}, include_str!(concat!(env!(\"OUT_DIR\"), {:?}))),",
-            format!("/{}", rel.display()),
+            snapshot_bundle::table_path(rel),
         )
         .unwrap();
     }
@@ -418,6 +436,8 @@ fn install_prebuilt_snapshot(bundle: &Path, out_dir: &Path) {
     });
     let manifest = snapshot_bundle::parse(&text)
         .unwrap_or_else(|e| panic!("libdeno: invalid {}: {e}", manifest_path.display()));
+    snapshot_compat::verify(bundle, &identity.target, text.as_bytes())
+        .unwrap_or_else(|e| panic!("libdeno: snapshot compatibility check failed: {e}"));
     let read = |name: &str| {
         std::fs::read(bundle.join(name)).unwrap_or_else(|e| {
             panic!(
@@ -445,27 +465,8 @@ fn install_prebuilt_snapshot(bundle: &Path, out_dir: &Path) {
     });
     std::fs::write(out_dir.join(snapshot_bundle::SNAPSHOT_FILE), &snapshot).unwrap();
     std::fs::write(out_dir.join(snapshot_bundle::TABLE_FILE), &table_bytes).unwrap();
-    for name in snapshot_bundle::table_sources(&table) {
-        let source = bundle.join(&name);
-        let target = out_dir.join(&name);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::copy(&source, &target).unwrap_or_else(|e| {
-            panic!(
-                "libdeno: bundle {} does not contain the residual source {name}: {e}",
-                bundle.display()
-            )
-        });
-    }
-    let missing = snapshot_bundle::missing_sources(&table, out_dir);
-    if !missing.is_empty() {
-        panic!(
-            "libdeno: bundle {} does not contain the residual sources its table \
-             references: {missing:?}",
-            bundle.display()
-        );
-    }
+    snapshot_bundle::copy_verified_residuals(&manifest, &table, bundle, out_dir)
+        .unwrap_or_else(|e| panic!("libdeno: bundle {} {e}", bundle.display()));
     println!(
         "cargo:warning=libdeno: reused the prebuilt snapshot in {} (target {})",
         bundle.display(),

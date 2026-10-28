@@ -1,10 +1,14 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use libdeno::LibdenoOptions;
 use pyo3::prelude::*;
 use pyo3::types::PyBool;
 
-use crate::{path_from_python, string_sequence, ConfigurationError, DenoIOError};
+use crate::{path_from_python, string_sequence, ConfigurationError};
+
+/// Mirrors `MIN_V8_OLD_GENERATION_BYTES` in `src/limits.rs`.
+const MIN_V8_OLD_GENERATION_BYTES: usize = 8 << 20;
 
 /// Rejects `bool` (an `int` subclass, so `True` would otherwise become 1) and
 /// non-integers, so a bad value reports the argument name.
@@ -74,6 +78,35 @@ pub(crate) fn options_from_python(
     })
 }
 
+/// Mirrors `validate_max_heap_bytes` and `validate_execution_deadline` in
+/// `src/limits.rs` (the source of truth; keep the two in sync). Validating here
+/// keeps a missing entry from masking an invalid resource limit, which the
+/// Rust API rejects as a configuration error.
+pub(crate) fn validate_options(options: &LibdenoOptions) -> PyResult<()> {
+    if let Some(bytes) = options.max_heap_bytes {
+        if bytes < MIN_V8_OLD_GENERATION_BYTES {
+            return Err(ConfigurationError::new_err(format!(
+                "max_heap_bytes={bytes} is too small; use at least \
+                 {MIN_V8_OLD_GENERATION_BYTES} bytes for a V8 old-generation limit"
+            )));
+        }
+        if bytes == usize::MAX {
+            return Err(ConfigurationError::new_err(
+                "max_heap_bytes=usize::MAX cannot be represented as a finite V8 heap budget",
+            ));
+        }
+    }
+    if options
+        .execution_deadline
+        .is_some_and(|duration| Instant::now().checked_add(duration).is_none())
+    {
+        return Err(ConfigurationError::new_err(
+            "execution deadline is too large for the host clock",
+        ));
+    }
+    Ok(())
+}
+
 /// Applies the `*_with_output` capture keywords.
 pub(crate) fn apply_capture(
     options: &mut LibdenoOptions,
@@ -88,12 +121,11 @@ pub(crate) fn apply_capture(
 }
 
 /// Resolution base for a path entry: `options.cwd` when set, else the process
-/// cwd, mirroring Rust's `effective_cwd`.
-pub(crate) fn entry_base(options: &LibdenoOptions) -> PyResult<PathBuf> {
+/// cwd, mirroring Rust's `effective_cwd`. Returns a plain message so the caller
+/// can run it inside `py.detach` and build the Python error after reattaching.
+pub(crate) fn entry_base(options: &LibdenoOptions) -> Result<PathBuf, String> {
     let current_dir = || {
-        std::env::current_dir().map_err(|error| {
-            DenoIOError::new_err(format!("failed to get current directory: {error}"))
-        })
+        std::env::current_dir().map_err(|error| format!("failed to get current directory: {error}"))
     };
     match options.cwd.as_deref() {
         Some(cwd) if cwd.is_absolute() => Ok(cwd.to_path_buf()),

@@ -608,8 +608,9 @@ impl ExecutionFailure {
         self.report.as_ref()
     }
 
-    /// Returns partial output when a backend can provide it. Legacy and
-    /// in-process backends do not expose error-time partial output.
+    /// Returns partial output when a backend can provide it: the supervised
+    /// subprocess backend, and an in-process run that had capture enabled and
+    /// failed after printing something.
     pub fn partial_output(&self) -> Option<&ExecutionOutput> {
         self.partial_output.as_deref()
     }
@@ -870,30 +871,7 @@ struct ExecutorDispatch {
 }
 
 #[cfg(feature = "execution-control")]
-#[derive(Clone, Copy)]
-enum CancelReason {
-    User,
-    Deadline,
-    Shutdown,
-}
-
-#[cfg(feature = "execution-control")]
-fn cancellation_reason(reason: CancelReason) -> crate::limits::CancellationReason {
-    match reason {
-        CancelReason::User => crate::limits::CancellationReason::User,
-        CancelReason::Deadline => crate::limits::CancellationReason::Deadline,
-        CancelReason::Shutdown => crate::limits::CancellationReason::Shutdown,
-    }
-}
-
-#[cfg(feature = "execution-control")]
-fn supervisor_cancel_reason(reason: CancelReason) -> crate::supervisor::CancelReason {
-    match reason {
-        CancelReason::User => crate::supervisor::CancelReason::User,
-        CancelReason::Deadline => crate::supervisor::CancelReason::Deadline,
-        CancelReason::Shutdown => crate::supervisor::CancelReason::Shutdown,
-    }
-}
+use crate::supervisor::CancelReason;
 
 #[cfg(feature = "execution-control")]
 struct ControlState {
@@ -1016,8 +994,7 @@ impl TaskControl {
         state.cancel_reason = Some(reason);
         state.lifecycle = ExecutionState::Cancelling;
         drop(state);
-        self.cancellation
-            .request_with_reason(cancellation_reason(reason));
+        self.cancellation.request_with_reason(reason);
         CancelOutcome::Requested
     }
 
@@ -1962,7 +1939,7 @@ impl ExecutorDispatch {
                     &request.entry,
                     &options,
                     Some(cancellation),
-                    supervisor_cancel_reason(default_cancel_reason),
+                    default_cancel_reason,
                     deadline,
                     timing.clone(),
                     on_started,
@@ -2047,7 +2024,7 @@ impl ExecutorDispatch {
     fn finish(
         &self,
         started: Instant,
-        result: Result<RunOutput, LibdenoError>,
+        result: Result<RunOutput, crate::output::CapturedRunError>,
         options: &LibdenoOptions,
         timing: ExecutionTiming,
     ) -> Result<ExecutionResult, ExecutionFailure> {
@@ -2062,7 +2039,16 @@ impl ExecutorDispatch {
                 None,
                 None,
             )),
-            Err(error) => Err(self.failure(started, Some(self.backend), error, timing)),
+            Err(error) => Err(captured_execution_failure(
+                error,
+                self.report(
+                    started,
+                    Some(self.backend),
+                    CapabilityOutcome::Failed,
+                    timing,
+                ),
+                options,
+            )),
         }
     }
 
@@ -2149,6 +2135,35 @@ impl ExecutorDispatch {
             None,
         )
     }
+}
+
+/// Converts a failed captured run into a public failure that still carries the
+/// bytes the script printed before it failed.
+fn captured_execution_failure(
+    failure: crate::output::CapturedRunError,
+    report: ExecutionReport,
+    options: &LibdenoOptions,
+) -> ExecutionFailure {
+    let crate::output::CapturedRunError { error, output } = failure;
+    ExecutionFailure::new(
+        ExecutionError::Libdeno(error),
+        report,
+        output.map(|captured| ExecutionOutput {
+            stdout: if options.capture_stdout {
+                captured.stdout
+            } else {
+                Vec::new()
+            },
+            stderr: if options.capture_stderr {
+                captured.stderr
+            } else {
+                Vec::new()
+            },
+            truncated: captured.truncated,
+            incomplete: false,
+            reader_error: false,
+        }),
+    )
 }
 
 #[cfg(feature = "execution-control")]
@@ -2376,12 +2391,10 @@ impl Executor {
                         &options,
                         timing,
                     )),
-                    Err(error) => Err(self.failure(
-                        started,
-                        dispatched,
-                        CapabilityOutcome::Failed,
+                    Err(error) => Err(captured_execution_failure(
                         error,
-                        timing,
+                        self.report(started, dispatched, CapabilityOutcome::Failed, timing),
+                        &options,
                     )),
                 }
             }
@@ -2456,7 +2469,8 @@ impl Executor {
                         &request.entry,
                         &options,
                         timing.clone(),
-                    );
+                    )
+                    .map_err(crate::output::CapturedRunError::new);
                     self.finish_sync_result(started, result, &options, timing)
                 } else {
                     let result = crate::subprocess::run_in_subprocess_with_executable_observed(
@@ -2492,7 +2506,7 @@ impl Executor {
     fn finish_sync_result(
         &self,
         started: Instant,
-        result: Result<RunOutput, LibdenoError>,
+        result: Result<RunOutput, crate::output::CapturedRunError>,
         options: &LibdenoOptions,
         timing: ExecutionTiming,
     ) -> Result<ExecutionResult, ExecutionFailure> {
@@ -2505,12 +2519,15 @@ impl Executor {
                 options,
                 timing,
             )),
-            Err(error) => Err(self.failure(
-                started,
-                Some(self.backend),
-                CapabilityOutcome::Failed,
+            Err(error) => Err(captured_execution_failure(
                 error,
-                timing,
+                self.report(
+                    started,
+                    Some(self.backend),
+                    CapabilityOutcome::Failed,
+                    timing,
+                ),
+                options,
             )),
         }
     }

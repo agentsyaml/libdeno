@@ -51,8 +51,10 @@ the container's native musl target, then build with source mode enabled:
 
 ```sh
 export V8_FROM_SOURCE=1
-export LIBDENO_SNAPSHOT_EXPORT_DIR="$PWD/musl-bundle"
-cargo build --release --lib
+target=x86_64-unknown-linux-musl
+python3 scripts/snapshot_compat.py export \
+  --manifest-path Cargo.toml --target "$target" --bundle "$PWD/musl-bundle" -- \
+  cargo build --locked --manifest-path Cargo.toml --target "$target" --release --lib
 ```
 
 Run this inside an Alpine container or other musl system, and use the same
@@ -62,12 +64,15 @@ container recipe has not been validated end-to-end.
 
 ## 3. Reuse the bundle
 
-The result is a normal snapshot bundle. Use it the way a published one is
-used, on any build with the same target and the same libdeno and deno
-versions:
+The result is a normal snapshot bundle. Import it through the wrapper with the
+same consumer manifest, dependency sources, features, and target used to export
+it:
 
 ```bash
-LIBDENO_SNAPSHOT_DIR=$PWD/musl-bundle cargo build --release --target x86_64-unknown-linux-musl
+target=x86_64-unknown-linux-musl
+python3 scripts/snapshot_compat.py import \
+  --manifest-path Cargo.toml --target "$target" --bundle "$PWD/musl-bundle" -- \
+  cargo build --locked --manifest-path Cargo.toml --target "$target" --release --lib
 ```
 
 Builds for that target skip snapshot creation entirely, so the cross build no
@@ -79,8 +84,8 @@ snapshot does not replace compiling `deno_runtime` and `deno_node`.
 - The patch is tied to the exact crate versions. Re-check the three sites when
   `deno_runtime` or `deno_node` moves; the argv constructor exclusion depends
   on the target's init-array ABI.
-- Bundle identity does not cover patched sources, so a patched tree and a
-  stock bundle with the same versions look identical to the manifest. Keep
-  musl bundles separate from the published ones.
+- The compatibility wrapper hashes the selected Deno source trees as well as
+  the manifest identity; keep this musl bundle separate from bundles made for
+  different patches or consumer feature graphs.
 - Snapshot bundles exist since 0.3.7; earlier releases only have the
   cross-architecture guard.
