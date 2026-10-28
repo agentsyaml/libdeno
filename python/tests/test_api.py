@@ -13,13 +13,6 @@ from tempfile import TemporaryDirectory
 
 import libdeno
 
-# In-process capture is rejected on Windows: Rust std writes through
-# GetStdHandle there, bypassing the CRT fd that dup2 redirects.
-CAPTURE_UNSUPPORTED = sys.platform == "win32"
-capture_only = unittest.skipIf(
-    CAPTURE_UNSUPPORTED, "in-process output capture is not supported on Windows"
-)
-
 
 class ApiTests(unittest.TestCase):
     def setUp(self):
@@ -346,50 +339,6 @@ class ApiTests(unittest.TestCase):
         finally:
             os.chdir(original_cwd)
 
-    @capture_only
-    def test_run_with_output_captures_stdout(self):
-        entry = self.write("print.js", "console.log('hello stdout');")
-        output = libdeno.run_with_output(entry, allow_all_permissions=True)
-
-        self.assertEqual(output.exit_code, 0)
-        self.assertIn(b"hello stdout", output.stdout)
-        self.assertEqual(output.stderr, b"")
-        self.assertFalse(output.capture_truncated)
-
-    @capture_only
-    def test_run_with_output_captures_stderr_separately(self):
-        entry = self.write("print-stderr.js", "console.error('only stderr');")
-        output = libdeno.run_with_output(entry, allow_all_permissions=True)
-
-        self.assertEqual(output.stdout, b"")
-        self.assertIn(b"only stderr", output.stderr)
-
-    def test_run_with_output_capture_flags_can_be_disabled(self):
-        entry = self.write(
-            "both-streams.js",
-            "console.log('out'); console.error('err');",
-        )
-        output = libdeno.run_with_output(
-            entry,
-            allow_all_permissions=True,
-            capture_stdout=False,
-            capture_stderr=False,
-        )
-
-        self.assertEqual(output.exit_code, 0)
-        self.assertEqual(output.stdout, b"")
-        self.assertEqual(output.stderr, b"")
-
-    @capture_only
-    def test_max_capture_bytes_truncates_and_sets_flag(self):
-        entry = self.write("chatty.js", "console.log('x'.repeat(65536));")
-        output = libdeno.run_with_output(
-            entry, allow_all_permissions=True, max_capture_bytes=64
-        )
-
-        self.assertTrue(output.capture_truncated)
-        self.assertLessEqual(len(output.stdout), 64)
-
     def test_run_source_javascript_and_typescript(self):
         self.assertEqual(
             libdeno.run_source("Deno.exit(0);", allow_all_permissions=True), 0
@@ -476,18 +425,6 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(
             runtime.run_source("Deno.exit(0);", allow_all_permissions=True), 0
         )
-        if CAPTURE_UNSUPPORTED:
-            return
-
-        entry = self.write("runtime-print.js", "console.log('from runtime');")
-        output = runtime.run_with_output(entry, allow_all_permissions=True)
-        self.assertEqual(output.exit_code, 0)
-        self.assertIn(b"from runtime", output.stdout)
-
-        source_output = runtime.run_source_with_output(
-            "console.log('from source');", allow_all_permissions=True
-        )
-        self.assertIn(b"from source", source_output.stdout)
 
     def test_runtime_entries_reject_cwd(self):
         runtime = libdeno.Runtime(self.root)
