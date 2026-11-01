@@ -12,6 +12,52 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// `docs/api.md`'s effect table lists `kv` and `cron` as the two names whose
+/// omission removes a namespace. The `webgpu` case below already covers the
+/// "omitting changes nothing" half; this covers the half that actually gates.
+#[test]
+fn omitting_kv_and_cron_removes_their_namespaces() {
+    let dir = temp_dir("kv-cron");
+    let marker = dir.join("out.txt");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        format!(
+            "Deno.writeTextFileSync({marker:?}, [\n\
+             \x20 typeof Deno.openKv,\n\
+             \x20 typeof Deno.cron,\n\
+             ].join(','));\n",
+            marker = marker.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let probe = |features: Option<Vec<String>>| -> String {
+        run(
+            &entry,
+            &LibdenoOptions {
+                features,
+                allow_all_permissions: true,
+                ..Default::default()
+            },
+        )
+        .expect("the run must succeed");
+        fs::read_to_string(&marker).unwrap()
+    };
+
+    let emptied = probe(Some(vec![]));
+    let defaults = probe(None);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        emptied, "undefined,undefined",
+        "an empty feature set must remove kv and cron"
+    );
+    assert_eq!(
+        defaults, "function,function",
+        "the default set must include kv and cron"
+    );
+}
+
 #[test]
 fn default_runtime_features_are_enabled() {
     let dir = temp_dir("default");
