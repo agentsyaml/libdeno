@@ -135,6 +135,17 @@ snapshot-import = []
 [package.metadata.docs.rs]
 no-default-features = true
 
+# Every integration test statically links V8, so one test binary is ~450 MB and
+# `--all-targets` does not fit a CI runner's disk at full debug info: measured
+# 39 GB with line tables against 144 GB without. Line tables keep panic
+# backtraces readable while dropping variable and type information, which is
+# most of the size. Override on a specific failing test for full detail:
+#   CARGO_PROFILE_TEST_DEBUG=2 cargo test --test <name>
+#
+# Only the test profile is relaxed; `cargo build` keeps full debug info.
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 debug = false
 # Release profile for this workspace's own builds (the demo example and CI
