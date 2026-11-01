@@ -62,6 +62,9 @@ fn a_lexical_escape_is_denied() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// Links need an API std exposes only on Unix, and the behaviour under test is
+/// the POSIX one: Deno's path check follows a link inside the grant.
+#[cfg(unix)]
 #[test]
 fn a_symlink_inside_the_granted_root_is_followed() {
     let dir = temp_dir("symlink");

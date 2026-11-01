@@ -313,6 +313,10 @@ fn native_op_reports_install_rejection_during_run() {
     });
 }
 
+/// The fixture makes a package visible by symlinking it into `linked/`, which
+/// needs `std::os::unix`; Windows junctions are a different API with different
+/// resolution rules, so this case does not port by changing one line.
+#[cfg(unix)]
 #[test]
 fn installed_broker_denies_cjs_json_require_despite_allow_all() {
     let dir = std::env::temp_dir().join(format!("libdeno-broker-require-{}", std::process::id()));

@@ -134,7 +134,9 @@ fn in_process_capture_still_rejects_a_concurrent_run() {
         let entry = entry.clone();
         std::thread::spawn(move || libdeno::run_with_output(&entry, &captured).map(|o| o.exit_code))
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // A watchdog, not a latency assertion: the captured run has to bootstrap an
+    // isolate first, and on a loaded machine that alone can outlast 10 s.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !marker.exists() {
         assert!(Instant::now() < deadline, "the captured run never started");
         std::thread::sleep(Duration::from_millis(10));

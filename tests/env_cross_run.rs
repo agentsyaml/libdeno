@@ -9,6 +9,10 @@
 //!
 //! Subprocess runs are unaffected: the child gets a copy of the environment.
 
+// The redirect works through a chmod +x'd `git` on `PATH`; Windows has no
+// execute bit, so the mechanism does not exist there.
+#![cfg(unix)]
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
