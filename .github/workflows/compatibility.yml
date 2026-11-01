@@ -49,6 +49,8 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets --locked
+        env:
+          CARGO_BUILD_JOBS: 2
 
       # Every test target statically links V8, so one build leaves tens of GB of
       # binaries in `target/`. Building a second feature variant on top of them

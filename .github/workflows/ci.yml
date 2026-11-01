@@ -73,7 +73,13 @@ jobs:
       - name: Test
         # --locked keeps CI in sync with the committed Cargo.lock (the release
         # publish is --locked too, so lockfile drift fails here, not at tag).
+        # Serializing most of the build keeps the linker from being run once per
+        # test binary at the same time: each one links V8 statically, and doing
+        # dozens concurrently on a 4-core runner ends in `ld terminated with
+        # signal 7 [Bus error]` rather than a test failure.
         run: cargo test --all-targets --locked
+        env:
+          CARGO_BUILD_JOBS: 2
 
       - name: Prepare execution-control feature test
         run: |

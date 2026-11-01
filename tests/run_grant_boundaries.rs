@@ -15,6 +15,9 @@
 //! `cargo test` sets `DYLD_FALLBACK_LIBRARY_PATH` on macOS and that would mask
 //! what the test measures.
 
+// The fake binaries are made executable with `chmod`, which Windows lacks.
+#![cfg(unix)]
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

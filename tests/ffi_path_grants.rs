@@ -10,6 +10,10 @@
 //! The test builds its own library files: it copies a system library into the
 //! granted directory, then links to the copy from outside.
 
+// The fixture is a host `.dylib` reached through a symlink and a hard link;
+// the library paths are macOS/Linux only.
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

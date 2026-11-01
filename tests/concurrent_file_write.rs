@@ -12,6 +12,10 @@
 //! here because that count is a race, not an invariant — the inode check below
 //! is deterministic and fails for the same reason a regression would.
 
+// Inode identity is how this test says "the same file was rewritten, not
+// replaced"; std exposes it only on Unix.
+#![cfg(unix)]
+
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
