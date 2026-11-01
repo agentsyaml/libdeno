@@ -61,7 +61,7 @@ fn install_while_running(
         &entry,
         format!(
             "Deno.writeTextFileSync({started:?}, '1');\n\
-             const until = Date.now() + 10_000;\n\
+             const until = Date.now() + 60_000;\n\
              while (Date.now() < until) {{\n\
              \x20 try {{ Deno.statSync({release:?}); Deno.exit(0); }} catch (_) {{}}\n\
              }}\n\
@@ -74,7 +74,10 @@ fn install_while_running(
         let entry = entry.clone();
         std::thread::spawn(move || libdeno::run(&entry, &options()))
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // A watchdog, not a latency assertion: isolate bootstrap under load can take
+    // far longer than the run itself, so the window only has to be wide enough
+    // that "the run never started" means it really never will.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !started.exists() {
         assert!(Instant::now() < deadline, "the run never started");
         std::thread::sleep(Duration::from_millis(10));
