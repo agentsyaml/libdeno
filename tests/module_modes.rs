@@ -164,7 +164,9 @@ fn node_modules_dir_none_ignores_a_complete_local_tree() {
     // in-process capture lease in parallel. A script failure there is `Ok` with
     // a non-zero exit code, so the assertion is on that pair.
     std::env::set_var("LIBDENO_HOST_EXE", env!("CARGO_BIN_EXE_child_host"));
-    let run_with_mode = |mode: &str| -> (i32, String) {
+    // (exit code, stdout, first stderr line): the failure wording is the point
+    // of the `auto`/`none` assertions below, and it lands on stderr.
+    let run_with_mode = |mode: &str| -> (i32, String, String) {
         fs::write(
             root.join("deno.json"),
             format!(r#"{{"nodeModulesDir":"{mode}"}}"#),
@@ -176,6 +178,7 @@ fn node_modules_dir_none_ignores_a_complete_local_tree() {
                 allow_all_permissions: true,
                 cwd: Some(root.clone()),
                 capture_stdout: true,
+                capture_stderr: true,
                 ..Default::default()
             },
         )
@@ -183,15 +186,21 @@ fn node_modules_dir_none_ignores_a_complete_local_tree() {
         (
             output.exit_code,
             String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string(),
         )
     };
 
     let manual = run_with_mode("manual");
     let none = run_with_mode("none");
+    let auto = run_with_mode("auto");
 
     assert_eq!(
-        manual,
-        (0, "got local".to_string()),
+        (manual.0, manual.1.as_str()),
+        (0, "got local"),
         "manual mode must use the local tree"
     );
     assert_ne!(
@@ -199,6 +208,20 @@ fn node_modules_dir_none_ignores_a_complete_local_tree() {
         "none mode must not resolve the local tree; stdout was {:?}",
         none.1
     );
+    // `auto` also fails here, and with the registry's wording rather than a
+    // local-resolution error: it consulted the local tree, considered it
+    // incomplete for this dependency, and asked the registry — which has no
+    // such package. `docs/npm-support.md` states this pair explicitly.
+    assert_ne!(auto.0, 0, "auto mode must not resolve the local tree");
+    for (mode, output) in [("auto", &auto), ("none", &none)] {
+        assert!(
+            output
+                .2
+                .contains("Could not find npm package 'fixture' matching '1.0.0'"),
+            "{mode} mode must fail with the registry wording, got {:?}",
+            output.2
+        );
+    }
 }
 
 /// `manual` is the offline mode: a missing local package fails without a
