@@ -336,9 +336,15 @@ fn check_dynamic_import_read(
     let Ok(path) = specifier.to_file_path() else {
         return Ok(());
     };
-    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+    // Do NOT canonicalize here. `check_open` builds its path descriptor from
+    // the path it is given and resolves symlinks only afterwards (see
+    // `parse_special_file_descriptor`), so a pre-canonicalized path changes
+    // which grant the check is measured against. The static-import path
+    // (deno_resolver's graph loader) passes the un-resolved path too; passing
+    // a canonical one here made a symlinked dependency load statically but be
+    // denied dynamically — the same file, two answers.
     permissions
-        .check_open(Cow::Owned(canonical), OpenAccessKind::Read, Some("import"))
+        .check_open(Cow::Owned(path), OpenAccessKind::Read, Some("import"))
         .map_err(JsErrorBox::from_err)?;
     Ok(())
 }

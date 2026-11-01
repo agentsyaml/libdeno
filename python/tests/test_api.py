@@ -104,6 +104,35 @@ class ApiTests(unittest.TestCase):
         with self.assertRaises(libdeno.DenoRuntimeError):
             libdeno.run(caught, permissions=(f"--allow-read={self.root}",))
 
+    def test_a_forged_not_capable_message_is_indistinguishable_from_a_real_one(
+        self,
+    ):
+        """Both are DenoRuntimeError, and both read like a denial.
+
+        This is the reason the binding classifies on Rust provenance only. The
+        test pins the limitation so a host is not told to match on text: there
+        is no Python-level way to tell these two apart, so a caller must decide
+        from the flags it passed.
+        """
+        real = self.write("real-denial.js", "Deno.readTextFileSync('/etc/shadow');")
+        forged = self.write(
+            "forged-denial.js",
+            "throw Object.assign(new Error('forged'), { name: 'NotCapable' });",
+        )
+        messages = []
+        for entry in (real, forged):
+            with self.assertRaises(libdeno.DenoRuntimeError) as error:
+                libdeno.run(entry, permissions=(f"--allow-read={self.root}",))
+            messages.append(str(error.exception))
+
+        for message in messages:
+            self.assertTrue(
+                message.startswith("NotCapable"),
+                f"both failures render with the NotCapable prefix: {message}",
+            )
+        self.assertIn("/etc/shadow", messages[0])
+        self.assertIn("forged", messages[1])
+
     def test_typed_entry_denial_is_a_permission_error(self):
         entry = self.write("entry-denial.js", "Deno.exit(0);")
         with self.assertRaises(libdeno.DenoPermissionError):
@@ -114,6 +143,35 @@ class ApiTests(unittest.TestCase):
 
         with self.assertRaises(libdeno.DenoPermissionError):
             libdeno.run(entry, permissions=("--not-a-permission",))
+
+    def test_only_host_performed_checks_are_permission_errors(self):
+        """The boundary of `DenoPermissionError` is "the host checked".
+
+        A host-side check — the entry stat, flag parsing — produces it. A check
+        the runtime performs on the script's behalf produces
+        `DenoRuntimeError`, because the script triggered it and its details are
+        script-controlled. An empty flag list is a configuration problem, not a
+        denial: nothing was refused, the arguments were unusable.
+        """
+        entry = self.write("host-checked.js", "Deno.exit(0);")
+
+        # Host checked: the entry is outside the grant.
+        with self.assertRaises(libdeno.DenoPermissionError):
+            libdeno.run(entry, permissions=("--allow-read=/usr",), cwd=self.root)
+
+        # Host checked: the flag itself is invalid.
+        with self.assertRaises(libdeno.DenoPermissionError):
+            libdeno.run(entry, permissions=("--not-a-permission",))
+
+        # Not a denial: no flags at all is a configuration error.
+        with self.assertRaises(libdeno.ConfigurationError):
+            libdeno.run(entry, permissions=(), cwd=self.root)
+
+        # Script-triggered: the runtime refused on the script's behalf.
+        denial = self.write("script-denial.js", "Deno.readTextFileSync('/etc/shadow');")
+        with self.assertRaises(libdeno.DenoRuntimeError) as error:
+            libdeno.run(denial, permissions=(f"--allow-read={self.root}",), cwd=self.root)
+        self.assertNotIsInstance(error.exception, libdeno.DenoPermissionError)
 
     def test_runtime_reuses_resolver_and_does_not_leak_permissions(self):
         allowed = self.root / "allowed"

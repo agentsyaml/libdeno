@@ -279,3 +279,121 @@ fn run_source_async_smoke() {
     assert_eq!(code, 0);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn run_source_with_output_async_captures_from_an_in_memory_entry() {
+    // Only the "reject outside a tokio context" path had a test; the happy
+    // path — an in-memory entry, its relative imports, and captured output —
+    // was uncovered. Capture is exclusive, so this serializes with the other
+    // capturing tests in this binary.
+    let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("source-async-output");
+    fs::write(dir.join("sibling.js"), "export const v = 7;").unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let output = rt
+        .block_on(libdeno::run_source_with_output_async(
+            "import { v } from './sibling.js';\n\
+             console.log('out ' + v);\n\
+             console.error('err ' + v);\n",
+            SourceLang::JavaScript,
+            &dir,
+            &LibdenoOptions {
+                allow_all_permissions: true,
+                capture_stdout: true,
+                capture_stderr: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(stdout.contains("out 7"), "stdout: {stdout:?}");
+    assert!(stderr.contains("err 7"), "stderr: {stderr:?}");
+}
+
+#[test]
+fn reusable_runtime_runs_in_memory_source_with_output() {
+    // `LibdenoRuntime::run_with_source_async` and its captured variant were
+    // public but unreferenced by any test: only the free `run_source_async`
+    // functions were covered. The reusable path builds the virtual entry
+    // against `base_dir` while the resolver stack stays scoped to the
+    // runtime's directory, so a relative import has to resolve through the
+    // *shared* stack — that is the part worth pinning.
+    let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("runtime-source-async");
+    fs::write(dir.join("sibling.js"), "export const v = 11;").unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runtime = rt.block_on(LibdenoRuntime::new(&dir)).unwrap();
+    let output = rt
+        .block_on(runtime.run_with_output_source_async(
+            "import { v } from './sibling.js';\nconsole.log('out ' + v);",
+            SourceLang::JavaScript,
+            &dir,
+            &LibdenoOptions {
+                allow_all_permissions: true,
+                capture_stdout: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let code = rt
+        .block_on(runtime.run_with_source_async(
+            "if (1 + 1 !== 2) Deno.exit(3);",
+            SourceLang::JavaScript,
+            &dir,
+            &LibdenoOptions {
+                allow_all_permissions: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(stdout.contains("out 11"), "stdout: {stdout:?}");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn reusable_runtime_source_async_rejects_a_mismatched_cwd() {
+    // The shared stack is scoped to the runtime's directory, so an
+    // `options.cwd` that resolves elsewhere cannot be honored. Both methods
+    // share `check_source_preconditions_async`, but only a test keeps that
+    // wired: silently ignoring the pin would run the script against the
+    // runtime's directory instead of the caller's.
+    let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("runtime-source-cwd");
+    let other = temp_dir("runtime-source-cwd-other");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runtime = rt.block_on(LibdenoRuntime::new(&dir)).unwrap();
+    let err = rt
+        .block_on(runtime.run_with_source_async(
+            "console.log('never');",
+            SourceLang::JavaScript,
+            &dir,
+            &LibdenoOptions {
+                allow_all_permissions: true,
+                cwd: Some(other.clone()),
+                ..Default::default()
+            },
+        ))
+        .unwrap_err();
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&other);
+    assert!(
+        err.to_string()
+            .contains("run_with ignores LibdenoOptions.cwd"),
+        "expected a cwd rejection, got: {err}"
+    );
+}

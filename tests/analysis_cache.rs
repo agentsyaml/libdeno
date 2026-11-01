@@ -65,3 +65,77 @@ fn changed_source_invalidates_cached_analysis() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A warm analysis cache must not act as a permission bypass.
+///
+/// The cache stores `ModuleInfo` (dependency lists, media type) keyed by
+/// `(specifier, source hash)`, and it is process-global. A run with a narrower
+/// grant that hits a warm entry must still be refused by the file fetcher: the
+/// cached analysis says what the module contains, not whether this run may read
+/// it. If that ever inverted, one privileged run would unlock a file for every
+/// later unprivileged run in the same process.
+#[test]
+fn a_warm_analysis_cache_does_not_bypass_read_permissions() {
+    let dir = temp_dir("perm");
+    let entry = dir.join("main.js");
+    let dep = dir.join("dep.js");
+    fs::write(&dep, "export const value = 'secret';").unwrap();
+    fs::write(
+        &entry,
+        "try {\n\
+         \x20 const module = await import('./dep.js');\n\
+         \x20 console.log('READ ' + module.value);\n\
+         } catch {\n\
+         \x20 console.log('DENIED');\n\
+         }\n",
+    )
+    .unwrap();
+
+    // Warm the cache with a grant that covers dep.js. Output goes through a
+    // marker file: in-process capture is process-global and other tests in
+    // this binary run in parallel.
+    let marker = dir.join("out.txt");
+    let run_with = |permissions: Vec<String>| -> String {
+        let _ = fs::remove_file(&marker);
+        fs::write(
+            &entry,
+            format!(
+                "try {{\n\
+                 \x20 const module = await import('./dep.js');\n\
+                 \x20 Deno.writeTextFileSync({marker:?}, 'READ ' + module.value);\n\
+                 }} catch {{\n\
+                 \x20 Deno.writeTextFileSync({marker:?}, 'DENIED');\n\
+                 }}\n",
+                marker = marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        run(
+            &entry,
+            &LibdenoOptions {
+                permissions,
+                cwd: Some(dir.clone()),
+                ..Default::default()
+            },
+        )
+        .expect("the run must not fail at the host level");
+        fs::read_to_string(&marker).unwrap_or_default()
+    };
+
+    // Both runs need write access for the marker; only the read scope differs.
+    let write = format!("--allow-write={}", dir.display());
+    let granted = run_with(vec![
+        format!("--allow-read={}", dir.display()),
+        write.clone(),
+    ]);
+    // Same source, so the analysis cache entry is a hit. Only the entry file is
+    // granted for reading this time.
+    let narrowed = run_with(vec![format!("--allow-read={}", entry.display()), write]);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert_eq!(granted, "READ secret", "the granted run must read dep.js");
+    assert_eq!(
+        narrowed, "DENIED",
+        "a cache hit must not let a narrower run read a file it was not granted"
+    );
+}

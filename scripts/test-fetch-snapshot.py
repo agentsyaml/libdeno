@@ -59,6 +59,12 @@ def main():
         expected = str(work.resolve() / f"libdeno-snapshot-{VERSION}-{TARGET}")
         assert actual == expected, (actual, expected)
         assert (Path(actual) / "payload.txt").read_text() == "snapshot data\n"
+        # The printed assignment is a path finder, not an authorization: the
+        # build script rejects a bare LIBDENO_SNAPSHOT_DIR without the
+        # wrapper's declaration. Say so next to the line people copy.
+        assert "not sufficient alone" in result.stdout, (
+            "the helper must state that the export alone does not authorize an import"
+        )
 
         (assets / f"{ARCHIVE}.sha256").write_text(f"{'0' * 64}  {ARCHIVE}\n")
         failed_work = root / "checksum failure"

@@ -192,6 +192,12 @@ pub(crate) fn build_main_worker(
 
     let mut worker =
         MainWorker::bootstrap_from_options(main_module, worker_services, worker_options);
+    // A heap ceiling without this guard is worse than no ceiling: V8 aborts
+    // the host process when the old generation fills.
+    crate::limits::install_heap_limit_guard(
+        &mut worker.js_runtime,
+        options.max_heap_bytes.is_some(),
+    );
     let isolate_handle = worker.js_runtime.v8_isolate().thread_safe_handle();
     Ok((worker, isolate_handle))
 }
@@ -211,7 +217,7 @@ const DEFAULT_RUNTIME_FEATURES: &[&str] = &["kv", "cron", "ffi", "webgpu", "work
 /// feature list arrives as owned `String`s. The deno registry already owns the
 /// static names, so map through it and retain first-seen order without leaking
 /// host-provided strings or retaining the input set.
-fn static_feature_names(features: &[String]) -> Result<Vec<&'static str>, String> {
+pub(crate) fn static_feature_names(features: &[String]) -> Result<Vec<&'static str>, String> {
     let mut names = Vec::with_capacity(features.len().min(deno_features::UNSTABLE_FEATURES.len()));
     for feature in features {
         let Some(name) = deno_features::UNSTABLE_FEATURES

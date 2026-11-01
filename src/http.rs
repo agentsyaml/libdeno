@@ -123,14 +123,10 @@ fn tarball_decompress_budget() -> usize {
 /// Rejects gzip tarballs whose ISIZE trailer (last 4 bytes, little-endian,
 /// mod 2^32) claims a member size above the configured hint threshold.
 ///
-/// This is a coarse guard, not a precise bound: ISIZE only reflects the last
-/// gzip member (multi-member tarballs can decompress larger in total) and
-/// wraps at 4 GiB. It exists to block the cheap malicious case — a tiny
-/// tarball declaring ~4 GiB that would make upstream's `try_reserve` commit
-/// that much virtual memory before the real decompressed size is known. This is
-/// only a trailer pre-check: upstream's actual decompression/read_to_end path
-/// has no hard decompressed-byte budget, so neither this check nor the
-/// reqwest-returned response-body cap above establishes a decompressed-memory bound.
+/// Coarse by nature: ISIZE covers only the last gzip member and wraps at 4 GiB,
+/// so it is not a decompressed-size bound. It blocks the cheap malicious case —
+/// a tiny tarball declaring ~4 GiB, which would make upstream's `try_reserve`
+/// commit that much virtual memory before the real size is known.
 #[cfg(feature = "npm")]
 fn guard_tarball_isize(is_tarball: bool, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     // Only .tgz URLs carry gzip-compressed tar data; registry metadata
@@ -146,6 +142,8 @@ fn guard_tarball_isize(is_tarball: bool, bytes: Vec<u8>) -> Result<Vec<u8>, Stri
         bytes[bytes.len() - 1],
     ]) as usize;
     let budget = tarball_decompress_budget();
+    // The comparison is inline rather than a helper: the configured budget is a
+    // `OnceLock`, so a test can only exercise it through this function anyway.
     if isize > budget {
         return Err(format!(
             "tarball declares {isize} decompressed bytes, over the \

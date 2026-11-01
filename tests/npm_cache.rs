@@ -838,9 +838,9 @@ fn reusable_runtime_rebuilds_for_home_npmrc_change_with_independent_userconfig()
     std::fs::write(&userconfig_a, userconfig_content_a).unwrap();
     std::fs::write(&userconfig_b, userconfig_content_b).unwrap();
     assert_eq!(userconfig_content_a.len(), userconfig_content_b.len());
-    // deno_resolver 0.88 reads `$HOME/.npmrc` (or `%USERPROFILE%\.npmrc` on
-    // Windows); keep NPM_CONFIG_USERCONFIG on a separate, unrelated file and
-    // change it independently below.
+    // The resolver reads `<home>/.npmrc` (or `<profile>\.npmrc` on Windows) and
+    // never consults NPM_CONFIG_USERCONFIG; keep that variable on a separate,
+    // unrelated file and change it independently below.
     std::env::remove_var("NPM_CONFIG_REGISTRY");
     std::env::set_var("HOME", &home);
     std::env::set_var("USERPROFILE", &home);

@@ -245,7 +245,12 @@ fn legacy_output_capture_rejects_descendant_held_pipe_after_child_exit() {
     }
     let _ = fs::remove_dir_all(&dir);
     let error = result.unwrap_err();
-    assert_eq!(error.to_string(), "subprocess output capture incomplete");
+    assert!(
+        error
+            .to_string()
+            .starts_with("subprocess output capture incomplete"),
+        "{error}"
+    );
     assert!(
         matches!(error, LibdenoError::Io(ref error) if error.kind() == std::io::ErrorKind::TimedOut)
     );
@@ -305,6 +310,7 @@ fn cancellation_after_start_is_best_effort_for_direct_child() {
     })
     .unwrap_err();
     assert!(matches!(error, LibdenoError::Timeout(_)), "{error}");
+    assert_eq!(error.to_string(), "supervisor session timed out");
     assert!(marker.exists(), "the post-start test must cross START");
     // A cold child may spend several seconds in runtime bootstrap before the
     // cancellation grace can be observed; keep the assertion bounded without
@@ -350,8 +356,12 @@ fn missing_supervisor_auth_fails_closed() {
     assert!(!status.success());
 }
 
+/// A host that never speaks the supervisor protocol parks until the handshake
+/// deadline expires, so this observes `Timeout` — not `ChildCrash`, despite
+/// what the old name claimed. See `child_killed_after_start_is_a_child_crash`
+/// for the category this one does not reach.
 #[test]
-fn child_crash_without_terminal_is_reaped_and_reported() {
+fn host_that_ignores_the_supervisor_protocol_times_out() {
     let dir = temp_dir("crash");
     let entry = dir.join("main.js");
     fs::write(&entry, "Deno.exit(0);").unwrap();
@@ -363,4 +373,112 @@ fn child_crash_without_terminal_is_reaped_and_reported() {
     let error = run_in_supervised_subprocess(&entry, &allow_all()).unwrap_err();
     assert!(error.to_string().contains("supervisor"));
     let _ = fs::remove_dir_all(dir);
+}
+
+/// A child that dies without writing its TERMINAL frame is `ChildCrash`, not
+/// `Timeout`.
+///
+/// Every category renders a different fixed sentence, and that sentence is all
+/// a host sees when it logs `e.to_string()` — the child's own text never
+/// crosses the boundary. Only `ChildCrash` is unreachable from the direct
+/// helper tests above: the one named for it actually parks the child until the
+/// handshake deadline expires, so it observes `Timeout`. Killing the child
+/// after it starts is the only way to produce this category end to end.
+#[cfg(unix)]
+#[test]
+fn child_killed_after_start_is_a_child_crash() {
+    let dir = temp_dir("child-crash");
+    let marker = dir.join("started");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        format!("Deno.writeTextFileSync({marker:?}, 'started'); Deno.kill(Deno.pid, 'SIGKILL');"),
+    )
+    .unwrap();
+    let error = with_child_host(|| run_in_supervised_subprocess(&entry, &allow_all())).unwrap_err();
+    let started = marker.exists();
+    let _ = fs::remove_dir_all(dir);
+    assert!(
+        started,
+        "the child must cross START before dying, otherwise this is a handshake failure"
+    );
+    assert_eq!(
+        error.to_string(),
+        "supervisor child exited without a terminal result"
+    );
+    assert!(
+        matches!(error, LibdenoError::Runtime(_)),
+        "a crash is a Runtime failure, not Timeout: {error:?}"
+    );
+}
+
+/// A denial the *host* hits before user code runs is `Permission`.
+///
+/// Here the grant excludes the entry file, so the loader's read is denied in
+/// Rust and the typed `PermissionDeniedError` survives into the category.
+#[test]
+fn a_host_side_denial_is_a_permission_category() {
+    let dir = temp_dir("permission-category");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "1;").unwrap();
+    let allowed = dir.join("elsewhere");
+    fs::create_dir_all(&allowed).unwrap();
+    let error = with_child_host(|| {
+        run_in_supervised_subprocess(
+            &entry,
+            &LibdenoOptions {
+                // `allow_all_permissions` would discard this grant (see
+                // docs/permissions.md), so it stays at its default.
+                permissions: vec![format!("--allow-read={}", allowed.display())],
+                ..Default::default()
+            },
+        )
+    })
+    .unwrap_err();
+    let _ = fs::remove_dir_all(dir);
+    assert_eq!(error.to_string(), "supervisor child permission failure");
+    assert!(matches!(error, LibdenoError::Runtime(_)));
+}
+
+/// A denial raised *inside* the script is `Runtime`, not `Permission`.
+///
+/// Deno turns an in-script denial into a `NotCapable` JS exception, so the
+/// typed Rust provenance `is_permission_error()` requires is gone by the time
+/// the child reports. The host therefore cannot tell this apart from the
+/// thrown-error case below — both arrive as
+/// `supervisor child runtime failure`. That is the documented limit of the
+/// category, not an oversight; `docs/api.md` states it.
+#[test]
+fn an_in_script_denial_is_reported_as_a_runtime_category() {
+    let dir = temp_dir("in-script-denial");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "Deno.readTextFileSync('/etc/passwd');").unwrap();
+    let error = with_child_host(|| {
+        run_in_supervised_subprocess(
+            &entry,
+            &LibdenoOptions {
+                permissions: vec![format!("--allow-read={}", dir.display())],
+                ..Default::default()
+            },
+        )
+    })
+    .unwrap_err();
+    let _ = fs::remove_dir_all(dir);
+    assert_eq!(error.to_string(), "supervisor child runtime failure");
+}
+
+/// A thrown script error is `Runtime`, and the child's own text never
+/// crosses the boundary — that is the point of the fixed sentences.
+#[test]
+fn a_thrown_script_error_is_a_redacted_runtime_category() {
+    let dir = temp_dir("runtime-category");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "throw new Error('secret child text');").unwrap();
+    let error = with_child_host(|| run_in_supervised_subprocess(&entry, &allow_all())).unwrap_err();
+    let _ = fs::remove_dir_all(dir);
+    assert_eq!(error.to_string(), "supervisor child runtime failure");
+    assert!(
+        !error.to_string().contains("secret child text"),
+        "child error text crossed the supervisor boundary: {error}"
+    );
 }

@@ -280,6 +280,9 @@ fn build_web_worker_factory(
             },
         );
         let isolate = worker.js_runtime.v8_isolate().thread_safe_handle();
+        // Same guard as the main isolate: a worker that fills its heap must
+        // unwind, not abort the host process.
+        crate::limits::install_heap_limit_guard(&mut worker.js_runtime, max_heap_bytes.is_some());
         let tasks = worker
             .js_runtime
             .op_state()

@@ -41,8 +41,12 @@ own graph and permission-bound loader.
 An unstable API is available only when both the op's `FeatureChecker` and the
 JavaScript namespace are enabled. `deno_runtime_adapter.rs` supplies both from
 one list (`DEFAULT_RUNTIME_FEATURES`, overridable through
-`LibdenoOptions.features`). The defaults include `kv`, `cron`, `ffi`, `webgpu`,
-and `worker-options`.
+`LibdenoOptions.features`). The defaults list `kv`, `cron`, `ffi`, `webgpu`, and
+`worker-options`, but only `kv` and `cron` still gate anything in Deno 2.9.x:
+`ffi` and `webgpu` are stable APIs with no `check_or_exit` call left, so naming
+them has no effect and omitting them does not remove `Deno.dlopen` or
+`navigator.gpu`. See [Permissions](permissions.md#what-each-grant-actually-covers)
+and `tests/features.rs`.
 
 ## Module loading (`module_loader.rs`)
 
@@ -72,6 +76,21 @@ and `worker-options`.
 module graph. Nested workers are supported. Workers share resolver factories,
 HTTP/file caches, analysis caches, the V8 snapshot, and npm process state, but
 not module graphs or permissions.
+
+A worker is a separate isolate inside the same process, and the run-level
+options do not all reach it the same way. What a host has to know:
+
+| Option | Effect on a worker |
+|---|---|
+| `execution_deadline` | reaches it — the deadline stops the main isolate and then closes every live worker, waiting for them to unwind before the run returns |
+| `max_heap_bytes` | forwarded, so it cannot be bypassed; an overflow surfaces as the worker's uncaught error, not as `execution terminated` |
+| `capture_stdout` / `capture_stderr` | applies — fd 1/2 are process-wide, so a worker's `console.log` lands in the same buffer |
+| `permissions` | an explicit `deno.permissions` set can narrow the parent's grants but never widen them; widening fails the run |
+
+Read "worker = cheap thread" into any of those and the answer is wrong; read
+"worker = separate isolate sharing process resources" and all four follow. The
+tests are `worker_deadline_stops.rs`, `worker_heap_cap.rs`,
+`worker_env_scope.rs`, and `worker_permission_escalation.rs`.
 
 ## HTTP client (`http.rs`)
 

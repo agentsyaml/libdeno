@@ -5,7 +5,7 @@ libdeno.
 
 ## Prerequisites
 
-- A recent stable Rust toolchain (edition 2021).
+- Rust 1.95 or newer (edition 2021).
 - Linux, macOS, or Windows.
 - Network access on the first build (crates.io) and, at runtime, whenever a
   remote module or npm package needs to be fetched.
@@ -20,7 +20,9 @@ cargo build --example demo
 ```
 
 This produces `target/debug/examples/demo`, a small host binary that parses
-`--allow-*` permission flags, an entry path, and script arguments.
+`--allow-*` permission flags, an entry path, and script arguments. It rejects an
+unrecognized flag rather than skipping it, because it grants everything when no
+`--allow-*` flag is present.
 
 The V8 snapshot is created by the build-host process. A build whose target CPU
 architecture differs from the host is rejected unless a prebuilt bundle is
@@ -71,9 +73,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ..Default::default()
   };
   let exit_code = run("app.js", &options)?;
+  println!("script exited with {exit_code}");
   Ok(())
 }
 ```
+
+The permission string resolves against `LibdenoOptions.cwd`, the same base the
+relative entry path uses — not the host's process working directory when the two
+differ. The script's own relative paths are the exception: in-process they still
+follow the host process directory, because `cwd` is a resolution base and not a
+directory change (`Deno.cwd()` reports the host cwd). Grant absolute paths, or
+run in a subprocess, if the script opens files by relative path.
 
 `run` blocks until the script finishes and returns the exit code the script
 requested. Each call gets a fresh worker and module graph; independent runs can
@@ -96,15 +106,22 @@ In-process output capture is not supported on Windows. Use
 
 Relative paths resolve against `LibdenoOptions.cwd`, which defaults to the
 process current directory. In-process runs do not change the host process cwd;
-the script sees that host cwd through `Deno.cwd()`. Use absolute paths or a
+the script sees that host cwd through `Deno.cwd()`, and a relative path it opens
+resolves against it — not against `cwd`. The subprocess backend does change
+directory, so the same script reads a different file. Use absolute paths or a
 subprocess API when the script needs a different process cwd.
 
 ## Writing your own host binary
 
 For `.node` native addons, your host must export the N-API symbols. Call this
-from the host crate's `build.rs` (`deno_napi` goes in `[build-dependencies]`),
-because it emits `cargo:rustc-link-arg-bin` directives that only a build script
-can print:
+from the host crate's `build.rs`, because it emits `cargo:rustc-link-arg-bin`
+directives that only a build script can print:
+
+```toml
+[build-dependencies]
+# Match the N-API version inside libdeno's Deno stack, not the latest release.
+deno_napi = "0.190.0"
+```
 
 ```rust
 // build.rs

@@ -534,18 +534,19 @@ impl StreamCapture {
     /// Split from [`Self::restore`] so a host can restore stdio immediately
     /// and move the (up to 500ms) drain to a blocking pool.
     ///
-    /// The wait is capped at a *total* budget from entry: on macOS
-    /// `posix_spawn` inherits every fd regardless of FD_CLOEXEC, so a child
-    /// the script spawned and `unref()`ed (detached, not awaited by the event
-    /// loop) may hold the pipe write end open after the run, and EOF would
-    /// never arrive — a daemonized child would hang the host forever. Linux
-    /// closes the pipe in the exec'd child via CLOEXEC; macOS needs the
-    /// timeout, which reports an incomplete capture. The budget is
+    /// The wait is capped at a *total* budget from entry: a child the script
+    /// spawned and `unref()`ed (detached, not awaited by the event loop) may
+    /// hold the pipe write end open after the run, and EOF would never arrive
+    /// — a daemonized child would hang the host forever. The budget is
     /// total, not per-block: a child that *keeps writing* (a logging daemon)
     /// would otherwise reset the idle timer on every block and stall the
-    /// caller forever. A silent descendant that keeps the write end open can
-    /// still leave the detached reader blocked in read() until it writes or
-    /// exits (one thread + fd per such run — documented trade-off).
+    /// caller forever.
+    ///
+    /// Closing the read end when collection gives up also closes the pipe for
+    /// that descendant: its next write to the inherited fd gets EPIPE, and
+    /// SIGPIPE terminates it by default. That is a consequence of capture
+    /// owning fd 1/2, not something this function can avoid while still
+    /// returning; `docs/api.md` tells callers to redirect detached stdio.
     fn restore(&mut self) {
         // Defensive: restore() may only run once; the (possibly reused) fd
         // number must never be dup2'd a second time.
@@ -640,7 +641,9 @@ fn collect_blocks_until(
 fn capture_incomplete_error() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        "output capture incomplete: collection deadline expired before EOF",
+        "output capture incomplete: collection deadline expired before EOF; \
+         a detached child usually holds the captured stdout/stderr pipe open \
+         (give it stdout: \"null\" or a log file instead of \"inherit\")",
     )
 }
 
