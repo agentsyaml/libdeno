@@ -50,6 +50,13 @@ jobs:
       - name: Test
         run: cargo test --all-targets --locked
 
+      # Every test target statically links V8, so one build leaves tens of GB of
+      # binaries in `target/`. Building a second feature variant on top of them
+      # exhausts the runner's disk — the linker fails with `write() failed,
+      # errno=28` instead of a test failing. `ci.yml` already cleans the same way.
+      - name: Prepare execution-control feature test
+        run: cargo clean -p libdeno
+
       - name: Test execution-control feature
         run: cargo test --all-targets --features execution-control,phase-diagnostics --locked
 
