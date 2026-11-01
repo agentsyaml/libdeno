@@ -117,3 +117,89 @@ pub(crate) fn wait_readable(handle: WaitHandle, stop: &AtomicBool) -> io::Result
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::AtomicBool;
+
+    fn pipe() -> (std::fs::File, std::fs::File) {
+        // `os_pipe` is not a dependency; a Unix pipe via std is enough.
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a two-element array, which is what pipe(2) writes.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe(2) failed: {}", io::Error::last_os_error());
+        // SAFETY: both descriptors are freshly created and owned here.
+        unsafe {
+            (
+                <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[0]),
+                <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    #[test]
+    fn data_is_reported_as_readable() {
+        let (read, mut write) = pipe();
+        write.write_all(b"x").unwrap();
+        let stop = AtomicBool::new(false);
+        let ready = wait_readable(from_std(&read), &stop).unwrap();
+        assert!(ready, "queued data must be reported as readable");
+    }
+
+    #[test]
+    fn a_stop_request_wins_over_a_silent_pipe() {
+        // This is the property the module exists for: a reader whose writer
+        // stays open and silent must still notice the stop flag instead of
+        // blocking for the rest of the process.
+        let (read, _write) = pipe();
+        let stop = AtomicBool::new(false);
+        let handle = from_std(&read);
+        let started = std::time::Instant::now();
+        let flag = &stop;
+        let ready = std::thread::scope(|scope| {
+            let worker = scope.spawn(move || wait_readable(handle, flag).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            stop.store(true, Ordering::Release);
+            worker.join().unwrap()
+        });
+        assert!(!ready, "a stopped reader must report `false`");
+        // One 50 ms slice plus scheduling; a blocking read would never return.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the stop flag must be observed within one slice, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_closed_write_end_is_reported_as_readable() {
+        // POLLHUP without POLLIN still means `read` returns 0 (EOF) without
+        // blocking, so the caller must not wait for the stop flag.
+        let (read, write) = pipe();
+        drop(write);
+        let stop = AtomicBool::new(false);
+        let ready = wait_readable(from_std(&read), &stop).unwrap();
+        assert!(ready, "EOF must be reported as readable");
+    }
+
+    #[test]
+    fn a_closed_descriptor_reports_readable_so_the_read_sees_ebadf() {
+        // `poll` sets POLLNVAL for a closed descriptor, which counts as
+        // `ready > 0`, so this reports `true` rather than an error. That is
+        // safe for the callers: they follow with `read`, which returns EBADF
+        // and ends the reader. Pinned so a future change to the `ready > 0`
+        // branch cannot silently turn a closed pipe into a permanent stall.
+        let (read, _write) = pipe();
+        let raw = read.as_raw_fd();
+        drop(read);
+        let stop = AtomicBool::new(false);
+        let ready = wait_readable(from_raw_fd(raw), &stop).unwrap();
+        assert!(
+            ready,
+            "POLLNVAL must be treated as ready so the caller reads and sees EBADF"
+        );
+    }
+}

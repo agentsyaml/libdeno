@@ -9,6 +9,38 @@ use sys_traits::impls::RealSys;
 
 use crate::LibdenoError;
 
+/// Environment variables that select libdeno's own behavior. A script must not
+/// be able to set them: `--allow-env` would otherwise become an
+/// arbitrary-code-execution grant, because `LIBDENO_HOST_EXE` decides which
+/// binary `run_in_subprocess` executes.
+///
+/// The same reasoning covers the resolver inputs. libdeno reads them from the
+/// host process for every run, so a script that rewrites one steers a *later*
+/// run: `DENO_DIR` moves the module cache (and makes the host write outside any
+/// grant), and the registry/JSR variables redirect package resolution to an
+/// attacker's server. None of them are capabilities the script was granted.
+///
+/// The `*_TEST_*` names are excluded on purpose: they only gate test child
+/// modes and are compiled into test binaries, not the library's runtime
+/// decisions.
+const CONTROL_ENV_VARS: &[&str] = &[
+    "LIBDENO_HOST_EXE",
+    "LIBDENO_CHILD_MODE",
+    "LIBDENO_CHILD_TOKEN",
+    "LIBDENO_SUPERVISOR_MODE",
+    "LIBDENO_SUPERVISOR_ENDPOINT",
+    "LIBDENO_SUPERVISOR_TOKEN",
+    "LIBDENO_ANALYSIS_CACHE_ENTRIES",
+    "LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES",
+    "DENO_DIR",
+    "DENO_NO_PACKAGE_JSON",
+    "JSR_URL",
+    "NPM_CONFIG_REGISTRY",
+    "npm_config_registry",
+    "NPM_CONFIG_REPLACE_REGISTRY_HOST",
+    "npm_config_replace_registry_host",
+];
+
 /// Builds the permission container from `--allow-*` capability strings.
 ///
 /// The default stance is opt-in: an empty `permission_args` list is a
@@ -52,7 +84,7 @@ pub fn build_permissions(
 
     let mut opts = PermissionsOptions {
         allow_env: None,
-        deny_env: None,
+        deny_env: Some(CONTROL_ENV_VARS.iter().map(|s| s.to_string()).collect()),
         ignore_env: None,
         allow_net: None,
         deny_net: None,
@@ -221,6 +253,23 @@ pub fn build_permissions(
     Ok(PermissionsContainer::new(parser, perms))
 }
 
+/// Validates the `--allow-*` argument list without keeping the container.
+///
+/// The subprocess parent calls this before spawning: a child that rejects its
+/// own options only prints to stderr and exits 1, so without this check the
+/// parent reports `Ok(exit_code: 1)` for an invalid configuration —
+/// indistinguishable from the script exiting 1 on purpose.
+pub(crate) fn validate_permission_args(
+    permission_args: &[String],
+    allow_all: bool,
+    prompt: bool,
+    cwd: &Path,
+) -> Result<(), LibdenoError> {
+    let parser =
+        Arc::new(deno_runtime::deno_permissions::RuntimePermissionDescriptorParser::new(RealSys));
+    build_permissions(permission_args, allow_all, prompt, parser, cwd).map(|_| ())
+}
+
 fn is_run_path(spec: &str) -> bool {
     let path = Path::new(spec);
     path.is_absolute()
@@ -386,6 +435,23 @@ mod tests {
             p.query_import(Some("deno.land")).unwrap(),
             PermissionState::Prompt
         );
+    }
+
+    #[test]
+    fn no_default_import_hosts_are_granted() {
+        // The `deno run` CLI ships a default `--allow-import` value
+        // (deno.land:443, jsr.io:443, esm.sh:443, ...), so a CLI run with only
+        // --allow-read can still fetch those registries. libdeno grants no
+        // host until one is named: an embedded host that wants the CLI's
+        // convenience must pass the list itself.
+        for flag in ["--allow-read=.", "--allow-net", "--allow-env"] {
+            let p = perms(&[flag], false, false);
+            assert_eq!(
+                p.query_import(Some("deno.land")).unwrap(),
+                PermissionState::Prompt,
+                "{flag} must not grant a default import host"
+            );
+        }
     }
 
     #[test]

@@ -256,6 +256,74 @@ fn repeated_capture_does_not_exhaust_reader_budget() {
 }
 
 #[test]
+fn heap_cap_terminates_the_script_instead_of_aborting_the_host() {
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // A heap ceiling that V8 enforces with FatalProcessOutOfMemory would kill
+    // the whole embedder. The near-heap-limit guard turns it into a
+    // termination error the caller can handle, so this test can assert both
+    // the error AND that the process survived to run a second script.
+    let dir = temp_dir("heap-cap");
+    let hog = dir.join("hog.js");
+    fs::write(
+        &hog,
+        "const held = [];\n\
+         for (let i = 0; i < 4_000_000; i++) held.push({ a: i, b: i + 1, c: 'xxxxxxxx' });\n",
+    )
+    .unwrap();
+    let capped = LibdenoOptions {
+        allow_all_permissions: true,
+        max_heap_bytes: Some(64 << 20),
+        capture_stdout: true,
+        ..Default::default()
+    };
+    let error = run_with_output(&hog, &capped).unwrap_err();
+    assert!(
+        error.to_string().contains("execution terminated"),
+        "expected a termination error, got: {error}"
+    );
+
+    // The host is still usable: a normal capped run completes.
+    let ok = dir.join("ok.js");
+    fs::write(&ok, "console.log('alive');").unwrap();
+    let out = run_with_output(&ok, &capped).unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "alive\n");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn detached_child_holding_the_capture_pipe_is_reported_as_incomplete() {
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // A script that detaches a child inheriting stdout leaves the capture
+    // pipe open past the run. The script itself exits 0, but the capture
+    // cannot reach EOF: that is the documented timed-out I/O error, and the
+    // message must name the cause (a detached child), because "collection
+    // deadline expired" alone gives a caller nothing to act on.
+    let dir = temp_dir("detached-child");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "console.log('before-detach');\n\
+         const cmd = new Deno.Command('/bin/sh', {\n\
+           args: ['-c', 'sleep 30'],\n\
+           stdout: 'inherit',\n\
+           stderr: 'inherit',\n\
+         });\n\
+         cmd.spawn().unref();\n",
+    )
+    .unwrap();
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        capture_stdout: true,
+        ..Default::default()
+    };
+    let error = run_with_output(&entry, &options).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("output capture incomplete"), "{message}");
+    assert!(message.contains("detached child"), "{message}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn run_with_reuses_stack_and_captures() {
     let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // The reusable-runtime path must honor capture too: long-lived hosts get
@@ -289,6 +357,171 @@ fn run_with_reuses_stack_and_captures() {
         String::from_utf8_lossy(&out2.stdout).contains("runtime capture\n"),
         "second run captured stdout: {:?}",
         String::from_utf8_lossy(&out2.stdout)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prompt_and_captured_stderr_are_rejected_in_process() {
+    // The documented reason (`docs/api.md`, "prompt") is that the upstream
+    // prompter requires stderr to be a terminal, and capture replaces fd 2
+    // with a pipe — so the pair would silently deny every ungranted check.
+    // Only the subprocess helpers had a test for this; the in-process entry
+    // points share the same check, and a regression there would turn prompts
+    // into silent denials for every embedding host.
+    //
+    // Five in-process entry points reach this check — `run_with_output`,
+    // `run_source_with_output`, `runtime::run_with_output`, and both
+    // `run_with_output_async` variants — all confirmed to reject identically.
+    // Testing one is enough to pin the shared message, and
+    // `tests/subprocess_config_validation.rs` covers the spawn side.
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("prompt-capture");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('x');").unwrap();
+    let error = run_with_output(
+        &entry,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            prompt: true,
+            capture_stderr: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        error
+            .to_string()
+            .contains("prompt and capture_stderr cannot be combined"),
+        "expected the documented rejection, got: {error}"
+    );
+}
+
+#[test]
+fn prompt_with_only_captured_stdout_runs() {
+    // The rejection is narrow: capturing stdout leaves fd 2 alone, so prompt
+    // mode stays usable. Without this half, a check that rejected prompting
+    // whenever *any* capture is on would still pass the test above.
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("prompt-stdout");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('prompt-safe');").unwrap();
+    let out = run_with_output(
+        &entry,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            prompt: true,
+            capture_stdout: true,
+            ..Default::default()
+        },
+    )
+    .expect("capturing only stdout must stay compatible with prompt mode");
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(out.exit_code, 0);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("prompt-safe"));
+}
+
+#[test]
+fn reusable_runtime_captured_source_returns_output() {
+    // `libdeno::runtime::run_with_output_source` is the captured twin of
+    // `run_with_source`, and the Python binding calls it directly — a
+    // regression here surfaces as a Python failure with no Rust test naming
+    // the cause. It lives in this binary, not `tests/runtime.rs`, because
+    // capture takes the process-global lease and every test here already
+    // serializes on CAPTURE_LOCK.
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("runtime-captured-source");
+    fs::write(dir.join("sibling.js"), "export const v = 5;").unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runtime = rt.block_on(libdeno::LibdenoRuntime::new(&dir)).unwrap();
+    let out = libdeno::runtime::run_with_output_source(
+        &runtime,
+        "import { v } from './sibling.js';\nconsole.log('captured ' + v);",
+        SourceLang::JavaScript,
+        &dir,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            capture_stdout: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("captured 5"),
+        "captured stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn every_in_process_entry_point_rejects_the_prompt_capture_pair() {
+    // `docs/api.md` states the rule once, but five in-process entry points must
+    // enforce it: `run_with_output`, `run_source_with_output`,
+    // `runtime::run_with_output`, and both async captured spellings. They all
+    // funnel through `limits::validate_prompt_capture`, so the check itself is
+    // shared — this test exists so that a *new* entry point which forgets to
+    // call it fails here instead of silently turning prompts into denials.
+    //
+    // The existing guards are layered (a sync entry passes two of them), so
+    // removing any single call keeps this test green; removing all of them
+    // flips it. That is the intent: the invariant is "no entry point runs
+    // without the check", not "exactly one call site".
+    let _g = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("prompt-capture-all");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('x');").unwrap();
+    let flags = || LibdenoOptions {
+        allow_all_permissions: true,
+        prompt: true,
+        capture_stderr: true,
+        ..Default::default()
+    };
+    let assert_rejected = |label: &str, error: libdeno::LibdenoError| {
+        assert!(
+            error
+                .to_string()
+                .contains("prompt and capture_stderr cannot be combined"),
+            "{label} must reject the pair, got: {error}"
+        );
+    };
+
+    assert_rejected(
+        "run_with_output",
+        run_with_output(&entry, &flags()).unwrap_err(),
+    );
+    assert_rejected(
+        "run_source_with_output",
+        run_source_with_output("console.log(1);", SourceLang::JavaScript, &dir, &flags())
+            .map(|_| ())
+            .unwrap_err(),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runtime = rt.block_on(libdeno::LibdenoRuntime::new(&dir)).unwrap();
+    assert_rejected(
+        "runtime::run_with_output",
+        libdeno::runtime::run_with_output(&runtime, &entry, &flags()).unwrap_err(),
+    );
+    assert_rejected(
+        "LibdenoRuntime::run_with_output_async",
+        rt.block_on(runtime.run_with_output_async(&entry, &flags()))
+            .map(|_| ())
+            .unwrap_err(),
+    );
+    assert_rejected(
+        "run_with_output_async",
+        rt.block_on(libdeno::run_with_output_async(&entry, &flags()))
+            .map(|_| ())
+            .unwrap_err(),
     );
     let _ = fs::remove_dir_all(&dir);
 }

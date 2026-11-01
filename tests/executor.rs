@@ -782,7 +782,7 @@ mod execution_control {
     }
 
     #[test]
-    fn supervised_child_configuration_failure_is_infrastructure() {
+    fn supervised_child_configuration_failure_is_rejected_by_the_parent() {
         let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = temp_dir("control-supervised-child-configuration-failure");
         let entry = dir.join("main.js");
@@ -805,15 +805,22 @@ mod execution_control {
                 SubmissionOptions::default(),
             )
             .unwrap();
+        // Empty permissions with no opt-in is a configuration error, and the
+        // parent now rejects it before spawning, so the caller gets the real
+        // cause instead of an opaque supervisor infrastructure failure.
         let failure = runtime().block_on(handle.result()).unwrap_err();
-        assert!(matches!(
-            failure.error(),
-            ExecutionError::Supervisor(SupervisorFailureCategory::Infrastructure)
-        ));
-        let partial = failure
+        match failure.error() {
+            ExecutionError::Libdeno(LibdenoError::Configuration(message)) => {
+                assert!(
+                    message.contains("no permission flags provided"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a parent-side Configuration error, got: {other:?}"),
+        }
+        assert!(failure
             .partial_output()
-            .expect("supervisor capture must preserve child configuration output");
-        assert!(partial.stdout().is_empty());
+            .is_none_or(|partial| partial.stdout().is_empty()));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1950,4 +1957,66 @@ mod execution_control {
         assert!(failure.partial_output().is_none());
         let _ = fs::remove_dir_all(dir);
     }
+}
+
+/// The three option validators run on the `Executor` path too.
+///
+/// `max_heap_bytes`, `execution_deadline` and the prompt/capture pairing are
+/// checked in `limits.rs` and called from `lib.rs` (in-process), `subprocess.rs`
+/// (child spawn) and `executor.rs` (both backends via `normalize_options`).
+/// Tests existed for the first two call sites only, so a refactor that dropped
+/// the executor call would keep every other suite green while submitted
+/// requests started running with a 1-byte heap cap or a rejected prompt pair.
+#[test]
+fn executor_rejects_invalid_limits_on_both_backends() {
+    let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = temp_dir("executor-limits");
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('never');").unwrap();
+    std::env::set_var("LIBDENO_HOST_EXE", env!("CARGO_BIN_EXE_child_host"));
+
+    let cases: [(&str, LibdenoOptions, &str); 3] = [
+        (
+            "heap",
+            LibdenoOptions {
+                max_heap_bytes: Some(1),
+                ..allow_all()
+            },
+            "max_heap_bytes=1 is too small",
+        ),
+        (
+            "deadline",
+            LibdenoOptions {
+                execution_deadline: Some(Duration::MAX),
+                ..allow_all()
+            },
+            "execution deadline is too large for the host clock",
+        ),
+        (
+            "prompt",
+            LibdenoOptions {
+                prompt: true,
+                capture_stderr: true,
+                ..allow_all()
+            },
+            "prompt and capture_stderr cannot be combined",
+        ),
+    ];
+
+    for backend in [ExecutionBackend::InProcess, ExecutionBackend::Subprocess] {
+        let executor = build(Executor::builder(&dir).backend(backend));
+        for (label, options, needle) in &cases {
+            let failure = executor
+                .execute(ExecutionRequest::new(&entry, options.clone()))
+                .expect_err(&format!("{backend:?}/{label} must be rejected"))
+                .into_parts()
+                .0;
+            let message = failure.to_string();
+            assert!(
+                message.contains(needle),
+                "{backend:?}/{label}: expected {needle:?}, got: {message}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
 }

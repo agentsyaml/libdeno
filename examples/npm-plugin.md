@@ -15,6 +15,25 @@ Put it in your project with its package configuration. `nodeModulesDir` mode is
 respected; without an explicit setting, libdeno uses managed `auto`. Merely
 having a `node_modules` directory does not select BYONM.
 
+The read grant below is enough **because the dependency is already installed**:
+libdeno never installs on the host's behalf at run time, and it never writes a
+lockfile. Install `node_modules` (or vendor it) before shipping the plugin.
+
+A missing dependency fails, and the failure it reports first is not the one a
+reader might expect. With `--allow-read=<project>` and nothing else, both
+`manual` and the default resolve path answer the same way:
+
+```
+Requires read access to "<tmp>/node_modules"
+```
+
+That path is a directory *above* the project, not the npm cache: the resolver
+walks upward looking for a `node_modules` before anything else, so the first
+missing permission is read, not net. Granting everything (`-A`) moves the
+failure to `Cannot find module '<name>'` — `require` never installs. The plugin
+cannot self-install at run time; that is deliberate, and it is why the tree must
+be installed before the plugin is handed to libdeno.
+
 ## 2. The host
 
 ```rust

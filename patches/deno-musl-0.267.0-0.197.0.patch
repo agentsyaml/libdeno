@@ -1,6 +1,16 @@
 diff -ru a/deno_node/ops/process.rs b/deno_node/ops/process.rs
 --- a/deno_node/ops/process.rs
 +++ b/deno_node/ops/process.rs
+@@ -82,8 +82,8 @@
+ /// Compute the contiguous argv buffer bounds from argv[0]..argv[argc-1].
+ ///
+ /// # Safety
+ /// `argv` must be a valid pointer to `argc` C string pointers.
+-#[cfg(unix)]
++#[cfg(all(unix, not(target_env = "musl")))]
+ unsafe fn compute_argv_info(
+   argc: usize,
+   argv: *mut *mut libc::c_char,
 @@ -105,7 +105,8 @@
  #[cfg(target_os = "linux")]
  #[used]

@@ -188,13 +188,7 @@ fn run_in_subprocess_inner(
     // deadlock hosts that run long-lived children (plugins/daemons): the
     // first child would hold a process-global lock forever and block every
     // later run_in_subprocess or run() call in the same process.
-    let (payload, mut child) = spawn_child_request(
-        entry,
-        options,
-        explicit_host,
-        std::process::Stdio::inherit(),
-        std::process::Stdio::inherit(),
-    )?;
+    let (payload, mut child) = spawn_child_request(entry, options, explicit_host, false, false)?;
     write_child_request(&mut child, payload, timing.clone())?;
     // The writer thread dropped the last handle to the child's stdin after the
     // payload write, so a script reading process.stdin sees EOF instead of
@@ -207,26 +201,80 @@ fn run_in_subprocess_inner(
 }
 
 /// Spawns the host executable in child mode with the run request payload
-/// ready to write. `stdout`/`stderr` pick the stdio mode: inherit for
-/// [`run_in_subprocess`], piped for [`run_in_subprocess_with_output`].
+/// ready to write. `capture_stdout`/`capture_stderr` pick the stdio mode:
+/// inherit for [`run_in_subprocess`], piped for
+/// [`run_in_subprocess_with_output`].
 ///
 /// The child's cwd is pinned from a plain read with no synchronization:
 /// in-process runs never switch the process cwd (cwd is a resolution base
 /// only), and the request payload carries its own cwd for the child side.
+fn stdio_for(capture: bool) -> std::process::Stdio {
+    if capture {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::inherit()
+    }
+}
+
+/// Rejects options the child would reject, before a child is spawned.
+///
+/// A child that fails its own validation only prints to stderr and exits 1, so
+/// without this check the parent returns `Ok(exit_code: 1)` for an invalid
+/// configuration — indistinguishable from the script exiting 1 on purpose.
+/// `capture_stderr` is the effective fd state, not `options.capture_stderr`:
+/// `run_in_subprocess_with_output` always pipes stderr.
+fn validate_child_options(
+    options: &LibdenoOptions,
+    cwd: &Path,
+    capture_stderr: bool,
+) -> Result<(), LibdenoError> {
+    crate::limits::validate_max_heap_bytes(options.max_heap_bytes)?;
+    crate::limits::validate_execution_deadline(options.execution_deadline)?;
+    crate::limits::reject_zero_deadline(options.execution_deadline)?;
+    // The implied-capture case needs its own message: `validate_prompt_capture`
+    // suggests capturing stdout only, which this helper cannot do.
+    if options.prompt && capture_stderr && !options.capture_stderr {
+        return Err(LibdenoError::Configuration(
+            "prompt cannot be combined with run_in_subprocess_with_output: it always \
+             captures stderr, and permission prompts require stderr to be a terminal. \
+             Use run_in_subprocess (no capture), or grant the capabilities up front"
+                .to_string(),
+        ));
+    }
+    crate::limits::validate_prompt_capture(options.prompt, capture_stderr)?;
+    crate::permissions::validate_permission_args(
+        &options.permissions,
+        options.allow_all_permissions,
+        options.prompt,
+        cwd,
+    )?;
+    // Same check `build_main_worker` performs; an unknown name would otherwise
+    // reach the child and surface as `Ok(exit_code: 1)`.
+    if let Some(features) = &options.features {
+        crate::deno_runtime_adapter::static_feature_names(features).map_err(|bad| {
+            LibdenoError::Configuration(format!("unknown runtime feature: {bad}"))
+        })?;
+    }
+    Ok(())
+}
+
 fn spawn_child_request(
     entry: &Path,
     options: &LibdenoOptions,
     explicit_host: Option<&Path>,
-    stdout: std::process::Stdio,
-    stderr: std::process::Stdio,
+    capture_stdout: bool,
+    capture_stderr: bool,
 ) -> Result<(Vec<u8>, std::process::Child), LibdenoError> {
     if options.extensions.is_some() {
         return Err(LibdenoError::Configuration(
             "native extension factories are not supported by subprocess execution".into(),
         ));
     }
+    let stdout = stdio_for(capture_stdout);
+    let stderr = stdio_for(capture_stderr);
     let token = child_token()?;
     let cwd = crate::effective_cwd(options)?;
+    validate_child_options(options, &cwd, capture_stderr)?;
     let request = ChildRunRequest {
         entry: entry.to_path_buf(),
         permissions: options.permissions.clone(),
@@ -244,6 +292,22 @@ fn spawn_child_request(
     // Validate before resolving the executable or spawning a process: an
     // oversized request must have no child-side effects.
     validate_child_request_size(&payload)?;
+    // A process spawned as a libdeno child that never serviced child mode is
+    // running the host's own `main()`. Spawning from there re-runs the host as
+    // a grandchild, and every level repeats, so one forgotten
+    // `maybe_handle_child_mode()` becomes an unbounded process tree instead of
+    // one wrong result. Both markers survive in this environment only in that
+    // case: a serviced child removes them before running the script.
+    if std::env::var_os(LIBDENO_CHILD_MODE).is_some()
+        && std::env::var_os(LIBDENO_CHILD_TOKEN).is_some()
+    {
+        return Err(LibdenoError::Configuration(
+            "run_in_subprocess was called from a process spawned as a libdeno child \
+             that never serviced child mode; call maybe_handle_child_mode() at the \
+             start of main()"
+                .into(),
+        ));
+    }
     let exe = match explicit_host {
         Some(host_executable) => host_executable.to_path_buf(),
         None => std::env::var_os(LIBDENO_HOST_EXE)
@@ -431,16 +495,8 @@ fn run_in_subprocess_with_output_inner(
         entry,
         options,
         explicit_host,
-        if capture_stdout {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::inherit()
-        },
-        if capture_stderr {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::inherit()
-        },
+        capture_stdout,
+        capture_stderr,
     )?;
     // Start draining both pipes BEFORE writing the request. A host that prints
     // more than a pipe buffer during startup blocks on stdout; if the parent is
@@ -476,7 +532,9 @@ fn run_in_subprocess_with_output_inner(
     if capture.incomplete {
         return Err(LibdenoError::Io(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            "subprocess output capture incomplete",
+            "subprocess output capture incomplete: collection deadline expired before EOF; \
+             a detached child usually holds the captured stdout/stderr pipe open \
+             (give it stdout: \"null\" or a log file instead of \"inherit\")",
         )));
     }
     Ok(crate::RunOutput {
@@ -762,6 +820,7 @@ fn supervisor_request(
             "native extension factories are not supported by subprocess execution".into(),
         ));
     }
+    validate_child_options(options, &cwd, options.capture_stderr)?;
     let max_capture_bytes = supervisor_capture_limit(
         options.capture_stdout,
         options.capture_stderr,
@@ -3838,6 +3897,7 @@ mod tests {
     #[test]
     fn supervisor_capture_boundaries_are_exact_and_bounded() {
         let mut options = LibdenoOptions {
+            allow_all_permissions: true,
             capture_stdout: true,
             ..Default::default()
         };

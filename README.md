@@ -140,7 +140,7 @@ Linux x86_64/aarch64, macOS x86_64/arm64, and Windows x64. See the
 |---|---|
 | `LibdenoOptions.permissions` | Explicit `--allow-*` capabilities. An empty list is a configuration error unless `allow_all_permissions` or `prompt` is enabled. |
 | `LibdenoOptions.args` / `cwd` | Script arguments and the base directory for resolving entries and imports. In-process scripts observe the host process's current directory. |
-| `LibdenoOptions.features` | Overrides the default unstable API set (`kv`, `cron`, `ffi`, `webgpu`, `worker-options`). |
+| `LibdenoOptions.features` | Overrides the default unstable API set (`kv`, `cron`, `ffi`, `webgpu`, `worker-options`). In Deno 2.9.x only `kv` and `cron` still gate anything among those defaults, and `ffi` / `webgpu` are stable so the list does not restrict them; `net` and `raw-imports` gate their namespaces but are not in the default set, so they only matter when you add them. |
 | `LibdenoError` | Errors for entry resolution, permissions, configuration, runtime execution, I/O, or deadlines. See the [API reference](docs/api.md) for variants. |
 
 Remote module imports require `--allow-import`; file imports require

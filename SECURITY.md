@@ -39,6 +39,96 @@ labels and `cause` fields do not identify permission denials. The Python API
 uses this classification when mapping `Runtime` / `Core` errors to
 `DenoPermissionError`.
 
+### Path grants follow names, not inodes
+
+`--allow-read` / `--allow-write` check the path a script names. Lexical escapes
+are rejected: `..` and absolute paths outside a granted root fail with
+`NotCapable`. Links are not resolved, so a grant on a directory also covers any
+symbolic link inside it and any hard link to an outside file: the script can
+read or overwrite the link target, and writing through a symlinked directory
+creates files outside the granted root. Verified against Deno CLI 2.9.8, which
+behaves identically; this is Deno's permission model, not a libdeno divergence.
+`tests/path_grant_boundaries.rs` pins it.
+
+The same rule governs `--allow-ffi=<path>`: a grant on a directory covers a
+symbolic or hard link inside it, so `Deno.dlopen` loads a library that lives
+outside the granted root. Measured with `--allow-ffi=<dir>` and a link to
+`/opt/homebrew/Cellar/libuv/1.53.0/lib/libuv.1.0.0.dylib`: the direct path was
+denied, the link inside the directory opened. Deno CLI 2.9.8 matches.
+
+The consequence for a host: a path grant is only as tight as the filesystem
+under that path. Do not grant write access to a directory that untrusted code
+can populate with links, and treat a grant on a shared or world-writable
+directory as a grant on whatever those links point at. For FFI this matters
+more than for reads: loading a library is arbitrary native code in the host
+process, so scope `--allow-ffi` to files the script cannot replace.
+
+## Environment is not a capability
+
+`--allow-env` grants the script read and write access to the host process
+environment. That surface is larger than it looks: libdeno reads the host
+environment to decide *how* a run executes, so any variable it trusts is
+effectively a capability the script can grant itself.
+
+libdeno therefore keeps these names off that surface, even under a bare
+`--allow-env`:
+
+- `LIBDENO_HOST_EXE` — selects the binary a subprocess run executes.
+- `LIBDENO_CHILD_MODE`, `LIBDENO_CHILD_TOKEN`, `LIBDENO_SUPERVISOR_MODE`,
+  `LIBDENO_SUPERVISOR_ENDPOINT`, `LIBDENO_SUPERVISOR_TOKEN` — authenticate a
+  run request.
+- `LIBDENO_ANALYSIS_CACHE_ENTRIES`, `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES` —
+  process-global resource knobs.
+- `DENO_DIR`, `DENO_NO_PACKAGE_JSON`, `JSR_URL`, `NPM_CONFIG_REGISTRY`,
+  `NPM_CONFIG_REPLACE_REGISTRY_HOST` (and lowercase aliases) — resolver inputs
+  re-read on every run.
+
+The escalation this prevents: a script sets `LIBDENO_HOST_EXE` to a binary it
+wrote, and the host's next `run_in_subprocess` executes that binary — arbitrary
+code with no `--allow-run`, outside every permission check. `DENO_DIR` and the
+registry variables are the same shape one step removed: point them at a
+location the script controls and a *later*, more privileged run fetches and
+trusts the script's modules.
+`-A` / `allow_all_permissions` bypasses the deny list along with every other
+permission, so it remains a trusted-code-only setting.
+
+A host that needs one of these values set must set it itself, from trusted
+startup code, rather than let the script do it.
+
+The deny list also holds inside a web worker, and `Deno.env.set` there writes
+the same process environment the main thread sees. A worker created without an
+explicit permission set inherits the run's `--allow-env` and can therefore
+rewrite `PATH` or `HOME` for the rest of the process; a worker created with an
+explicit set (`deno: { permissions: { read: [...] } }`) loses the capability and
+its write is refused. See `tests/worker_env_scope.rs`.
+
+### Residual risk: `HOME` and `PATH`
+
+Two variables cannot go on that list, because scripts legitimately read them
+and the upstream permission model cannot deny writes while allowing reads. Both
+are still host-process state that a script can rewrite, and both steer later
+runs:
+
+- `HOME` selects which `$HOME/.npmrc` the resolver reads. A script that points
+  it at a directory it controls changes the registry (and any credentials) a
+  later `npm:` resolution uses.
+- `PATH` selects which binary an allowed `--allow-run` name resolves to. A
+  script that prepends a directory it controls makes a later run's
+  `Deno.Command("git")` execute its own `git`, even though the grant was
+  `--allow-run=git`.
+
+Both were reproduced against this tree and pinned by `tests/env_cross_run.rs`:
+one run rewrites `PATH`, then a later in-process run holding only
+`--allow-run=git` executes the script's own `git`. The same test shows a
+subprocess run leaves the host environment untouched, which is the mitigation
+below in its simplest form. They are documented rather than denied:
+blocking them would break ordinary scripts that read `HOME` or `PATH`, which is
+most of them. The mitigation is architectural, not per-variable — do not run
+untrusted code in the same process as a more privileged run. Give each trust
+level its own process, or restart the host between trust domains. A host that
+needs a specific value can also set it itself from trusted startup code and
+avoid granting `--allow-env` at all.
+
 ## Known Upstream-Tracked Advisories
 
 The existing entries are ignored in `.cargo/audit.toml` because only the
@@ -111,6 +201,14 @@ explicit `deno.permissions` shares the parent's live permission container, so
 parent revocations apply inside it; a Worker created with explicit permission
 arguments gets a forked copy that later parent changes do not affect.
 
+The explicit set can narrow the parent's grants, never widen them. Asking for
+more than the parent holds fails the run rather than silently clamping:
+`read: true` under a parent `--allow-read=<one directory>` produces
+`NotCapable: Can't escalate parent thread permissions`, and the worker never
+starts. Pass the same descriptor the parent holds (or a narrower one) — a bare
+`true` means "everywhere", which the parent did not grant. A worker that omits
+`deno.permissions` inherits and is unaffected.
+
 `max_heap_bytes` requests a best-effort V8 old-generation heap limit (minimum
 8 MiB) for the main worker and Web Workers. It does not cap total V8/native/host
 memory, RSS, CPU, or child-process memory. `execution_deadline` can interrupt
@@ -127,6 +225,13 @@ in-process capture unbounded. In-process fd capture is unavailable on Windows.
 platforms and can run alongside other calls. Its cap limits retained output,
 not child resources or descendants. The execution-control supervisor retains
 64 KiB per stream by default and accepts explicit limits up to 96 KiB.
+
+The pipe readers are budgeted process-wide: 64 slots, two per capture, so at
+most 32 captures are in flight. A 33rd simultaneous capture fails immediately
+with an `Io` error whose kind is `WouldBlock` — it is not queued, and a host
+that treats every `Io` as fatal will see backpressure as a failure. The budget
+is released as runs finish. A host that needs more concurrency uses
+`run_in_subprocess`, which takes no pipe readers.
 
 HTTP module bodies and npm metadata have a 256 MiB cap on bytes returned by
 reqwest after transport decoding. Explicit npm `.tgz` responses have a 1 GiB

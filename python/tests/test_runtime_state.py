@@ -89,6 +89,20 @@ class RuntimeStateTests(unittest.TestCase):
             "node_modules/nested-pkg/node_modules/nested-dep/package.json",
             '{"name":"nested-dep","version":"1.0.0","type":"module","main":"b.js"}',
         )
+        # A nested package's `package.json` edit is picked up without
+        # `refresh()`: the resolver probe covers the `node_modules` directories
+        # above the workspace, and each run re-reads module contents. An earlier
+        # version of this test called `refresh()` first, which hid whether the
+        # probe actually covered the case — it did.
+        self.assertEqual(runtime.run(entry, allow_all_permissions=True), 0)
+        self.assertEqual(
+            output.read_text(encoding="utf-8"),
+            "b",
+            "a nested package.json edit must be visible without an explicit refresh",
+        )
+
+        # `refresh()` still forces a rebuild; prove the call is reachable and
+        # returns None, so the binding keeps exposing it.
         self.assertIsNone(runtime.refresh())
         self.assertEqual(runtime.run(entry, allow_all_permissions=True), 0)
         self.assertEqual(output.read_text(encoding="utf-8"), "b")

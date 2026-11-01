@@ -27,6 +27,14 @@ def main():
         assert ctor.startswith('not(target_env = "musl"))]'), "constructor is not excluded on musl"
         assert "#[cfg(target_env = \"musl\")]\n    return;" not in process
         assert "libc::PR_SET_NAME" in process
+        # On musl the constructor above is gone and the macOS path is cfg'd out,
+        # so `compute_argv_info` would be an unused private function. A host
+        # that vendors these crates as path dependencies sees its own lint
+        # level, so `-D warnings` would fail the build (not lint-capped).
+        helper = process.split("unsafe fn compute_argv_info(", 1)[0].rsplit("#[cfg(", 1)[-1]
+        assert helper.startswith('all(unix, not(target_env = "musl")))]'), (
+            "compute_argv_info must be excluded on musl or it becomes dead code"
+        )
         host = (work / "deno_runtime/ops/worker_host.rs").read_text()
         worker = (work / "deno_runtime/worker.rs").read_text()
         assert '#[cfg(all(target_os = "linux", not(target_env = "musl")))]' in host

@@ -129,6 +129,53 @@ fn literal_dynamic_import_honors_revoked_read() {
 }
 
 #[test]
+#[cfg(unix)]
+fn symlinked_dependency_is_judged_the_same_by_static_and_dynamic_import() {
+    // `check_open` resolves symlinks itself; pre-canonicalizing in the
+    // dynamic-import check changed which grant the path was measured against,
+    // so a symlinked dependency loaded statically and was denied dynamically.
+    // Both spellings must agree, and both must match the Deno CLI (which
+    // allows the traversal because the link lives inside the grant).
+    let fixture = Fixture::new("symlink-consistency");
+    let dir = fs::canonicalize(&fixture.0).unwrap();
+    let inside = dir.join("inside");
+    let outside = dir.join("outside");
+    fs::create_dir_all(&inside).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("mod.js"), "export const v = 'VIA-SYMLINK';").unwrap();
+    std::os::unix::fs::symlink(&outside, inside.join("link")).unwrap();
+    fs::write(inside.join("ok.js"), "export const v = 'IN-GRANT';").unwrap();
+
+    let restricted = LibdenoOptions {
+        permissions: vec![format!("--allow-read={}", inside.display())],
+        ..Default::default()
+    };
+    for code in [
+        "import { v } from './link/mod.js'; if (v !== 'VIA-SYMLINK') Deno.exit(9);",
+        "const m = await import('./link/mod.js'); if (m.v !== 'VIA-SYMLINK') Deno.exit(9);",
+        "import { v } from './ok.js'; if (v !== 'IN-GRANT') Deno.exit(9);",
+        "const m = await import('./ok.js'); if (m.v !== 'IN-GRANT') Deno.exit(9);",
+    ] {
+        assert_eq!(
+            run_source(code, SourceLang::JavaScript, &inside, &restricted).unwrap(),
+            0,
+            "failed for: {code}"
+        );
+    }
+
+    // The grant is still a boundary: a path outside it stays denied.
+    fs::write(outside.join("blocked.js"), "export const v = 1;").unwrap();
+    let outside_code = format!(
+        "try {{ await import({:?}); Deno.exit(9); }} catch {{ }}",
+        format!("file://{}", outside.join("blocked.js").display())
+    );
+    assert_eq!(
+        run_source(&outside_code, SourceLang::JavaScript, &inside, &restricted).unwrap(),
+        0
+    );
+}
+
+#[test]
 fn literal_dynamic_import_loads_without_revocation() {
     let fixture = Fixture::new("dynamic-granted");
     let dir = fs::canonicalize(&fixture.0).unwrap();

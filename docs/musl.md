@@ -8,13 +8,21 @@ musl; consequently process-title argv rewriting is disabled there. Linux
 `PR_SET_NAME` process naming remains available. Nothing here changes the
 published crates.
 
-The patch changes three sites in three files:
+The patch changes four sites in three files:
 
 ```
 deno_runtime/worker.rs            +1  exclude malloc_trim on musl
 deno_runtime/ops/worker_host.rs   ~1  exclude malloc_trim on musl
 deno_node/ops/process.rs          +1  exclude argv init-array constructor on musl
+deno_node/ops/process.rs          ~1  exclude the now-uncalled argv helper on musl
 ```
+
+The fourth site matters for vendored builds. Removing the init-array constructor
+leaves `compute_argv_info` with no caller on musl (the other caller is the macOS
+path, `cfg`'d out), and a private unused function is a `dead_code` warning in a
+path dependency. Path dependencies are not lint-capped, so a host whose build
+passes `-D warnings` — or whose CI does — fails on it. Excluding the helper
+along with its caller keeps the patched tree warning-free.
 
 ## 1. Vendor and patch the two crates
 

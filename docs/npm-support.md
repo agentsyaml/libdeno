@@ -22,11 +22,44 @@ installation. In that build, `npm:` imports fail; bare imports from a local
 ## npm modes
 
 `nodeModulesDir` selects `manual` (use local `node_modules`), `auto` (managed
-resolution), or `none` (disable `node_modules`). Without a setting, libdeno uses
-managed `auto`; an existing `node_modules` directory does not select `manual`.
+resolution), or `none`. Without a setting, libdeno uses managed `auto`; an
+existing `node_modules` directory does not select `manual`.
+
+The three modes differ in whether they touch the registry:
+
+| Mode | Local `node_modules` | Registry |
+|---|---|---|
+| `manual` | required | never contacted |
+| `auto` | used when present | used when the local tree lacks the package |
+| `none` | ignored | used |
+
+`none` removes local `node_modules` from resolution — neither a BYONM tree nor
+a managed root is consulted — but it does not block npm. Measured with a
+complete `node_modules/fixture` tree and a matching `package.json` dependency:
+`manual` resolves it locally, while `auto` and `none` both fail with `Could not
+find npm package 'fixture' matching '1.0.0'` (`tests/module_modes.rs`).
+
+`manual` is the offline mode. With a declared dependency that is absent from
+`node_modules` and no `--allow-net`, it fails with `Could not resolve
+"left-pad", but found it in a package.json. Deno expects the node_modules/
+directory to be up to date` — no registry request is attempted. Use `none` to
+stop a stray tree from being used; blocking registry access is what
+`--allow-net` and the import-host grants are for.
 
 If present, `deno.lock` supplies and validates npm checksums. Frozen mode rejects
 changes; libdeno never writes lockfile updates.
+
+A stale lockfile fails the run with `LibdenoError::Core`, the same variant a
+script failure produces. The message reads:
+
+> The lockfile is out of date. Run `deno install --frozen=false`, or rerun with
+> `--frozen=false` to update it.
+
+A host that wants to distinguish "your lockfile is stale" from "your script
+threw" has to match that text; there is no dedicated variant. The
+local-`node_modules` check comes first: with `nodeModulesDir: "manual"` and a
+missing package, the run reports that the `node_modules/` directory is not up to
+date before frozen mode is consulted.
 
 ## Bare imports vs `npm:` specifiers
 

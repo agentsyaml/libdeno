@@ -39,8 +39,9 @@ fn serve_many_bytes(responses: Vec<Vec<u8>>) -> String {
 }
 
 #[cfg(feature = "npm")]
-// Test scheduling under parallel CI can delay the client after fixture creation.
-const HTTP_FIXTURE_TIMEOUT: Duration = Duration::from_secs(15);
+// A watchdog, not a latency assertion: only turns "never connected" into a
+// failure instead of a hung test, so keep it generous under load.
+const HTTP_FIXTURE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[cfg(feature = "npm")]
 fn serve_redirect_with_etag_target() -> (String, std::thread::JoinHandle<()>) {
@@ -474,4 +475,25 @@ fn isize_guard_ignores_non_tarball_paths() {
 fn isize_guard_ignores_non_gzip_bytes() {
     let bytes = vec![0u8; 64]; // no gzip magic
     assert!(guard_tarball_isize(true, bytes).is_ok());
+}
+
+#[cfg(feature = "npm")]
+#[test]
+fn a_zero_tarball_budget_rejects_every_tarball() {
+    // `OnceLock`-backed, so only a child can pick `0`. Unlike the cache-entries
+    // knob, where `0` means "default", `0` here rejects every tarball.
+    if std::env::var("LIBDENO_ZERO_TARBALL_BUDGET_CHILD").is_ok() {
+        let bytes = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+        let error = guard_tarball_isize(true, bytes).unwrap_err();
+        assert!(error.contains("over the 0-byte budget"), "{error}");
+        return;
+    }
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        // Substring filter, no `--exact`: the name is unique in this binary.
+        .args(["a_zero_tarball_budget_rejects_every_tarball"])
+        .env("LIBDENO_ZERO_TARBALL_BUDGET_CHILD", "1")
+        .env("LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES", "0")
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "child failed: {child:?}");
 }

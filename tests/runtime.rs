@@ -152,17 +152,31 @@ fn refresh_rebuilds_after_nested_node_modules_change() {
     assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
     assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), "a");
 
-    // The nested package's metadata does not update the project-level
-    // node_modules directory fingerprint. Refresh is the bounded opt-in for
-    // this case; it must rebuild before the next run.
+    // A nested package's `package.json` edit is picked up without `refresh()`:
+    // the probe covers the `node_modules` directories above the workspace, and
+    // each run re-reads the module contents. This assertion used to sit behind
+    // a `refresh()` call, which hid whether the probe actually covered the
+    // case — it did, so the call proved nothing.
     fs::write(
         nested_dep.join("package.json"),
         r#"{"name":"nested-dep","version":"1.0.0","type":"module","main":"b.js"}"#,
     )
     .unwrap();
+    assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
+    assert_eq!(
+        fs::read_to_string(dir.join("out.txt")).unwrap(),
+        "b",
+        "a nested package.json edit must be visible without an explicit refresh"
+    );
+
+    // `refresh()` still forces a rebuild, which is what it is for: changes the
+    // probe cannot see. Prove it rebuilds by mutating state the probe does not
+    // read — the module file's contents are re-read anyway, so the observable
+    // is that the run still succeeds and observes the edit.
+    fs::write(nested_dep.join("b.js"), "export const marker = 'c';").unwrap();
     runtime.refresh();
     assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
-    assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), "b");
+    assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), "c");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -435,12 +449,10 @@ fn reusable_async_run_rebuilds_when_config_changes() {
 
 #[test]
 fn reusable_runtime_runs_in_memory_source() {
-    // run_with_source / run_with_output_source: in-memory sources through the
-    // reusable stack — the exit code comes back. The captured variant
-    // (run_with_output_source) is intentionally not asserted here: capture
-    // holds a process-global exclusive lease, which races with the captured
-    // tests in async_api.rs (captured coverage lives there under its FILE_LOCK).
+    // run_with_source: in-memory sources through the reusable stack — the exit
+    // code comes back, and a relative import resolves through the shared stack.
     let dir = temp_dir("run-with-source");
+    fs::write(dir.join("sibling.js"), "export const v = 7;").unwrap();
     let runtime = build_runtime(&dir);
     let options = LibdenoOptions {
         allow_all_permissions: true,
@@ -448,16 +460,13 @@ fn reusable_runtime_runs_in_memory_source() {
     };
     let code = run_with_source(
         &runtime,
-        "console.log('reusable in-memory');",
+        "import { v } from './sibling.js';\nif (v !== 7) Deno.exit(3);",
         SourceLang::JavaScript,
         &dir,
         &options,
     )
     .unwrap();
     assert_eq!(code, 0);
-    // ponytail: skip the captured variant here — capture holds a process-global
-    // exclusive lease, which races with the captured tests in async_api.rs
-    // (captured coverage lives there under its FILE_LOCK).
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -613,4 +622,235 @@ fn reusable_async_execution_deadline_still_applies() {
         "expected Timeout, got: {error}"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// The permission-isolation guarantee in both directions and across
+/// `refresh()`.
+///
+/// The existing tests only check that a wide grant does not leak into a
+/// following narrow run. The opposite direction matters too: a narrow run must
+/// not leave the resolver stack in a state where the next wide grant is
+/// ignored, and `refresh()` (which rebuilds the stack) must not carry either
+/// run's permissions forward.
+#[test]
+fn permissions_do_not_leak_in_either_direction_across_refresh() {
+    let root = temp_dir("perm-both-ways");
+    let scripts = root.join("scripts");
+    let secret_dir = root.join("secret");
+    let out = root.join("out");
+    for dir in [&scripts, &secret_dir, &out] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let secret = secret_dir.join("secret.txt");
+    fs::write(&secret, "SECRET").unwrap();
+    let entry = scripts.join("main.js");
+    fs::write(
+        &entry,
+        "const [secret, marker] = Deno.args;\n\
+         let result;\n\
+         try { result = 'READ ' + Deno.readTextFileSync(secret); }\n\
+         catch (e) { result = 'DENIED ' + e.constructor.name; }\n\
+         Deno.writeTextFileSync(marker, result);\n",
+    )
+    .unwrap();
+    let marker = out.join("marker.txt");
+
+    let runtime = build_runtime(&root);
+    let attempt = |grant_secret: bool| -> String {
+        let _ = fs::remove_file(&marker);
+        let mut permissions = vec![
+            format!("--allow-read={}", scripts.display()),
+            format!("--allow-write={}", out.display()),
+        ];
+        if grant_secret {
+            permissions.push(format!("--allow-read={}", secret_dir.display()));
+        }
+        let options = LibdenoOptions {
+            permissions,
+            args: vec![
+                secret.to_string_lossy().to_string(),
+                marker.to_string_lossy().to_string(),
+            ],
+            ..Default::default()
+        };
+        run_with(&runtime, &entry, &options).unwrap();
+        fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+
+    assert_eq!(attempt(true), "READ SECRET", "wide run");
+    assert_eq!(attempt(false), "DENIED NotCapable", "narrow run");
+    assert_eq!(attempt(true), "READ SECRET", "wide run after narrow");
+    runtime.refresh();
+    assert_eq!(
+        attempt(false),
+        "DENIED NotCapable",
+        "narrow run after refresh"
+    );
+    assert_eq!(attempt(true), "READ SECRET", "wide run after refresh");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The probe covers more than the docs used to claim, and a test that calls
+/// `refresh()` cannot tell the difference.
+///
+/// Mutates resolver input and asserts the next run on the same runtime observes
+/// it **without** `refresh()`. If a future change narrows the probe, this
+/// fails — which is the point: the previous version of
+/// `refresh_rebuilds_after_nested_node_modules_change` called `refresh()`, so it
+/// passed whether or not the probe covered the case.
+#[test]
+fn resolver_probe_sees_changes_without_an_explicit_refresh() {
+    let dir = temp_dir("probe-covers");
+    fs::write(dir.join("a.js"), "export const v = 'A';").unwrap();
+    fs::write(dir.join("b.js"), "export const v = 'B';").unwrap();
+    let marker = dir.join("out.txt");
+    let entry = dir.join("main.js");
+    fs::write(
+        &entry,
+        "import { v } from 'alias';\n\
+         Deno.writeTextFileSync(new URL('./out.txt', import.meta.url), v);\n",
+    )
+    .unwrap();
+    let runtime = build_runtime(&dir);
+    let options = LibdenoOptions {
+        allow_all_permissions: true,
+        ..Default::default()
+    };
+
+    // Import-map edit with the same byte length ("./a.js" -> "./b.js"): a
+    // length-based fingerprint would miss it, so this pins content hashing.
+    fs::write(dir.join("deno.json"), r#"{"imports":{"alias":"./a.js"}}"#).unwrap();
+    assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "A");
+
+    fs::write(dir.join("deno.json"), r#"{"imports":{"alias":"./b.js"}}"#).unwrap();
+    assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "B",
+        "an import-map edit must be visible without refresh"
+    );
+
+    // Module contents are not part of the resolver probe, but each run gets a
+    // fresh module graph, so an edit two levels inside a package is re-read
+    // anyway. `docs/api.md` states this; without the assertion a future
+    // module-graph cache would make the doc wrong silently.
+    let package = dir.join("node_modules/deep-pkg");
+    fs::create_dir_all(package.join("lib")).unwrap();
+    fs::write(
+        package.join("package.json"),
+        r#"{"name":"deep-pkg","version":"1.0.0","type":"module","exports":"./index.js"}"#,
+    )
+    .unwrap();
+    fs::write(
+        package.join("index.js"),
+        "export { value } from './lib/deep.js';\n",
+    )
+    .unwrap();
+    fs::write(package.join("lib/deep.js"), "export const value = 'V1';\n").unwrap();
+    fs::write(dir.join("deno.json"), r#"{"nodeModulesDir":"manual"}"#).unwrap();
+    fs::write(
+        dir.join("package.json"),
+        r#"{"dependencies":{"deep-pkg":"1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        &entry,
+        "import { value } from 'deep-pkg';\n\
+         Deno.writeTextFileSync(new URL('./out.txt', import.meta.url), value);\n",
+    )
+    .unwrap();
+    assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "V1");
+
+    fs::write(package.join("lib/deep.js"), "export const value = 'V2';\n").unwrap();
+    assert_eq!(run_with(&runtime, &entry, &options).unwrap(), 0);
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "V2",
+        "an edit inside a dependency must be re-read without refresh"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `LibdenoRuntime::new` tolerates a directory that does not exist yet.
+///
+/// `LibdenoOptions.cwd` takes the opposite stance for the same class of
+/// mistake: a missing path is a `Configuration` error, so a host cannot
+/// silently run against the host cwd while its grants point somewhere else. The
+/// reusable runtime falls back to the raw path instead, which makes `new(dir)`
+/// usable before `create_dir_all(dir)` — a real convenience for a host that
+/// prepares a workspace lazily — but it also means a typo in that path is not
+/// reported. `run_with` then fails later, at module load, on a path that
+/// mentions the missing directory.
+///
+/// The two behaviours are documented; this pins the asymmetry so a change to
+/// either side has to be deliberate.
+#[test]
+fn reusable_runtime_accepts_a_directory_that_does_not_exist_yet() {
+    let dir = temp_dir("new-missing");
+    let _ = fs::remove_dir_all(&dir);
+    let runtime = build_runtime(&dir);
+    // Creating it afterwards is the supported order.
+    fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("main.js");
+    fs::write(&entry, "console.log('ran');").unwrap();
+    let code = run_with(
+        &runtime,
+        &entry,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            cwd: Some(dir.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `run_with_source` rejects capture flags, exactly like `run_with`.
+///
+/// Both go through `check_source_preconditions` → `reject_capture_flags`, but
+/// only the path-based `run_with` had a test. The in-memory variant takes a
+/// different branch (`capture_flags_allowed: false`), so a change to that
+/// argument would leave `run_with` green while the in-memory entry silently
+/// accepted capture flags it can never honor — and paid the exclusivity
+/// rejection on a busy host for nothing.
+///
+/// The guard is applied twice (once here, once in `run_with_exit_code`), so
+/// removing either one alone keeps this test green. That redundancy is
+/// deliberate — the source says it is "idempotent and cheap" — and the mutation
+/// that matters is removing both.
+#[test]
+fn run_with_source_rejects_capture_flags() {
+    let dir = temp_dir("reject-src-cap");
+    let runtime = build_runtime(&dir);
+    let error = run_with_source(
+        &runtime,
+        "console.log('never captures');",
+        SourceLang::JavaScript,
+        &dir,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            capture_stdout: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        matches!(error, libdeno::LibdenoError::Configuration(_)),
+        "expected a configuration error, got: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("run_with does not support output capture"),
+        "expected the documented message, got: {error}"
+    );
 }

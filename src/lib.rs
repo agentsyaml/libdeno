@@ -271,13 +271,38 @@ impl EntrySource {
 /// entry carries the result, see [`entry_cwd`]), while a path run reads it once
 /// per run — set `options.cwd` to pin the base explicitly if the host changes
 /// the process cwd concurrently.
+///
+/// An explicit `cwd` must resolve to a directory. It is rejected otherwise
+/// rather than falling back to the raw path: the run would then use the host
+/// cwd while its permission grants still point at the missing directory.
 pub(crate) fn effective_cwd(options: &LibdenoOptions) -> Result<PathBuf, LibdenoError> {
     let raw = match options.cwd.as_deref() {
         Some(cwd) if cwd.is_absolute() => cwd.to_path_buf(),
         Some(cwd) => std::env::current_dir()?.join(cwd),
-        None => std::env::current_dir()?,
+        // Unset: follow the process cwd, whose canonical form may be
+        // unavailable (the directory was removed); the raw path still resolves
+        // entry and permission paths, so keep the fallback.
+        None => {
+            let cwd = std::env::current_dir()?;
+            return Ok(std::fs::canonicalize(&cwd).unwrap_or(cwd));
+        }
     };
-    Ok(std::fs::canonicalize(&raw).unwrap_or(raw))
+    // An explicit cwd that does not resolve is a broken sandbox pin: falling
+    // back to the raw path would run the script with the host's cwd while
+    // permission grants point at a directory that does not exist.
+    let resolved = std::fs::canonicalize(&raw).map_err(|error| {
+        LibdenoError::Configuration(format!(
+            "LibdenoOptions.cwd {} is not a usable directory: {error}",
+            raw.display()
+        ))
+    })?;
+    if !resolved.is_dir() {
+        return Err(LibdenoError::Configuration(format!(
+            "LibdenoOptions.cwd {} is not a directory",
+            raw.display()
+        )));
+    }
+    Ok(resolved)
 }
 
 /// The run's resolution base: an in-memory entry's own (already computed and
@@ -360,6 +385,17 @@ pub struct LibdenoOptions {
     /// With `prompt: true` and an empty `permissions` list, every access is
     /// asked interactively (the v0.2.0 empty-list error does not apply);
     /// with flags, flags grant and everything else is asked.
+    ///
+    /// Prompting cannot work in two configurations, and both fail closed
+    /// rather than erroring, so a run that "should have asked" just reports
+    /// `NotCapable`:
+    /// - `capture_stderr: true` — the prompter writes to stderr and requires
+    ///   it to be a terminal. This combination is rejected up front with
+    ///   [`LibdenoError::Configuration`].
+    /// - `run_in_subprocess` / `run_in_subprocess_with_output` — the child's
+    ///   stdin carries the run request. Not rejected, because `prompt` with
+    ///   full grants is a valid configuration there (the prompt is simply
+    ///   never consulted); ungranted checks are denied.
     pub prompt: bool,
     /// Arguments exposed to the script via `process.argv` (after `argv[0]`).
     pub args: Vec<String>,
@@ -368,21 +404,31 @@ pub struct LibdenoOptions {
     ///
     /// This is a **resolution base only** — the process cwd is never switched
     /// (chdir is process-global and would serialize or corrupt concurrent
-    /// runs). The script observes the host's cwd: `Deno.cwd()` and relative
-    /// filesystem operations inside the script resolve against it, so script
-    /// authors should use absolute paths (or [`crate::run_in_subprocess`],
-    /// where the child's cwd is pinned at spawn).
+    /// runs). `Deno.chdir()` is therefore refused in-process with
+    /// `NotSupported`. The script observes the host's cwd: `Deno.cwd()` and
+    /// relative filesystem operations inside the script resolve against it, so
+    /// script authors should use absolute paths (or
+    /// [`crate::run_in_subprocess`], where the child's cwd is pinned at spawn).
     pub cwd: Option<PathBuf>,
     /// In-process, best-effort constraint on the V8 old-generation heap in
     /// bytes (the constraint behind `--v8-flags=--max-old-space-size`). It does
     /// not cap native allocations, V8 external memory, host allocations, or
     /// memory used by child processes; it is not an OS/process memory boundary.
+    ///
+    /// Exceeding it terminates the script rather than aborting the host: the
+    /// run fails with V8's termination error, and V8 raises the ceiling once to
+    /// reach the next JS stack check, so peak heap can briefly exceed this
+    /// value. ArrayBuffer and other external allocations are not counted.
     pub max_heap_bytes: Option<usize>,
     /// In-process, best-effort execution deadline. It can terminate JavaScript
     /// when V8 reaches an interruptible stack check and then report
     /// [`LibdenoError::Timeout`], but it cannot interrupt a blocking syscall,
     /// native code, a child-process wait, or a blocked permission broker/hook;
     /// such a run may exceed the requested deadline.
+    ///
+    /// In a subprocess the deadline cuts the child down but the parent sees
+    /// `Ok` with exit code 1 (the reason is on the child's stderr), not
+    /// [`LibdenoError::Timeout`]; see the backend notes in `docs/api.md`.
     pub execution_deadline: Option<std::time::Duration>,
     /// Redirect the script's stdout (fd 1, e.g. `console.log`) into
     /// [`RunOutput::stdout`] instead of the host's terminal. Off by default
@@ -406,17 +452,19 @@ pub struct LibdenoOptions {
     /// default, honors explicit values through 96 KiB, and rejects larger
     /// explicit values with [`LibdenoError::Configuration`] before spawning.
     pub max_capture_bytes: Option<usize>,
-    /// Runtime feature flags exposed to the script, overriding the default
-    /// set (`kv`, `cron`, `ffi`, `webgpu`, `worker-options`). Feature names
-    /// must be valid deno unstable-feature names (see deno's
-    /// `--unstable-*` flags); they gate which JS namespace IDs and feature
-    /// checks are wired into the runtime. `None` (default) enables the
-    /// default set. An embedder running untrusted plugins can shrink the
-    /// surface (e.g. `Some(vec!["ffi".into()])`); the ops themselves stay
-    /// permission-gated regardless. `worker-options` is always enabled even
-    /// when omitted from a custom set — without it `new Worker(...)` with
-    /// worker options terminates the host process, which a plugin must never
-    /// be able to trigger.
+    /// Unstable feature names to enable, overriding the default set (`kv`,
+    /// `cron`, `ffi`, `webgpu`, `worker-options`). Names must be valid deno
+    /// unstable-feature names. `None` (default) enables the default set.
+    ///
+    /// In Deno 2.9.x only `kv`, `cron`, `net` and `raw-imports` still gate
+    /// anything: `ffi` and `webgpu` are stable APIs, so dropping those names
+    /// does **not** remove `Deno.dlopen` or `navigator.gpu` from the surface.
+    /// Shrinking this list is not an FFI or WebGPU control — use
+    /// `--allow-ffi` for that. See `docs/api.md`.
+    ///
+    /// `worker-options` is always enabled even when omitted from a custom set
+    /// — without it `new Worker(...)` with worker options terminates the host
+    /// process, which a plugin must never be able to trigger.
     pub features: Option<Vec<String>>,
     /// Creates fresh Deno extensions for each main and web worker runtime.
     /// Extensions are appended after Deno's built-ins and libdeno guards. The
@@ -451,6 +499,13 @@ impl std::fmt::Debug for ExtensionFactory {
 #[derive(Debug, Clone, Default)]
 pub struct RunOutput {
     /// The exit code the script requested (0 on normal completion).
+    ///
+    /// This is the value as written by `Deno.exit(n)` or `Deno.exitCode`,
+    /// unclamped: `Deno.exit(300)` yields `300`, `Deno.exitCode = -1` yields
+    /// `-1`. A real process exit would have the OS truncate those to a byte
+    /// (44, 255); libdeno reports what the script asked for so a caller can
+    /// distinguish the cases. Clamp before passing it to
+    /// `std::process::exit`.
     pub exit_code: i32,
     /// Captured stdout bytes; empty unless [`LibdenoOptions::capture_stdout`]
     /// was set. Legacy/in-process capture is unbounded unless
@@ -849,6 +904,10 @@ fn run_sync_output_cancellable(
             CAPTURE_UNSUPPORTED_ON_WINDOWS.to_string(),
         )));
     }
+    // Before OutputCapture::new: once fd 2 is a pipe the prompter can only
+    // deny, so the combination must fail loudly instead of at the first check.
+    limits::validate_prompt_capture(options.prompt, options.capture_stderr)
+        .map_err(output::CapturedRunError::new)?;
     let capture = output::OutputCapture::new(
         options.capture_stdout,
         options.capture_stderr,
@@ -905,6 +964,7 @@ fn run_sync_output(
             CAPTURE_UNSUPPORTED_ON_WINDOWS.to_string(),
         ));
     }
+    limits::validate_prompt_capture(options.prompt, options.capture_stderr)?;
     let capture = output::OutputCapture::new(
         options.capture_stdout,
         options.capture_stderr,
@@ -1049,6 +1109,8 @@ where
             CAPTURE_UNSUPPORTED_ON_WINDOWS.to_string(),
         )));
     }
+    limits::validate_prompt_capture(options.prompt, options.capture_stderr)
+        .map_err(output::CapturedRunError::new)?;
     let capture = output::OutputCapture::new(
         options.capture_stdout,
         options.capture_stderr,
@@ -1158,17 +1220,11 @@ pub(crate) async fn run_inner_with_cancellation(
     // converge here, so invalid resource limits cannot reach backend defaults.
     limits::validate_max_heap_bytes(options.max_heap_bytes)?;
     limits::validate_execution_deadline(options.execution_deadline)?;
+    limits::validate_prompt_capture(options.prompt, options.capture_stderr)?;
     // A zero budget means "do not execute": reject before resolver setup and
     // V8 bootstrap so no script side effect can happen. `run_with_termination`
     // repeats this check for the paths that skip this function.
-    if options
-        .execution_deadline
-        .is_some_and(|duration| duration.is_zero())
-    {
-        return Err(LibdenoError::Timeout(
-            "execution deadline of 0ns exceeded; script was not started".to_string(),
-        ));
-    }
+    limits::reject_zero_deadline(options.execution_deadline)?;
 
     // rustls needs an explicit CryptoProvider (aws-lc-rs and ring are both
     // enabled in the dep graph); the deno CLI does the same. Only install when
@@ -1538,12 +1594,29 @@ mod tests {
 
     #[test]
     fn failed_worker_spawn_returns_io_error_and_releases_lease() {
+        // An exclusive lease cannot be taken while any other test in this
+        // binary has a run in flight, so wait for a quiet moment instead of
+        // failing on contention. The assertion under test is that a failed
+        // spawn releases the lease, not that acquisition never contends.
+        let acquire = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match RunLease::acquire(true) {
+                    Ok(lease) => return lease,
+                    Err(error) if std::time::Instant::now() < deadline => {
+                        let _ = error;
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("could not take the capture lease: {error}"),
+                }
+            }
+        };
         let result = {
-            let _lease = RunLease::acquire(true).unwrap();
+            let _lease = acquire();
             join_worker::<()>(|| Err(std::io::Error::other("injected spawn failure")))
         };
         assert!(matches!(result, Err(LibdenoError::Io(_))));
-        let lease = RunLease::acquire(true).expect("failed spawn must release its run lease");
+        let lease = acquire();
         drop(lease);
     }
 

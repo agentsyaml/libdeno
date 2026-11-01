@@ -191,6 +191,25 @@ async fn op_net_connect_vsock_denied(
     ))
 }
 
+/// `Deno.chdir` would change the **host** process's working directory.
+///
+/// An in-process run shares that directory with the host and with every other
+/// concurrent run, so a script that calls it redirects the host's own relative
+/// paths and corrupts any concurrent run that resolves a relative specifier.
+/// libdeno documents `cwd` as a resolution base that never switches the process
+/// directory; this guard makes that true. Use `run_in_subprocess` when the
+/// script needs a different working directory: the child gets its own.
+#[deno_core::op2(fast, stack_trace)]
+fn op_fs_chdir_denied(_state: &mut OpState, #[string] _directory: &str) -> Result<(), JsErrorBox> {
+    Err(JsErrorBox::new(
+        "NotSupported",
+        "Deno.chdir() is not available: an in-process run shares the host \
+         process, and changing its working directory would redirect the host's \
+         relative paths and corrupt concurrent runs. Use run_in_subprocess when \
+         the script needs a different cwd.",
+    ))
+}
+
 #[deno_core::op2(reentrant, stack_trace)]
 #[smi]
 async fn op_kv_database_open_denied(
@@ -391,6 +410,8 @@ pub(crate) fn extensions(
         let guard = match op.name {
             "op_net_listen_tcp" => Some(tcp_guard),
             "op_net_listen_tls" => Some(tls_guard),
+            // chdir is process-global; see `op_fs_chdir_denied`.
+            "op_fs_chdir" => Some(op_fs_chdir_denied()),
             "op_net_listen_udp" if !net_enabled => Some(op_net_listen_udp_denied()),
             #[cfg(unix)]
             "op_net_listen_unixpacket" if !net_enabled => Some(op_net_listen_unixpacket_denied()),

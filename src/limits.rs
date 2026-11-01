@@ -243,11 +243,44 @@ pub(crate) fn validate_max_heap_bytes(
 /// the CLI applies for `--v8-flags=--max-old-space-size=N` (bytes, whereas the
 /// flag takes MB). `WorkerOptions.create_params` feeds these into isolate
 /// creation; V8 keeps its defaults for the young generation, initial sizes and
-/// code range — only the hard ceiling is pinned. When the heap approaches the
-/// cap V8 runs repeated GCs and eventually aborts with out-of-memory.
+/// code range — only the hard ceiling is pinned.
+///
+/// A hard ceiling alone is not a usable limit: when the old generation fills,
+/// V8 prints a GC trace and calls `FatalProcessOutOfMemory`, which aborts the
+/// whole host process. An embedder cannot catch that. Pair this with
+/// [`install_heap_limit_guard`] on every isolate created from these params.
 pub(crate) fn isolate_create_params(max_heap_bytes: Option<usize>) -> Option<v8::CreateParams> {
     max_heap_bytes
         .map(|bytes| v8::CreateParams::default().set_max_old_generation_size_in_bytes(bytes))
+}
+
+/// Turns a heap ceiling into a script-level failure instead of a host abort.
+///
+/// V8 calls the near-heap-limit callback before it gives up. Terminating
+/// execution from there throws the uncatchable termination error at the next
+/// stack check, so the run unwinds through the normal path and the embedder
+/// sees a termination error while the process stays alive.
+///
+/// The callback must also raise the limit, even though the cap is what the
+/// caller asked for. Returning the limit unchanged makes V8 resume allocation
+/// with no headroom and abort before any JS stack check can observe the
+/// termination flag — measured: a tight allocation loop still died with
+/// `FatalProcessOutOfMemory` under a debug build. Doubling buys exactly the
+/// headroom needed to reach the next stack check; the termination is already
+/// requested, so the script stops there. This is the pattern deno_core's own
+/// heap-limit tests use.
+///
+/// No-op when `max_heap_bytes` is `None` — without a ceiling the callback
+/// would never fire and the default V8 limit applies.
+pub(crate) fn install_heap_limit_guard(js_runtime: &mut deno_core::JsRuntime, capped: bool) {
+    if !capped {
+        return;
+    }
+    let isolate_handle = js_runtime.v8_isolate().thread_safe_handle();
+    js_runtime.add_near_heap_limit_callback(move |current_limit, _initial_limit| {
+        isolate_handle.terminate_execution();
+        current_limit.saturating_mul(2)
+    });
 }
 
 /// Drives `fut` (the worker run) to completion with an optional hard deadline.
@@ -289,6 +322,39 @@ pub(crate) fn validate_execution_deadline(
     if deadline.is_some_and(|duration| Instant::now().checked_add(duration).is_none()) {
         return Err(crate::LibdenoError::Configuration(
             "execution deadline is too large for the host clock".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A zero budget means "do not execute": reject before resolver setup and V8
+/// bootstrap so no script side effect can happen. Shared with the subprocess
+/// parent, which otherwise spawns a child that fails and reports `Ok(exit 1)`.
+pub(crate) fn reject_zero_deadline(deadline: Option<Duration>) -> Result<(), crate::LibdenoError> {
+    if deadline.is_some_and(|duration| duration.is_zero()) {
+        return Err(crate::LibdenoError::Timeout(
+            "execution deadline of 0ns exceeded; script was not started".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `prompt` and `capture_stderr` cannot both work: the upstream prompter
+/// requires *both* stdin and stderr to be terminals, and stderr capture
+/// replaces fd 2 with a pipe. Leaving the pair unvalidated is worse than an
+/// error — every check silently becomes a deny, so a run that should ask for
+/// permission fails with `NotCapable` and no prompt is ever shown.
+pub(crate) fn validate_prompt_capture(
+    prompt: bool,
+    capture_stderr: bool,
+) -> Result<(), crate::LibdenoError> {
+    if prompt && capture_stderr {
+        return Err(crate::LibdenoError::Configuration(
+            "prompt and capture_stderr cannot be combined: permission prompts are \
+             written to stderr and require it to be a terminal, but capture replaces \
+             stderr with a pipe, so every ungranted check would be denied without \
+             prompting. Capture stdout only, or grant the capabilities up front"
+                .to_string(),
         ));
     }
     Ok(())
@@ -836,6 +902,19 @@ mod tests {
         assert!(validate_execution_deadline(Some(Duration::MAX)).is_err());
         assert!(validate_execution_deadline(Some(Duration::from_secs(1))).is_ok());
         assert!(validate_execution_deadline(None).is_ok());
+    }
+
+    #[test]
+    fn prompt_with_stderr_capture_is_rejected() {
+        // The upstream prompter needs stdin AND stderr to be terminals; stderr
+        // capture makes fd 2 a pipe. Unvalidated, every ungranted check would
+        // deny silently with no prompt shown.
+        let error = validate_prompt_capture(true, true).unwrap_err();
+        assert!(matches!(error, crate::LibdenoError::Configuration(_)));
+        assert!(error.to_string().contains("cannot be combined"));
+        assert!(validate_prompt_capture(true, false).is_ok());
+        assert!(validate_prompt_capture(false, true).is_ok());
+        assert!(validate_prompt_capture(false, false).is_ok());
     }
 
     #[cfg(feature = "execution-control")]

@@ -39,6 +39,14 @@ across runs; permissions, module graphs, and isolates stay per run. The process
 cwd is never changed. `cwd` exists only on the path entry points (`run`,
 `run_with_output`).
 
+`runtime.refresh()` marks the stack stale so the next run rebuilds it
+unconditionally. Most edits do not need it: config, lockfile, registry settings
+and `node_modules` directory identities are probed before each run, and module
+contents are re-read because every run builds a fresh module graph. Call it when
+forcing a rebuild is cheaper than reasoning about whether the probe covers your
+change — the same rule the Rust `LibdenoRuntime::refresh` follows, documented in
+the [API reference](api.md#libdenoruntime--reusable-sync-and-async-runs).
+
 ## Capture output
 
 ```python
@@ -88,7 +96,7 @@ All arguments after `entry` (or `code`) are keyword-only:
 | `base_dir` | Directory the virtual source entry lives in; relative imports resolve against it. Defaults to `.`. |
 | `capture_stdout` / `capture_stderr` | Capture flags on the `*_with_output` entry points; both default to `True`. |
 | `max_capture_bytes` | Per-stream capture cap; truncation sets `capture_truncated`. |
-| `features` | A list or tuple of unstable Deno features to enable; `None` keeps the runtime defaults (`kv`, `cron`, `ffi`, `webgpu`, `worker-options`). |
+| `features` | A list or tuple of unstable Deno features to enable; `None` keeps the runtime defaults (`kv`, `cron`, `ffi`, `webgpu`, `worker-options`). Only `kv` and `cron` still gate anything in Deno 2.9.x — `ffi` and `webgpu` are stable, so omitting them does not remove `Deno.dlopen` or `navigator.gpu`. |
 | `max_heap_bytes` | V8 old-generation constraint. Must be an integer (not `bool`); below 8 MiB raises `ConfigurationError`. It bounds neither native allocations nor RSS. |
 | `execution_deadline` | Deadline in seconds; must be finite and non-negative. Best effort: blocking system calls, native code, and blocked permission paths can overrun it. |
 
@@ -103,7 +111,22 @@ rather than silently ignored.
 - `EntryError` — the entry path does not exist or entry resolution fails, such as
   when `package.json` is malformed or `main` escapes its directory. If `main`
   names a missing file, module loading fails with `DenoRuntimeError`.
-- `DenoPermissionError` — permission flags are invalid or a run was denied.
+- `DenoPermissionError` — permission flags are invalid, or a permission check
+  performed by the host itself (such as reading the entry file) was denied.
+  A denial raised *inside* the script (`Deno.readTextFileSync` on a path the
+  run was not granted, `Deno.connect` to a host outside `--allow-net`) arrives
+  as a JavaScript exception, so it is `DenoRuntimeError`.
+  The distinction exists because a JavaScript error's name and message can be
+  forged by the script, so only a denial the host itself produced is trusted as
+  provenance.
+
+  Do not recover the distinction from the message. A script that throws
+  `Object.assign(new Error('x'), { name: 'NotCapable' })` produces a
+  `DenoRuntimeError` whose text begins with `NotCapable`, exactly like a real
+  in-script denial, so a `str(e).startswith("NotCapable")` check reports a
+  forged error as a permission problem. Treat every `DenoRuntimeError` as
+  "the script failed" and decide from the permission flags you passed, not from
+  what the script says about itself.
 - `ConfigurationError` — the arguments cannot form a valid run.
 - `DenoRuntimeError` — runtime startup or JavaScript failure.
 - `DenoIOError` — host filesystem or I/O failure.

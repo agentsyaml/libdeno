@@ -2272,3 +2272,81 @@ fn managed_project_bare_import_reports_npm_disabled() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_script_level_denial_is_not_typed_as_a_permission_error() {
+    // The complement of `denied_entry_read_retains_typed_permission_classification`.
+    // A denial raised inside the script reaches the host as a JavaScript
+    // exception (CoreError::Js(JsError)), which carries only the JS name and
+    // message. `is_permission_error` must not trust those: a script can forge
+    // them, and `tests/smoke.rs` already pins that forgeries are rejected.
+    // The cost is that the most common denial — a script reading a path it was
+    // not granted — is classified as a runtime error, not a permission one.
+    // That asymmetry is documented in docs/api.md and docs/python.md.
+    let dir = temp_dir("script-level-denial");
+    fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("main.js");
+    fs::write(&entry, "Deno.readTextFileSync('/etc/passwd');").unwrap();
+    let error = run(
+        &entry,
+        &LibdenoOptions {
+            permissions: vec![format!("--allow-read={}", dir.display())],
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("NotCapable") && message.contains("Requires read access"),
+        "the denial must still be legible, got: {message}"
+    );
+    assert!(
+        !error.is_permission_error(),
+        "a JS-side denial carries no typed Rust source, so it must not be \
+         classified as a permission error: {message}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `base_dir` is the resolution base for a virtual entry, and `options.cwd`
+/// does not override it.
+///
+/// `docs/api.md` says relative imports and config discovery start at
+/// `base_dir`, while `cwd` only affects path entries. If `cwd` won here, a host
+/// that sets `cwd` for an unrelated reason would silently resolve a different
+/// sibling module.
+#[test]
+fn run_source_resolves_relative_imports_from_base_dir_not_cwd() {
+    let base = temp_dir("in-memory-base");
+    let elsewhere = temp_dir("in-memory-cwd");
+    fs::write(base.join("sibling.js"), "export const origin = 'base_dir';").unwrap();
+    fs::write(elsewhere.join("sibling.js"), "export const origin = 'cwd';").unwrap();
+    let marker = base.join("origin.txt");
+    let code = format!(
+        "import {{ origin }} from './sibling.js';\n\
+         Deno.writeTextFileSync({marker:?}, origin);\n",
+        marker = marker.to_string_lossy()
+    );
+
+    // A file marker, not capture: in-process capture is process-global and this
+    // binary's tests run in parallel.
+    run_source(
+        &code,
+        SourceLang::JavaScript,
+        &base,
+        &LibdenoOptions {
+            allow_all_permissions: true,
+            cwd: Some(elsewhere.clone()),
+            ..Default::default()
+        },
+    )
+    .expect("the in-memory run must succeed");
+    let observed = fs::read_to_string(&marker).unwrap();
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&elsewhere);
+
+    assert_eq!(
+        observed, "base_dir",
+        "cwd must not redirect a virtual entry's relative imports"
+    );
+}

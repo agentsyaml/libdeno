@@ -176,6 +176,13 @@ A snapshot is executable input, not data: it defines the JavaScript builtins
 and the extension sources a runtime starts with. Treat a bundle you did not
 build as you would a binary.
 
+The fingerprint in the manifest is FNV-1a over the bytes. It detects truncated
+or corrupted transfers; it is not a signature and cannot authenticate a bundle
+against a tampered one — only the `.sha256` published beside a release asset,
+or a bundle you built yourself, does that. Residual source names are validated
+as plain relative paths before any file is read, so a crafted manifest cannot
+read or copy files from outside the bundle directory.
+
 ## Published bundles
 
 Release assets include `libdeno-<version>-<target>-snapshot.tar.gz` with a
@@ -184,20 +191,23 @@ guard-containing libdeno source revision from the consumer package directory,
 using the consumer manifest and matching target; do not set
 `LIBDENO_SNAPSHOT_DIR` directly.
 
-The repository helper downloads, verifies, and unpacks a release asset:
+The repository helper downloads, verifies, and unpacks a release asset. It
+prints the extracted path with that caveat next to it:
 
 ```bash
 ./scripts/fetch-snapshot.sh 0.3.8
+# not sufficient alone; pass this directory as --bundle to snapshot_compat.py:
+# export LIBDENO_SNAPSHOT_DIR=...
 # v0.3.7 and earlier assets use manifest format v1 and are rejected.
 ```
 
-The printed `LIBDENO_SNAPSHOT_DIR` assignment remains a convenient way to
-discover the extracted directory, but exporting it alone no longer authorizes
-an import. Pass that directory as the wrapper's `--bundle`; the v0.3.7 asset
-still fails because it uses manifest v1. Generate a replacement from a source
-revision or release containing this guard and the matching Deno source
-combination. Builds never download a bundle on their own; cache and trust
-decisions stay with the caller.
+The printed assignment is a way to find the directory, not to authorize it:
+exporting it alone fails at build time with `snapshot import requires the
+snapshot compatibility wrapper`. Pass the directory as the wrapper's
+`--bundle` instead. v0.3.7 assets still fail — the wrapper rejects format v1
+before Cargo runs. Generate a replacement from a source revision or release
+containing this guard and the matching Deno source combination. Builds never
+download a bundle on their own; cache and trust decisions stay with the caller.
 
 `*-unknown-linux-musl` is not published: the Deno crates do not compile for
 musl without a local patch. [musl.md](musl.md) walks through building and

@@ -156,8 +156,13 @@ pub struct ShellLifecycleScriptsExecutor;
 /// native-addon builds. The direct child is supervised; descendants are not
 /// claimed to be part of this boundary until platform process-tree support is
 /// added.
+///
+/// These limits only matter if lifecycle scripts are ever enabled. Today
+/// `lifecycle_scripts_config.allowed` is `PackagesAllowedScripts::None` and no
+/// option exposes it, so this executor is registered but never invoked.
 // ponytail: direct-child supervision now; add process groups/Job Objects after
-// the platform-specific lifecycle research is available.
+// the platform-specific lifecycle research is available — and before exposing
+// any way to allow lifecycle scripts.
 #[cfg(feature = "npm")]
 const LIFECYCLE_SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 #[cfg(feature = "npm")]

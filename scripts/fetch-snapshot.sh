@@ -37,4 +37,7 @@ mkdir -p "$dest"
 tar -xzf "$tmp/$archive" -C "$dest"
 
 echo
+# Exporting this is not enough: the build script requires the wrapper's
+# compatibility declaration. Pass the directory as --bundle instead.
+echo "# not sufficient alone; pass this directory as --bundle to snapshot_compat.py:"
 printf 'export LIBDENO_SNAPSHOT_DIR=%q\n' "$PWD/$dest"

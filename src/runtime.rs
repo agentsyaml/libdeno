@@ -29,8 +29,8 @@ use crate::RunLease;
 /// package semantics, effective auth-free npm routing, `JSR_URL`, lockfile, and
 /// BYONM
 /// node_modules inputs. Managed installation output is deliberately excluded
-/// from the BYONM probe. deno_resolver 0.88 reads `$HOME/.npmrc` and does not
-/// honor `NPM_CONFIG_USERCONFIG`.
+/// from the BYONM probe. The resolver reads `<home>/.npmrc` (it never consults
+/// `NPM_CONFIG_USERCONFIG`), so a user-level registry change is a rebuild input.
 ///
 /// The runtime is single-threaded by design: the module loader stack is
 /// `Rc<dyn ModuleLoader>`-based. Synchronous `run_with` executes on a fresh
@@ -69,11 +69,21 @@ struct RuntimeState {
 impl LibdenoRuntime {
     /// Builds the resolver stack for `cwd` once. Later [`run_with`] calls on
     /// this runtime skip the factory construction unless the config chain
-    /// changed. `cwd` is canonicalized; it becomes the working directory of
-    /// every script run through this runtime.
+    /// changed.
+    ///
+    /// `cwd` is stored as given, not canonicalized. Canonicalizing it here
+    /// splits two things that have to agree: the resolver stack would discover
+    /// the workspace and `node_modules` under the canonical spelling, while
+    /// `run_with` resolves the caller's entry path as written and checks its
+    /// read grant against that same spelling. On macOS `std::env::temp_dir()`
+    /// is `/var/...`, a symlink to `/private/var/...`, so the two diverge for
+    /// the most ordinary fixture there is: a workspace member fails with
+    /// `Import "x" not a dependency`, and a scoped `--allow-read` is denied for
+    /// the entry the caller just named. Keeping the caller's form makes the
+    /// stack, the entry URL and the grants agree, which is what `run` already
+    /// does with `LibdenoOptions.cwd`.
     pub async fn new(cwd: impl AsRef<Path>) -> Result<Self, LibdenoError> {
-        let cwd =
-            std::fs::canonicalize(cwd.as_ref()).unwrap_or_else(|_| cwd.as_ref().to_path_buf());
+        let cwd = cwd.as_ref().to_path_buf();
         // Discovery starts at the runtime's cwd: scripts run inside it resolve
         // against the same deno.json / package.json / node_modules chain.
         let shared = SharedServices::new(cwd.clone(), vec![cwd.clone()])
@@ -92,13 +102,20 @@ impl LibdenoRuntime {
         })
     }
 
-    /// Marks the resolver stack stale. The next [`run_with`],
+    /// Marks the resolver stack stale, so the next [`run_with`],
     /// [`Self::run_async`], or [`Self::run_with_output_async`] call rebuilds
-    /// the permission-free stack before executing. Use this after filesystem
-    /// changes below the discovered resolver inputs, such as edits inside
-    /// nested `node_modules`; npm routing and workspace changes are detected by
-    /// the accepted manifest. This is an explicit bounded
-    /// invalidation mechanism, not a recursive watcher or tree hash.
+    /// the permission-free stack unconditionally.
+    ///
+    /// Most filesystem changes do not need this: config, lockfile, registry
+    /// settings and `node_modules` directory identities are probed before each
+    /// run, and module contents are re-read because every run gets a fresh
+    /// module graph. Import-map edits, package `main` edits, edits deep inside
+    /// a dependency, and workspace member additions or removals were all
+    /// observed on the next run without calling this. Reach for `refresh` when
+    /// forcing a rebuild is cheaper than reasoning about whether the probe
+    /// covers your change, or when a change lands somewhere the probe does not
+    /// read. This is an explicit bounded invalidation mechanism, not a
+    /// recursive watcher or tree hash.
     pub fn refresh(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.refresh_generation = state.refresh_generation.wrapping_add(1);
@@ -452,6 +469,8 @@ fn run_with_sync_output_cancellable(
             LibdenoError::Configuration(crate::CAPTURE_UNSUPPORTED_ON_WINDOWS.to_string()),
         ));
     }
+    crate::limits::validate_prompt_capture(options.prompt, options.capture_stderr)
+        .map_err(crate::output::CapturedRunError::new)?;
     let capture = crate::output::OutputCapture::new(
         options.capture_stdout,
         options.capture_stderr,
