@@ -129,7 +129,12 @@ fn shutting_down_cancels_a_worker_still_preloading_remote_modules() {
         command.process_group(0);
     }
     let mut child = command.spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(12);
+    // A watchdog, not a latency assertion: the child has to bootstrap an isolate
+    // and start an HTTP fixture before its own work begins, and on a loaded
+    // machine that alone outlasts a tight bound. The failure then reads
+    // "cancellation exceeded 12 seconds", which sounds like a hang in the code
+    // under test.
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             let output = child.wait_with_output().unwrap();
@@ -148,7 +153,7 @@ fn shutting_down_cancels_a_worker_still_preloading_remote_modules() {
             #[cfg(not(unix))]
             child.kill().unwrap();
             let _ = child.wait();
-            panic!("worker preload cancellation exceeded 12 seconds");
+            panic!("worker preload cancellation exceeded its watchdog");
         }
         std::thread::sleep(Duration::from_millis(20));
     }

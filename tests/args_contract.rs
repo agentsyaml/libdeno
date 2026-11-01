@@ -60,6 +60,14 @@ fn options(dir: &std::path::Path) -> LibdenoOptions {
     }
 }
 
+/// The path without Windows' `\\?\` verbatim prefix.
+fn plain(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(rest) => PathBuf::from(rest),
+        None => path,
+    }
+}
+
 #[test]
 fn process_argv_puts_the_entry_first_and_the_arguments_after_it() {
     let (dir, entry) = setup("layout");
@@ -85,9 +93,15 @@ fn process_argv_puts_the_entry_first_and_the_arguments_after_it() {
         );
         // argv[0] is the embedding executable and argv[1] the entry, so the
         // caller's arguments start at index 2.
-        let resolved = fs::canonicalize(&entry).unwrap();
+        // `Deno.realPathSync` answers the plain long path; Rust's
+        // `canonicalize` answers the `\\?\` verbatim form on Windows. Strip it
+        // so the comparison is about the path, not the API it came from.
+        let resolved = plain(fs::canonicalize(&entry).unwrap());
+        // The payload is JSON, so a Windows path appears with doubled
+        // backslashes; escaping here keeps the comparison about the path.
+        let expected = resolved.display().to_string().replace('\\', "\\\\");
         assert!(
-            captured.contains(&format!("\"{}\"", resolved.display())),
+            captured.contains(&format!("\"{expected}\"")),
             "{backend}: process.argv[1] must be the entry ({}): {captured}",
             resolved.display()
         );
@@ -97,10 +111,12 @@ fn process_argv_puts_the_entry_first_and_the_arguments_after_it() {
         );
         // Deno.args drops the executable and the entry, keeping argv[0] of the
         // caller's list as its first element.
+        // `Deno.args` echoes the caller's own strings, so this comparison uses
+        // the spelling the caller passed — only JSON escaping is normalised.
+        let passed_dir = dir.display().to_string().replace('\\', "\\\\");
         assert!(
             captured.contains(&format!(
-                "\"args\":[\"{}\",\"--second\",\"third\"]",
-                dir.display()
+                "\"args\":[\"{passed_dir}\",\"--second\",\"third\"]"
             )),
             "{backend}: Deno.args must be the caller's list alone: {captured}"
         );
