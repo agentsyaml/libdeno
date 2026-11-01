@@ -541,7 +541,11 @@ mod tests {
             command.process_group(0);
         }
         let mut child = command.spawn().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        // A watchdog, not a latency assertion. The child bootstraps a whole
+        // isolate before it can fail the probe; on a loaded machine that alone
+        // takes longer than this test's own work, and a tight bound reports
+        // "the probe hung" when it was merely queued behind other tests.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
                 let output = child.wait_with_output().unwrap();
@@ -560,7 +564,7 @@ mod tests {
                 #[cfg(not(unix))]
                 child.kill().unwrap();
                 let _ = child.wait();
-                panic!("internal op probe exceeded 15 seconds");
+                panic!("internal op probe exceeded its watchdog");
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
