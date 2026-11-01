@@ -29,9 +29,16 @@ fn setup(name: &str) -> (PathBuf, PathBuf) {
     let entry = dir.join("main.js");
     fs::write(
         &entry,
+        // `realPathSync` because Windows hands back the 8.3 form of the temp
+        // directory in `argv`, while `display()` keeps the long one; comparing
+        // the resolved paths asserts the layout without depending on spelling.
         "Deno.writeTextFileSync(\n\
            Deno.args[0] + '/argv.json',\n\
-           JSON.stringify({ argv: process.argv, args: Deno.args }),\n\
+           JSON.stringify({\n\
+             entry: Deno.realPathSync(process.argv[1]),\n\
+             argv: process.argv,\n\
+             args: Deno.args,\n\
+           }),\n\
          );",
     )
     .unwrap();
@@ -78,9 +85,11 @@ fn process_argv_puts_the_entry_first_and_the_arguments_after_it() {
         );
         // argv[0] is the embedding executable and argv[1] the entry, so the
         // caller's arguments start at index 2.
+        let resolved = fs::canonicalize(&entry).unwrap();
         assert!(
-            captured.contains(&format!("\"{}\"", entry.display())),
-            "{backend}: process.argv[1] must be the entry: {captured}"
+            captured.contains(&format!("\"{}\"", resolved.display())),
+            "{backend}: process.argv[1] must be the entry ({}): {captured}",
+            resolved.display()
         );
         assert!(
             captured.contains("\"--second\",\"third\""),

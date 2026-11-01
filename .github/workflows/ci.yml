@@ -39,6 +39,19 @@ jobs:
         with:
           cache-on-failure: false
 
+      # Every test target statically links V8, so `--all-targets` leaves tens of
+      # GB of ~500 MB binaries in `target/`. The hosted image ships ~30 GB of
+      # SDKs this crate never touches; removing them is what makes the build
+      # fit. Without this the job dies mid-test with the runner losing its
+      # connection to the server, which reads like a network flake.
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
       - name: Fetch pinned crate sources
         run: cargo fetch --locked
 
