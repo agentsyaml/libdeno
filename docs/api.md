@@ -61,10 +61,13 @@ those to `44` and `255`; libdeno keeps the requested value so a host can tell
 
 That holds for the in-process entry points (`run`, `run_with_output`). A
 subprocess run reports the child's real process status, so the OS has already
-truncated it: `Deno.exit(300)` reads back as `44`, `Deno.exit(-1)` as `255`, and
-`Deno.exit(256)` as `0` — matching what `deno run` produces. A caller that
-compares an exit code against a value above 255 therefore matches in-process and
-silently never matches in a subprocess.
+decided the value. On POSIX that status keeps the low 8 bits, so
+`Deno.exit(300)` reads back as `44`, `Deno.exit(-1)` as `255`, and
+`Deno.exit(256)` as `0`. On Windows the exit code is the full 32-bit value, so
+all three read back unchanged. Either way this matches what `deno run`
+produces. A caller that compares an exit code against a value above 255
+therefore matches in-process and, on POSIX, silently never matches in a
+subprocess.
 
 Captures stdout/stderr selected by `capture_stdout` and `capture_stderr` into
 `RunOutput`. Capture redirects process file descriptors, so output from other

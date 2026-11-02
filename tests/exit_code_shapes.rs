@@ -1,6 +1,10 @@
 //! `exit_code` is the script's requested value in-process, but a real process
-//! status in a subprocess — the OS truncates it to one byte. Both halves are
-//! pinned here because the difference is invisible in the return type.
+//! status in a subprocess. Both halves are pinned here because the difference
+//! is invisible in the return type.
+//!
+//! How much of the value survives depends on the platform: a POSIX wait status
+//! keeps the low 8 bits, while a Windows process exit code is the full 32-bit
+//! value the script passed. Deno CLI 2.9.8 matches both.
 
 use std::fs;
 use std::path::PathBuf;
@@ -38,10 +42,20 @@ fn in_process_keeps_the_requested_exit_code() {
     assert_eq!(run_case("Deno.exit(256);", false), 256);
 }
 
+/// Same values the `deno` CLI produces for these scripts.
+#[cfg(unix)]
 #[test]
-fn subprocess_reports_the_os_truncated_status() {
-    // Same values the `deno` CLI produces for these scripts.
+fn subprocess_reports_the_posix_truncated_status() {
     assert_eq!(run_case("Deno.exit(300);", true), 44);
     assert_eq!(run_case("Deno.exit(-1);", true), 255);
     assert_eq!(run_case("Deno.exit(256);", true), 0);
+}
+
+/// A Windows process exit code is 32-bit, so nothing is truncated.
+#[cfg(windows)]
+#[test]
+fn subprocess_reports_the_full_windows_status() {
+    assert_eq!(run_case("Deno.exit(300);", true), 300);
+    assert_eq!(run_case("Deno.exit(-1);", true), -1);
+    assert_eq!(run_case("Deno.exit(256);", true), 256);
 }
