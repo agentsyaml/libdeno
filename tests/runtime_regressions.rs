@@ -244,7 +244,10 @@ fn run_exit_cases() {
 
     let ready = dir.join("async-ready.txt");
     fs::write(&worker, format!(
-        "globalThis.close=()=>{{Deno.writeTextFileSync({:?},'busy'); const closeEnd=Date.now()+2500; while(Date.now()<closeEnd){{}}}}; postMessage('ready'); const end=Date.now()+1200; while(Date.now()<end){{}} Deno.writeTextFileSync({:?}, 'late');",
+        // The busy window has to outlast this process noticing `ready` and dropping
+    // the run. At 1200 ms a loaded machine can lose that race and the worker
+    // finishes on its own, which then reads as "the drop failed to stop it".
+    "globalThis.close=()=>{{Deno.writeTextFileSync({:?},'busy'); const closeEnd=Date.now()+2500; while(Date.now()<closeEnd){{}}}}; postMessage('ready'); const end=Date.now()+10000; while(Date.now()<end){{}} Deno.writeTextFileSync({:?}, 'late');",
         close_called.display().to_string(), late.display().to_string()
     )).unwrap();
     fs::write(&main, format!(
