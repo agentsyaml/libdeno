@@ -17,6 +17,9 @@
 //!
 //! Deno CLI 2.9.8 behaves the same way in both directions.
 
+// In-process capture is refused on Windows, and the fixture observes the spawned process through a captured run.
+#![cfg(not(windows))]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

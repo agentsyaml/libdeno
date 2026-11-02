@@ -85,6 +85,9 @@ fn long_cjs_edits_execute_for_run_and_reusable_runtime() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// The in-process case probes a refused concurrent capture, which Windows
+/// rejects for its own reason before the lease is consulted.
+#[cfg(not(windows))]
 #[test]
 fn deno_exit_finishes_with_or_without_active_worker() {
     const CHILD: &str = "LIBDENO_EXIT_WORKER_TEST_CHILD";

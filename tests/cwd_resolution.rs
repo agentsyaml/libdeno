@@ -224,6 +224,9 @@ fn relative_permission_paths_resolve_against_cwd() {
 
 /// A script's own relative paths do not follow `options.cwd` in-process.
 ///
+/// Unix-only: the case also changes the process cwd and compares a captured
+/// run's stdout, and in-process capture is refused on Windows.
+///
 /// `docs/api.md` says in-process runs do not change the host cwd. The
 /// consequence is sharper than "`Deno.cwd()` reports the host directory": a
 /// script that opens `local.txt` gets the *host* file in-process and the
@@ -234,6 +237,7 @@ fn relative_permission_paths_resolve_against_cwd() {
 /// The answer is written to a file, not stdout: in-process capture redirects
 /// the process-global fd 1, so a parallel test's harness output would land in
 /// the captured buffer.
+#[cfg(not(windows))]
 #[test]
 fn script_relative_paths_follow_the_process_cwd_in_process_only() {
     // This test changes the process cwd, which is as process-global as the
