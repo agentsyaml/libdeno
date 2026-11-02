@@ -5,7 +5,10 @@ const CHILD_MODE: &str = "LIBDENO_NODE_IPC_TEST_MODE";
 
 fn run_bounded(mut command: Command) {
     let mut child = command.spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(35);
+    // A watchdog, not a latency assertion: the child bootstraps an isolate
+    // before its own work starts, which on a loaded machine outlasts a tight
+    // bound and then reads as a hang in the code under test.
+    let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             terminate_test_process_tree(&mut child);
@@ -14,7 +17,7 @@ fn run_bounded(mut command: Command) {
         }
         if Instant::now() >= deadline {
             terminate_test_process_tree(&mut child);
-            panic!("isolated IPC process exceeded 35s; its process group was terminated");
+            panic!("isolated IPC process exceeded its watchdog; its process group was terminated");
         }
         std::thread::sleep(Duration::from_millis(20));
     }

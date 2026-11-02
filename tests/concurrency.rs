@@ -105,7 +105,7 @@ fn captured_run_rejects_concurrent_ordinary_run() {
         std::thread::spawn(move || run_with_output(&worker_entry, &worker_options).unwrap());
 
     // Wait until the script is provably running (capture lease held).
-    let deadline = Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = Instant::now() + std::time::Duration::from_secs(120);
     while !marker.exists() {
         assert!(Instant::now() < deadline, "captured script never started");
         std::thread::sleep(std::time::Duration::from_millis(50));

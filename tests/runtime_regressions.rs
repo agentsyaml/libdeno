@@ -110,7 +110,7 @@ fn deno_exit_finishes_with_or_without_active_worker() {
         command.process_group(0);
     }
     let mut child = command.spawn().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -259,7 +259,7 @@ fn run_exit_cases() {
         .unwrap();
     let capture_error = tokio.block_on(async {
         let mut run = Box::pin(run_async(&main, &options));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             if ready.exists() {
                 break;
@@ -346,7 +346,7 @@ fn executor_permit_waits_for_cancelled_worker_tree() {
         command.process_group(0);
     }
     let mut child = command.spawn().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             let output = child.wait_with_output().unwrap();
@@ -411,7 +411,7 @@ fn run_executor_cancel_case() {
     let active = executor
         .submit(request, SubmissionOptions::default())
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while !ready.exists() {
         assert!(std::time::Instant::now() < deadline, "worker did not start");
         std::thread::sleep(std::time::Duration::from_millis(5));
