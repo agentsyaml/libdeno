@@ -7,6 +7,11 @@
 //!
 //! The probes run in a separate process, because a run that never returns would
 //! otherwise hang the whole test binary.
+//!
+//! A FIFO is the POSIX object that blocks in `open(2)`. Windows named pipes have
+//! different opening semantics, so the probes are Unix-only.
+
+#![cfg(unix)]
 
 use std::fs;
 use std::path::PathBuf;
