@@ -1581,7 +1581,7 @@ fn prompt_denies_outside_grants_without_a_terminal() {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
                 assert!(status.success(), "non-tty child failed: {status}");

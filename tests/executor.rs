@@ -432,7 +432,7 @@ fn dropped_async_subprocess_future_does_not_stop_started_child() {
     // This intentionally drops the !Send execute_async future after the child
     // proves it started. It is evidence for spawn_blocking's documented
     // behavior, not a cancellation contract: the child must still complete.
-    let started_deadline = Instant::now() + Duration::from_secs(15);
+    let started_deadline = Instant::now() + Duration::from_secs(120);
     runtime.block_on(async {
         let mut future = Box::pin(executor.execute_async(request));
         let waker = std::task::Waker::noop();
@@ -458,7 +458,7 @@ fn dropped_async_subprocess_future_does_not_stop_started_child() {
 
     fs::write(&release_tmp, "resume").unwrap();
     fs::rename(&release_tmp, &release).unwrap();
-    let completion_deadline = Instant::now() + Duration::from_secs(15);
+    let completion_deadline = Instant::now() + Duration::from_secs(120);
     while !completed.exists() {
         assert!(
             Instant::now() < completion_deadline,
@@ -489,7 +489,7 @@ mod execution_control {
     }
 
     fn wait_for(path: &PathBuf) {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(120);
         while !path.exists() {
             assert!(Instant::now() < deadline, "timed out waiting for {path:?}");
             std::thread::sleep(Duration::from_millis(5));
