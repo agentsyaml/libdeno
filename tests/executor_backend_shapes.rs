@@ -27,6 +27,9 @@ fn executor(dir: &PathBuf, backend: ExecutionBackend) -> Executor {
         .unwrap()
 }
 
+/// In-process capture is refused on Windows, so partial output cannot be
+/// observed there; the subprocess case below covers the same shape.
+#[cfg(not(windows))]
 #[test]
 fn in_process_backend_reports_a_thrown_error_as_failure_with_partial_output() {
     let dir = temp_dir("in-process");

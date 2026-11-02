@@ -19,6 +19,10 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// The executor's default backend is in-process, and in-process capture is
+/// refused on Windows; without the capture flag the assertion on captured
+/// output would not apply, so this case stays Unix-only.
+#[cfg(not(windows))]
 #[test]
 fn a_real_execution_reports_phase_diagnostics() {
     let dir = temp_dir("real");
