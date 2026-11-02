@@ -280,6 +280,10 @@ fn run_source_async_smoke() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// In-process capture is refused on Windows (std's stdout/stderr bypass the
+/// redirected CRT fd), so the happy path only exists on Unix. The refusal has
+/// its own test above.
+#[cfg(not(windows))]
 #[test]
 fn run_source_with_output_async_captures_from_an_in_memory_entry() {
     // Only the "reject outside a tokio context" path had a test; the happy
@@ -316,6 +320,7 @@ fn run_source_with_output_async_captures_from_an_in_memory_entry() {
     assert!(stderr.contains("err 7"), "stderr: {stderr:?}");
 }
 
+#[cfg(not(windows))]
 #[test]
 fn reusable_runtime_runs_in_memory_source_with_output() {
     // `LibdenoRuntime::run_with_source_async` and its captured variant were
