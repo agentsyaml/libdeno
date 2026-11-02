@@ -60,7 +60,7 @@ fn spawned_work_outlives(dir: &Path, tail: &str) -> bool {
         capture_stdout: true,
         ..Default::default()
     };
-    let _ = libdeno::run(&dir.join("main.js"), &options);
+    let _ = libdeno::run(dir.join("main.js"), &options);
     std::thread::sleep(Duration::from_secs(4));
     marker.exists()
 }
