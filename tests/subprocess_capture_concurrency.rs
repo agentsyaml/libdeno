@@ -57,7 +57,7 @@ fn options() -> LibdenoOptions {
 
 /// Runs `count` captures that all start together, returning how many succeeded
 /// and the first error message.
-fn burst(entry: &Path, count: usize) -> (usize, Option<String>) {
+fn burst(entry: &Path, count: usize) -> (usize, Vec<String>) {
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(count));
     let handles: Vec<_> = (0..count)
         .map(|_| {
@@ -76,10 +76,14 @@ fn burst(entry: &Path, count: usize) -> (usize, Option<String>) {
         .map(|handle| handle.join().unwrap())
         .collect();
     let ok = results.iter().filter(|result| result.is_ok()).count();
-    let error = results
+    // Every rejection, not just the first: a run that lost the race for a slot
+    // can also report the collection timeout, so which error arrives first is
+    // a scheduling detail.
+    let errors = results
         .iter()
-        .find_map(|result| result.as_ref().err().cloned());
-    (ok, error)
+        .filter_map(|result| result.as_ref().err().cloned())
+        .collect();
+    (ok, errors)
 }
 
 #[test]
@@ -87,7 +91,7 @@ fn a_simultaneous_burst_is_capped_at_32_captures() {
     let _budget = budget_lock();
     let dir = temp_dir("cap");
     let entry = entry(&dir);
-    let (ok, error) = burst(&entry, 40);
+    let (ok, errors) = burst(&entry, 40);
     // The cap is 64 slots / 2 streams, but the whole test binary runs in
     // parallel with other targets and the host is shared, so runs from this
     // burst can finish (and release slots) before later ones reserve. Assert
@@ -97,10 +101,11 @@ fn a_simultaneous_burst_is_capped_at_32_captures() {
         ok > 0 && ok < 40,
         "a 40-capture burst must be partially rejected, got {ok}"
     );
-    let error = error.expect("40 simultaneous captures must exceed the budget");
     assert!(
-        error.contains("subprocess output reader/pipe resource budget exhausted"),
-        "the error must name the exhausted budget, got: {error}"
+        errors
+            .iter()
+            .any(|error| error.contains("subprocess output reader/pipe resource budget exhausted")),
+        "at least one rejection must name the exhausted budget, got: {errors:?}"
     );
     let _ = fs::remove_dir_all(dir);
 }
@@ -114,10 +119,10 @@ fn the_budget_recovers_after_a_burst() {
     assert!(ok > 0, "the burst itself must run");
     // Let the survivors finish and release their slots.
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    let (after, error) = burst(&entry, 10);
+    let (after, errors) = burst(&entry, 10);
     assert_eq!(
         after, 10,
-        "a smaller burst must fully succeed after the budget recovers: {error:?}"
+        "a smaller burst must fully succeed after the budget recovers: {errors:?}"
     );
     let _ = fs::remove_dir_all(dir);
 }

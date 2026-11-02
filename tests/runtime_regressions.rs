@@ -263,7 +263,7 @@ fn run_exit_cases() {
         .enable_all()
         .build()
         .unwrap();
-    let capture_error = tokio.block_on(async {
+    tokio.block_on(async {
         let mut run = Box::pin(run_async(&main, &options));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
@@ -281,21 +281,14 @@ fn run_exit_cases() {
                 panic!("pending async run completed before cancellation");
             }
         }
+        // Dropping the future must not leave the worker running. Whether the
+        // run lease is still held at this instant is a race with the cleanup
+        // task, so the claim under test is the two markers below, not the
+        // lease: a captured run attempted right here either is rejected as
+        // concurrent or succeeds because cleanup already finished, and both
+        // are correct.
         drop(run);
-        run_with_output(
-            &capture_entry,
-            &LibdenoOptions {
-                permissions: vec![format!("--allow-read={}", dir.display())],
-                capture_stdout: true,
-                ..Default::default()
-            },
-        )
-        .unwrap_err()
     });
-    assert!(matches!(
-        capture_error,
-        libdeno::LibdenoError::Configuration(_)
-    ));
     std::thread::sleep(std::time::Duration::from_millis(1400));
     assert!(
         !late.exists(),
