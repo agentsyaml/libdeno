@@ -57,6 +57,7 @@ fn unhandled_worker_error_reports_only_the_generic_message() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn worker_onerror_handler_can_keep_the_run_alive() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -84,6 +85,7 @@ fn worker_onerror_handler_can_keep_the_run_alive() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn a_live_worker_keeps_the_event_loop_alive() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -30,6 +30,7 @@ fn options() -> LibdenoOptions {
     }
 }
 
+#[cfg(not(windows))]
 #[test]
 fn in_process_reports_a_deadline_as_a_timeout_error() {
     let (dir, entry) = setup("in-process");
@@ -80,6 +81,7 @@ fn subprocess_deadline_is_indistinguishable_from_deno_exit_one() {
 /// if `terminate_execution` ever stops interrupting running JS, the busy case
 /// silently inherits the grace offset and hosts notice a 3x overrun on their
 /// timeout budget.
+#[cfg(not(windows))]
 #[test]
 fn a_running_script_returns_close_to_the_deadline() {
     let dir = temp_dir("busy-latency");

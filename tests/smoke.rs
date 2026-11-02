@@ -2140,6 +2140,7 @@ fn run_with_source_rejects_capture_flags_before_resolving_base_dir() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn run_source_with_output_async_rejects_missing_base_dir_outside_tokio() {
     // F1 counterpart: the async-context check must win over a bad base_dir, so

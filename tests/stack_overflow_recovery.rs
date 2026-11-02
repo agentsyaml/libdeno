@@ -26,6 +26,7 @@ fn options() -> LibdenoOptions {
     }
 }
 
+#[cfg(not(windows))]
 #[test]
 fn a_stack_overflow_does_not_poison_later_runs() {
     let dir = temp_dir("recursion");

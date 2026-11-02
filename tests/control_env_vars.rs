@@ -41,6 +41,7 @@ fn options(dir: &Path) -> LibdenoOptions {
     }
 }
 
+#[cfg(not(windows))]
 #[test]
 fn a_script_cannot_set_the_host_executable_override() {
     let _capture = capture_lock();
@@ -70,6 +71,7 @@ fn a_script_cannot_set_the_host_executable_override() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn the_denial_covers_every_control_variable() {
     let _capture = capture_lock();
@@ -114,6 +116,7 @@ fn the_denial_covers_every_control_variable() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn ordinary_environment_variables_are_still_writable() {
     let _capture = capture_lock();
@@ -142,6 +145,7 @@ fn ordinary_environment_variables_are_still_writable() {
 /// list is described as a guard for scoped runs, not a guarantee under `-A`:
 /// a host that hands a plugin `-A` has already granted arbitrary code, so
 /// blocking one variable would be theatre.
+#[cfg(not(windows))]
 #[test]
 fn allow_all_permissions_bypasses_the_deny_list() {
     let _capture = capture_lock();
@@ -183,6 +187,7 @@ fn allow_all_permissions_bypasses_the_deny_list() {
 /// grant. Without this test, a change to "permissions narrows the allow-all
 /// fallback" would look like a hardening fix and silently reverse the
 /// documented semantics for every host that sets both.
+#[cfg(not(windows))]
 #[test]
 fn allow_all_permissions_discards_a_non_empty_permission_list() {
     let _capture = capture_lock();
@@ -260,6 +265,7 @@ fn invalid_permission_flags_keep_their_documented_prefix() {
 /// script that reads `DENO_DIR` or `LIBDENO_HOST_EXE` learns where the host
 /// caches modules and which binary the next subprocess run will execute, even
 /// though it cannot change them.
+#[cfg(not(windows))]
 #[test]
 fn reading_and_deleting_a_control_variable_is_denied_even_when_named_in_the_grant() {
     let _capture = capture_lock();

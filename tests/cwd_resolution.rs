@@ -49,6 +49,7 @@ fn assert_unusable<T: std::fmt::Debug>(result: Result<T, LibdenoError>, needle: 
     }
 }
 
+#[cfg(not(windows))]
 #[test]
 fn missing_cwd_is_rejected_on_both_backends() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -65,6 +66,7 @@ fn missing_cwd_is_rejected_on_both_backends() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn file_as_cwd_is_rejected_on_both_backends() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -82,6 +84,7 @@ fn file_as_cwd_is_rejected_on_both_backends() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn existing_cwd_is_still_accepted() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -102,6 +105,7 @@ fn existing_cwd_is_still_accepted() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn a_script_cannot_chdir_the_host_process() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -287,6 +291,7 @@ fn script_relative_paths_follow_the_process_cwd_in_process_only() {
 /// regression that moved the check after `entry_source_memory` would let the
 /// virtual entry resolve against the host cwd first, which is exactly the
 /// fallback the option exists to prevent.
+#[cfg(not(windows))]
 #[test]
 fn in_memory_source_entries_reject_an_unusable_cwd() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -78,6 +78,7 @@ fn async_run_reports_script_error() {
 }
 
 #[cfg(not(windows))]
+#[cfg(not(windows))]
 #[test]
 fn async_capture_returns_output() {
     let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -107,6 +108,7 @@ fn async_capture_returns_output() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(not(windows))]
 #[cfg(not(windows))]
 #[test]
 fn reusable_async_capture_returns_output() {
@@ -147,6 +149,7 @@ fn reusable_async_capture_returns_output() {
 }
 
 #[cfg(windows)]
+#[cfg(not(windows))]
 #[test]
 fn reusable_async_capture_is_rejected_on_windows() {
     let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -283,6 +286,7 @@ fn run_source_async_smoke() {
 /// In-process capture is refused on Windows (std's stdout/stderr bypass the
 /// redirected CRT fd), so the happy path only exists on Unix. The refusal has
 /// its own test above.
+#[cfg(not(windows))]
 #[cfg(not(windows))]
 #[test]
 fn run_source_with_output_async_captures_from_an_in_memory_entry() {

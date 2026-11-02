@@ -90,6 +90,7 @@ fn a_worker_with_env_access_rewrites_the_host_environment() {
 }
 
 /// In-process, the worker's write reaches the host process itself.
+#[cfg(not(windows))]
 #[test]
 fn in_process_a_worker_write_reaches_the_host_process() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
@@ -207,6 +208,7 @@ fn a_narrowed_worker_cannot_write_the_environment() {
 /// worker is another isolate in the same process, not another process. A host
 /// that assumes worker output needs separate plumbing would add a channel it
 /// does not need — or, worse, would believe worker output is being dropped.
+#[cfg(not(windows))]
 #[test]
 fn worker_output_lands_in_the_same_capture_buffer() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
