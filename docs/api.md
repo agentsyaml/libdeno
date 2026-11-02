@@ -708,13 +708,17 @@ attribution:
   runs must write to a temporary path and rename: the same measurement through
   `writeTextFileSync` + `renameSync` produced 0 torn reads out of 400, because
   `rename` replaces the directory entry atomically on one filesystem.
-- A process the *script* spawns with `Deno.Command` is not reaped when the run
-  ends. `Deno.exit()`, a thrown error, and an expired deadline all end the run
-  without signalling that process, so it keeps running with the host's
-  privileges until it exits on its own. Deno CLI 2.9.8 behaves identically.
-  A host that runs untrusted scripts must contain this itself — a cgroup or
-  process group it tears down afterwards — because neither libdeno nor Deno
-  tracks what a script spawned.
+- A process the *script* spawns with `Deno.Command` is killed when the run
+  ends, unless the script called `unref()` on it. `Deno.exit()`, a thrown
+  error, and an expired deadline all tear down the resource table, and
+  `ChildResource::drop` sends `SIGKILL` to every child that has not been
+  unref'd. Measured both ways: after `Deno.exit()` the child is a zombie,
+  while an `unref()`'d child keeps running. Set `detached: true` or call
+  `unref()` when the process is meant to outlive the run. Deno CLI 2.9.8
+  behaves identically.
+  A host that runs untrusted scripts must still contain the *unref'd* case
+  itself — a cgroup or process group it tears down afterwards — because
+  neither libdeno nor Deno tracks what a script detached.
 
 ## `LibdenoError`
 
