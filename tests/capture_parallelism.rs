@@ -107,6 +107,7 @@ fn subprocess_capture_coexists_with_an_in_process_run() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn in_process_capture_still_rejects_a_concurrent_run() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

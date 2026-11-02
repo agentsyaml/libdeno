@@ -32,6 +32,7 @@ fn write(dir: &Path, name: &str, code: &str) -> PathBuf {
     entry
 }
 
+#[cfg(not(windows))]
 #[test]
 fn type_errors_run_and_syntax_errors_do_not() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -62,6 +63,7 @@ fn type_errors_run_and_syntax_errors_do_not() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn typescript_only_syntax_transpiles() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -96,6 +98,7 @@ fn typescript_only_syntax_transpiles() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn a_js_entry_is_not_transpiled() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

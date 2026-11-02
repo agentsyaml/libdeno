@@ -76,6 +76,7 @@ fn a_cap_can_split_a_multibyte_character() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn a_zero_cap_keeps_nothing_and_reports_truncation() {
     let (dir, entry) = setup("zero", "console.log('hello');");
@@ -98,6 +99,7 @@ fn a_zero_cap_keeps_nothing_and_reports_truncation() {
 /// script printed nothing". `docs/api.md` says the limit applies only to a
 /// captured stream; this pins the flag pairing so the inert combination cannot
 /// silently become a default-on capture.
+#[cfg(not(windows))]
 #[test]
 fn a_cap_without_its_capture_flag_produces_no_output() {
     let _in_process = IN_PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());

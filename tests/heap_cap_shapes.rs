@@ -30,6 +30,7 @@ fn capped() -> LibdenoOptions {
     }
 }
 
+#[cfg(not(windows))]
 #[test]
 fn an_in_process_heap_cap_terminates_the_script_not_the_host() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

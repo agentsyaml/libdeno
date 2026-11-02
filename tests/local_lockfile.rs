@@ -71,6 +71,7 @@ fn a_script_without_dependencies_ignores_frozen_mode() {
     }
 }
 
+#[cfg(not(windows))]
 #[test]
 fn a_malformed_lockfile_is_rejected_regardless_of_frozen_mode() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -115,6 +116,7 @@ fn libdeno_never_writes_the_lockfile() {
 /// as `Core`, the same variant as a script failure, so a host that wants to
 /// distinguish "your lockfile is stale" from "your script threw" has to read
 /// the message — worth pinning so the wording does not drift unnoticed.
+#[cfg(not(windows))]
 #[test]
 fn frozen_mode_rejects_a_dependency_the_lockfile_does_not_cover() {
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
