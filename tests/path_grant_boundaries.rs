@@ -5,6 +5,9 @@
 //! point of these tests is to keep libdeno from drifting and to make the
 //! boundary explicit for callers who hand out write grants.
 
+// In-process capture is refused on Windows, and every case asserts on captured stdout.
+#![cfg(not(windows))]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

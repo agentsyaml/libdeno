@@ -8,6 +8,9 @@
 //! capture redirects the process-global fds, so this test binary's own harness
 //! output also lands in the buffer and shifts every boundary.
 
+// In-process capture is refused on Windows, and every case measures captured bytes.
+#![cfg(not(windows))]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

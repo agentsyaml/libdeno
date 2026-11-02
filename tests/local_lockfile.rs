@@ -5,6 +5,9 @@
 //! lockfile updates. These tests pin all three for the local (non-remote) case;
 //! the remote-fetch cases live in `remote_lockfile.rs`.
 
+// In-process capture is refused on Windows, and every case reads captured stdout through `assert_runs`.
+#![cfg(not(windows))]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

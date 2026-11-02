@@ -128,8 +128,8 @@ fn literal_dynamic_import_honors_revoked_read() {
     );
 }
 
-#[test]
 #[cfg(unix)]
+#[test]
 fn symlinked_dependency_is_judged_the_same_by_static_and_dynamic_import() {
     // `check_open` resolves symlinks itself; pre-canonicalizing in the
     // dynamic-import check changed which grant the path was measured against,
