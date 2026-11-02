@@ -14,6 +14,19 @@ use libdeno::{LibdenoError, LibdenoOptions};
 /// Capture redirects process-global fds, so these tests cannot overlap.
 static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The path without Windows' `\\?\` verbatim prefix.
+///
+/// `canonicalize` returns the verbatim form on Windows, but a process's own
+/// current directory (which is what a script's relative path resolves against)
+/// is the plain form. A grant spelled one way does not cover a path spelled the
+/// other, so the fixture uses the plain form for both.
+fn plain(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(rest) => PathBuf::from(rest),
+        None => path,
+    }
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("libdeno-cwd-{}-{name}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
@@ -229,7 +242,7 @@ fn script_relative_paths_follow_the_process_cwd_in_process_only() {
     // Canonicalize: `temp_dir` is `/var/...` on macOS, a symlink to
     // `/private/var`, and a grant on the symlink does not match the path the
     // resolver canonicalizes to.
-    let dir = temp_dir("script-relative").canonicalize().unwrap();
+    let dir = plain(temp_dir("script-relative").canonicalize().unwrap());
     let host = dir.join("host");
     let pinned = dir.join("pinned");
     fs::create_dir_all(&host).unwrap();
