@@ -5,6 +5,71 @@ breaking changes are highlighted per release with migration notes.
 
 [keep a changelog]: https://keepachangelog.com/en/1.1.0/
 
+## 0.3.9
+
+### Changed
+
+- In-process runs refuse `Deno.chdir()` with `NotSupported`. The script's
+  `chdir` changed the **host** process's working directory, redirecting the
+  host's own relative paths and corrupting concurrent runs.
+  `LibdenoOptions.cwd` is a resolution base only, as the docs always said. Use
+  `run_in_subprocess` when a script needs its own working directory.
+- `--allow-env` no longer covers libdeno's control variables:
+  `LIBDENO_HOST_EXE`, `LIBDENO_CHILD_MODE`, `LIBDENO_CHILD_TOKEN`, the
+  supervisor trio, `LIBDENO_ANALYSIS_CACHE_ENTRIES`,
+  `LIBDENO_MAX_TARBALL_DECOMPRESSED_BYTES`, `DENO_DIR`, `DENO_NO_PACKAGE_JSON`,
+  `JSR_URL`, and the npm registry variables. Reading, writing, or deleting one
+  is denied even when it is named in the grant. Before, a script could set
+  `LIBDENO_HOST_EXE` and pick the binary the next `run_in_subprocess` executed.
+- An explicit `LibdenoOptions.cwd` must resolve to a directory; anything else is
+  `LibdenoError::Configuration`. It used to fall back to the raw path, so the
+  script ran with the host cwd while its permission grants pointed at the
+  missing directory.
+- `prompt: true` with stderr capture is rejected when the options are validated.
+  The prompter requires stderr to be a terminal and capture replaces it with a
+  pipe, so every ungranted check failed closed as `NotCapable` and no prompt was
+  shown. This covers `capture_stderr: true` and `run_in_subprocess_with_output`,
+  which always pipes stderr.
+- The subprocess parent validates the options before spawning: permission flags,
+  heap cap, deadline, and the prompt/capture pair. A child that rejected its own
+  configuration printed to stderr and exited 1, so the parent returned
+  `Ok(exit_code: 1)` — indistinguishable from the script exiting 1 on purpose. A
+  zero `execution_deadline` is now rejected before the child starts, as
+  in-process runs already did.
+
+### Fixed
+
+- `max_heap_bytes` terminates the script instead of aborting the host process.
+  V8 calls `FatalProcessOutOfMemory` when the old generation fills, which an
+  embedder cannot catch; every isolate, main and Web Worker, now gets a
+  near-heap-limit callback that requests termination first, so the run fails
+  with a termination error and the process survives.
+- `LibdenoRuntime::new` keeps the directory spelling the caller passed.
+  Canonicalizing it made the resolver stack, the entry `file:` URL, and literal
+  path grants disagree on macOS (`/var/...` vs `/private/var/...`), which broke
+  workspace-member resolution and denied scoped read grants for the entry the
+  caller named.
+- A dynamic import is read-checked against the unresolved path, matching the
+  static loader. Canonicalizing first made a symlinked dependency load
+  statically and be denied at runtime.
+- Script-spawned processes do not outlive the run: `ChildResource::drop` sends
+  SIGKILL unless the script called `unref()` or spawned with `detached: true`.
+  `docs/api.md` said otherwise. The old test agreed because `ps -o stat=`
+  reports `Z` for a killed-but-unreaped process.
+- A deadline stops Web Workers with the run (`workers.close()` and wait); the
+  docs claimed the opposite.
+- The subprocess exit-code claim is now platform-correct: a POSIX wait status
+  keeps the low 8 bits (`Deno.exit(300)` reads back as `44`), while a Windows
+  process exit code is the full 32-bit value. In-process `RunOutput::exit_code`
+  keeps the requested value on both.
+- The capture-incomplete error names its usual cause, a detached child holding
+  the pipe open, and suggests `stdout: "null"` or a log file.
+
+### Security
+
+- `libz-sys` 1.1.29 → 1.1.31 in both lockfiles, clearing RUSTSEC-2026-0418 (the
+  build script leaked environment variables into the build directory).
+
 ## 0.3.8
 
 ### Added
