@@ -1,6 +1,6 @@
 [package]
 name = "libdeno-python"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2021"
 publish = false
 # The Python README is added by Maturin under a distinct name in the sdist.
@@ -12,7 +12,7 @@ name = "_libdeno"
 crate-type = ["cdylib"]
 
 [dependencies]
-libdeno = { path = "..", version = "=0.3.8" }
+libdeno = { path = "..", version = "=0.3.9" }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
 # Only `rt` is used directly. `enable_all()` still installs a timer driver
 # because features unify per crate: libdeno itself depends on tokio with
