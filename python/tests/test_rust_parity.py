@@ -6,6 +6,7 @@ budget (so a truncation can split a multi-byte character).
 """
 
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,6 +46,9 @@ class CwdValidationTest(unittest.TestCase):
         )
 
 
+@unittest.skipIf(
+    sys.platform == "win32", "in-process output capture is not supported on Windows"
+)
 class CaptureByteBudgetTest(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
