@@ -17,7 +17,7 @@
 //!
 //! Deno CLI 2.9.8 behaves the same way in both directions.
 
-// In-process capture is refused on Windows, and the fixture observes the spawned process through a captured run.
+// POSIX-only: the fixture spawns `/bin/sh`.
 #![cfg(not(windows))]
 
 use std::fs;
@@ -25,9 +25,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use libdeno::LibdenoOptions;
-
-/// In-process capture is process-global and exclusive.
-static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("libdeno-spawnleak-{}-{name}", std::process::id()));
@@ -39,7 +36,6 @@ fn temp_dir(name: &str) -> PathBuf {
 /// executes `tail`. Returns whether the marker appeared within 4 s, i.e.
 /// whether the spawned shell survived the end of the run.
 fn spawned_work_outlives(dir: &Path, tail: &str) -> bool {
-    let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let marker = dir.join("marker");
     let _ = fs::remove_file(&marker);
     fs::write(
@@ -60,7 +56,10 @@ fn spawned_work_outlives(dir: &Path, tail: &str) -> bool {
             format!("--allow-write={}", dir.display()),
             "--allow-run=/bin/sh".to_string(),
         ],
-        capture_stdout: true,
+        // No capture. The run's stdout is never read, and in-process capture
+        // redirects the process-global fd 1 — while it is redirected, the test
+        // harness's own writes go into the captured pipe, and a restore that
+        // races with them surfaces as `BrokenPipe` from libtest itself.
         ..Default::default()
     };
     let _ = libdeno::run(dir.join("main.js"), &options);
