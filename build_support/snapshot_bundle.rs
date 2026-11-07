@@ -110,6 +110,38 @@ pub fn validate_residual_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolves a residual name to the file it actually names inside `dir`.
+///
+/// The name check only proves the string is a plain relative path. The file it
+/// names can still be a symlink, or sit under a symlinked directory, pointing
+/// outside the bundle; `fs::read` and `fs::copy` follow symlinks, so
+/// containment has to be established on the resolved path. Both sides are
+/// canonicalized because the bundle directory itself may be reached through a
+/// symlink (`/var/...` -> `/private/var/...` on macOS).
+///
+/// `Ok(None)` means the file does not exist; callers decide how to word that.
+fn resolve_residual(dir: &Path, name: &str) -> Result<Option<std::path::PathBuf>, String> {
+    validate_residual_name(name)?;
+    let root = std::fs::canonicalize(dir)
+        .map_err(|e| format!("cannot resolve bundle directory {}: {e}", dir.display()))?;
+    let resolved = match std::fs::canonicalize(dir.join(name)) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot resolve residual source {name}: {error}")),
+    };
+    if !resolved.starts_with(&root) {
+        return Err(format!(
+            "residual source {name} resolves outside the bundle directory"
+        ));
+    }
+    // A FIFO or device at a residual name would make `fs::read` block or read
+    // forever; the name and the containment check say nothing about the type.
+    if !resolved.is_file() {
+        return Err(format!("residual source {name} is not a regular file"));
+    }
+    Ok(Some(resolved))
+}
+
 pub fn missing_sources(table: &str, dir: &Path) -> Vec<String> {
     let mut missing: Vec<String> = table_sources(table)
         .into_iter()
@@ -127,8 +159,10 @@ pub fn describe_residuals(table: &str, dir: &Path) -> Result<Vec<Residual>, Stri
     names
         .into_iter()
         .map(|name| {
-            validate_residual_name(&name)?;
-            let bytes = std::fs::read(dir.join(&name))
+            let Some(path) = resolve_residual(dir, &name)? else {
+                return Err(format!("cannot read residual source {name}: not found"));
+            };
+            let bytes = std::fs::read(&path)
                 .map_err(|e| format!("cannot read residual source {name}: {e}"))?;
             Ok(Residual {
                 name,
@@ -150,8 +184,10 @@ pub fn verify_residuals(manifest: &Manifest, table: &str, dir: &Path) -> Result<
         return Err("residual source list does not match the residual table".into());
     }
     for residual in &manifest.residuals {
-        validate_residual_name(&residual.name)?;
-        let bytes = std::fs::read(dir.join(&residual.name))
+        let Some(path) = resolve_residual(dir, &residual.name)? else {
+            return Err(format!("missing residual source {}", residual.name));
+        };
+        let bytes = std::fs::read(&path)
             .map_err(|e| format!("missing residual source {}: {e}", residual.name))?;
         if bytes.len() != residual.bytes || fingerprint(&bytes) != residual.hash {
             return Err(format!(
@@ -170,15 +206,21 @@ pub fn copy_verified_residuals(
     output_dir: &Path,
 ) -> Result<(), String> {
     for name in table_sources(table) {
-        validate_residual_name(&name)?;
-        let source = source_dir.join(&name);
+        let Some(source) = resolve_residual(source_dir, &name)? else {
+            return Err(format!("does not contain the residual source {name}"));
+        };
+        // Read through the resolved path and write those bytes. Copying the
+        // name again would re-follow a symlink that a concurrent writer could
+        // swap in after the containment check.
+        let bytes = std::fs::read(&source)
+            .map_err(|error| format!("does not contain the residual source {name}: {error}"))?;
         let target = output_dir.join(&name);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
         }
-        std::fs::copy(&source, &target)
-            .map_err(|error| format!("does not contain the residual source {name}: {error}"))?;
+        std::fs::write(&target, &bytes)
+            .map_err(|error| format!("failed to write {}: {error}", target.display()))?;
     }
     verify_residuals(manifest, table, output_dir)
 }

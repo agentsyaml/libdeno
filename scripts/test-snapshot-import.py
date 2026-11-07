@@ -168,6 +168,20 @@ def main():
         (bundle / "residual.js").unlink()
         assert "missing residual source" in run(temp / "missing-residual").stderr
         (bundle / "residual.js").write_bytes(residual)
+        if os.name != "nt":
+            # A symlink is not a plain file. Point it at an outside file with
+            # the content the manifest already expects, so only containment can
+            # stop the build from reading and copying it.
+            outside = temp / "outside-residual.js"
+            outside.write_bytes(residual)
+            (bundle / "residual.js").unlink()
+            (bundle / "residual.js").symlink_to(outside)
+            escaped = run(temp / "symlinked-residual")
+            assert escaped.returncode == 101, escaped.stderr
+            assert "resolves outside the bundle directory" in escaped.stderr, escaped.stderr
+            assert not (temp / "symlinked-residual" / "residual.js").exists()
+            (bundle / "residual.js").unlink()
+            (bundle / "residual.js").write_bytes(residual)
         write_manifest({"v8": "wrong-v8"})
         assert "v8" in run(temp / "mismatch").stderr
         write_manifest(snapshot_bytes=b"corrupted")

@@ -150,6 +150,62 @@ fn residual_names_cannot_escape_the_bundle_directory() {
     }
 }
 
+#[cfg(unix)]
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "libdeno-bundle-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[cfg(unix)]
+fn manifest_for(name: &str, table: &str, bytes: &[u8]) -> Manifest {
+    let mut manifest = describe(&identity(), b"snapshot", table.as_bytes());
+    manifest.residuals = vec![Residual {
+        name: name.into(),
+        bytes: bytes.len(),
+        hash: fingerprint(bytes),
+    }];
+    manifest
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_residual_cannot_read_outside_the_bundle() {
+    let root = scratch("symlink-file");
+    let bundle = root.join("bundle");
+    let outside = root.join("outside.txt");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(&outside, b"secret").unwrap();
+    std::os::unix::fs::symlink(&outside, bundle.join("residual.js")).unwrap();
+
+    let table = "include_str!(\"residual.js\")";
+    // The manifest is attacker-supplied too, so its hash matches the outside
+    // file; only containment can refuse this.
+    let manifest = manifest_for("residual.js", table, b"secret");
+
+    let error = verify_residuals(&manifest, table, &bundle).unwrap_err();
+    assert!(error.contains("outside the bundle directory"), "{error}");
+    let error = describe_residuals(table, &bundle).unwrap_err();
+    assert!(error.contains("outside the bundle directory"), "{error}");
+
+    let output = root.join("out");
+    std::fs::create_dir_all(&output).unwrap();
+    let error = copy_verified_residuals(&manifest, table, &bundle, &output).unwrap_err();
+    assert!(error.contains("outside the bundle directory"), "{error}");
+    assert!(
+        !output.join("residual.js").exists(),
+        "the outside file was copied into OUT_DIR"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn verify_rejects_a_traversing_residual_name() {
     // Both the table and the manifest are attacker-controlled in a bundle;
@@ -167,6 +223,81 @@ fn verify_rejects_a_traversing_residual_name() {
     let dir = std::env::temp_dir();
     let error = verify_residuals(&manifest, &table, &dir).unwrap_err();
     assert!(error.contains("not a plain relative path"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_directory_cannot_smuggle_a_residual_out() {
+    let root = scratch("symlink-dir");
+    let bundle = root.join("bundle");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("file.js"), b"secret").unwrap();
+    std::os::unix::fs::symlink(&outside, bundle.join("residual_sources")).unwrap();
+
+    let name = "residual_sources/file.js";
+    let table = format!("include_str!(\"{name}\")");
+    let manifest = manifest_for(name, &table, b"secret");
+    for error in [
+        verify_residuals(&manifest, &table, &bundle).unwrap_err(),
+        describe_residuals(&table, &bundle).unwrap_err(),
+    ] {
+        assert!(error.contains("outside the bundle directory"), "{error}");
+    }
+
+    let output = root.join("out");
+    std::fs::create_dir_all(&output).unwrap();
+    let error = copy_verified_residuals(&manifest, &table, &bundle, &output).unwrap_err();
+    assert!(error.contains("outside the bundle directory"), "{error}");
+    assert!(
+        !output.join(name).exists(),
+        "the outside file was copied into OUT_DIR"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_and_internally_symlinked_residuals_still_work() {
+    let root = scratch("symlink-inside");
+    let bundle = root.join("bundle");
+    std::fs::create_dir_all(bundle.join("nested/dir")).unwrap();
+    std::fs::write(bundle.join("nested/dir/x.js"), b"nested").unwrap();
+    // A symlink that resolves inside the bundle is a normal build-tree layout;
+    // containment is about where it resolves, not that it is a symlink.
+    std::os::unix::fs::symlink(bundle.join("nested/dir/x.js"), bundle.join("alias.js")).unwrap();
+
+    let table = "include_str!(\"nested/dir/x.js\")\ninclude_str!(\"alias.js\")";
+    let mut manifest = describe(&identity(), b"snapshot", table.as_bytes());
+    manifest.residuals = describe_residuals(table, &bundle).unwrap();
+    verify_residuals(&manifest, table, &bundle).unwrap();
+
+    let output = root.join("out");
+    copy_verified_residuals(&manifest, table, &bundle, &output).unwrap();
+    assert_eq!(
+        std::fs::read(output.join("nested/dir/x.js")).unwrap(),
+        b"nested"
+    );
+    assert_eq!(std::fs::read(output.join("alias.js")).unwrap(), b"nested");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_directory_is_not_a_residual_source() {
+    let dir = std::env::temp_dir().join(format!(
+        "libdeno-bundle-dirname-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(dir.join("residual.js")).unwrap();
+    let table = "include_str!(\"residual.js\")";
+    let error = describe_residuals(table, &dir).unwrap_err();
+    assert!(error.contains("not a regular file"), "{error}");
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
