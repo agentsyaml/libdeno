@@ -126,8 +126,8 @@ pub(crate) fn build_main_worker(
     };
 
     // Must match deno_runtime's release tag: scripts feature-detect
-    // Deno.version.deno. deno_runtime 0.267.0 == Deno v2.9.7.
-    const DENO_VERSION: &str = "2.9.7";
+    // Deno.version.deno. deno_runtime 0.268.0 == Deno v2.9.8.
+    const DENO_VERSION: &str = "2.9.8";
 
     let main_bootstrap = BootstrapOptions {
         deno_version: DENO_VERSION.to_string(),

@@ -166,12 +166,12 @@ fn ensure_snapshot_architecture() {
         .unwrap_or_else(|error| panic!("{error}"));
 }
 
-// The TypeScript version bundled in deno_runtime 0.267.0's snapshot.
+// The TypeScript version bundled in deno_runtime 0.268.0's snapshot.
 // No crate in the dep tree exposes the bundled TypeScript compiler version
 // (deno_ast::VERSION is the deno_ast crate version, not the TS compiler's), so
 // it cannot be machine-verified against a dependency. Source of truth: the deno
-// repo's cli/snapshot/shared.rs TS_VERSION at the tag for deno_runtime 0.267.0
-// (v2.9.7) — update in lockstep with the deno_runtime bump.
+// repo's cli/snapshot/shared.rs TS_VERSION at the tag for deno_runtime 0.268.0
+// (v2.9.8) — update in lockstep with the deno_runtime bump.
 //
 // The checked-in Cargo.toml ledger and the offline CI/release checks catch
 // local declaration drift, but they cannot prove upstream provenance. When

@@ -1,6 +1,6 @@
 # Building libdeno on musl
 
-`deno_runtime` 0.267.0 and `deno_node` 0.197.0 need a local patch to compile
+`deno_runtime` 0.268.0 and `deno_node` 0.198.0 need a local patch to compile
 for `*-unknown-linux-musl`: they call glibc-only `libc::malloc_trim`, and
 `deno_node` registers an argv initializer with a signature that does not match
 musl's `void(void)` init-array ABI. The patch excludes that initializer on
@@ -28,9 +28,9 @@ along with its caller keeps the patched tree warning-free.
 
 ```bash
 mkdir -p vendor
-cp -R ~/.cargo/registry/src/*/deno_runtime-0.267.0 vendor/deno_runtime
-cp -R ~/.cargo/registry/src/*/deno_node-0.197.0 vendor/deno_node
-(cd vendor && patch -p1 < ../patches/deno-musl-0.267.0-0.197.0.patch)
+cp -R ~/.cargo/registry/src/*/deno_runtime-0.268.0 vendor/deno_runtime
+cp -R ~/.cargo/registry/src/*/deno_node-0.198.0 vendor/deno_node
+(cd vendor && patch -p1 < ../patches/deno-musl-0.268.0-0.198.0.patch)
 ```
 
 Then point Cargo at the copies:

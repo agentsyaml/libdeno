@@ -6,8 +6,8 @@ fn identity() -> Identity {
         target: "aarch64-apple-darwin".into(),
         v8: "14.2.1".into(),
         typescript: "6.0.3".into(),
-        deno_core: "0.412.0".into(),
-        deno_runtime: "0.267.0".into(),
+        deno_core: "0.413.0".into(),
+        deno_runtime: "0.268.0".into(),
     }
 }
 

@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PATCH = ROOT / "patches/deno-musl-0.267.0-0.197.0.patch"
+PATCH = ROOT / "patches/deno-musl-0.268.0-0.198.0.patch"
 
 
 def main():

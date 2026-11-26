@@ -1,4 +1,4 @@
-// Adapted from deno_runtime 0.267.0 ops/worker_host.rs, Copyright 2018-2026 the Deno authors, MIT license.
+// Adapted from deno_runtime 0.268.0 ops/worker_host.rs, Copyright 2018-2026 the Deno authors, MIT license.
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::poll_fn;
