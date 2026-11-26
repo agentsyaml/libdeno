@@ -8,8 +8,8 @@ fn bundle_identity_rejects_a_different_v8_version() {
         target: "x86_64-apple-darwin".into(),
         v8: "15.0.245.2-rusty".into(),
         typescript: "6.0.3".into(),
-        deno_core: "0.412.0".into(),
-        deno_runtime: "0.267.0".into(),
+        deno_core: "0.413.0".into(),
+        deno_runtime: "0.268.0".into(),
     };
     let manifest = snapshot_bundle::describe(&identity, b"snapshot", b"table");
     let mut different = identity;

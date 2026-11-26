@@ -5,6 +5,47 @@ breaking changes are highlighted per release with migration notes.
 
 [keep a changelog]: https://keepachangelog.com/en/1.1.0/
 
+## 0.3.10
+
+### Changed
+
+- Deno runtime 2.9.7 → 2.9.8: `deno_runtime` 0.268.0, `deno_core` 0.413.0,
+  `deno_resolver` 0.91.0, `deno_graph` 0.111.1, `node_resolver` 0.98.0, and the
+  matching `deno_config`, `deno_npm*`, `deno_fs`, and `deno_features` releases.
+  TypeScript stays 6.0.3 and V8 stays 15.0.245.2-rusty, so a normal build does
+  not rebuild the engine. The public API is unchanged.
+- Snapshot identity changed with the runtime, so a bundle published for 0.3.9 or
+  earlier cannot be imported into a 0.3.10 build. Re-run
+  `scripts/fetch-snapshot.sh` once the 0.3.10 bundles are published.
+- [docs/musl.md](docs/musl.md) and
+  `patches/deno-musl-0.268.0-0.198.0.patch` target `deno_runtime` 0.268.0 and
+  `deno_node` 0.198.0. The patch still carries the same four musl exclusions.
+
+### Fixed
+
+- [docs/native-extensions.md](docs/native-extensions.md) and its compile
+  fixture pinned `deno_core` 0.412.0. A fixture copied from an older checkout
+  therefore failed to resolve against this crate's 0.413.0 lockfile; both now
+  name 0.413.0.
+
+### Security
+
+- Dependency updates clear the advisories that did not depend on the Deno
+  version: `rustix` 1.1.6 (RUSTSEC-2026-0486), `url` 2.5.9 (RUSTSEC-2026-0592),
+  `quinn-udp` 0.5.16 (RUSTSEC-2026-0538), and `libz-sys` 1.1.33
+  (RUSTSEC-2026-0544). `lcms2` and `lcms2-sys` move to 6.3.0 and 4.2.0, leaving
+  a yanked release.
+- Four advisories reachable only through the pinned Deno crates are recorded
+  with dated exceptions instead of being silently ignored: `hickory-proto` and
+  `hickory-resolver` 0.25.2, `libsqlite3-sys` 0.38.2, and `heapless` 0.8.0.
+  [SECURITY.md](SECURITY.md) lists the affected paths, what a host is exposed
+  to, and the version that lifts each exception.
+- Deno 2.9.8 carries upstream fixes of its own: N-API `DataView` bounds
+  checking, distrust of the compromised eMudhra certificate authorities, npm
+  package link-name validation, op-context lifetime during isolate disposal,
+  and a read-permission check for dynamically imported local files at compile
+  time.
+
 ## 0.3.9
 
 ### Changed

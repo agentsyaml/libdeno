@@ -1,8 +1,7 @@
 diff -ru a/deno_node/ops/process.rs b/deno_node/ops/process.rs
---- a/deno_node/ops/process.rs
-+++ b/deno_node/ops/process.rs
-@@ -82,8 +82,8 @@
- /// Compute the contiguous argv buffer bounds from argv[0]..argv[argc-1].
+--- a/deno_node/ops/process.rs	2026-11-23 20:08:20
++++ b/deno_node/ops/process.rs	2026-11-23 20:08:20
+@@ -83,7 +83,7 @@
  ///
  /// # Safety
  /// `argv` must be a valid pointer to `argc` C string pointers.
@@ -11,19 +10,17 @@ diff -ru a/deno_node/ops/process.rs b/deno_node/ops/process.rs
  unsafe fn compute_argv_info(
    argc: usize,
    argv: *mut *mut libc::c_char,
-@@ -105,7 +105,8 @@
+@@ -105,6 +105,7 @@
  #[cfg(target_os = "linux")]
  #[used]
  #[unsafe(link_section = ".init_array")]
--static ARGV_INIT_FN: unsafe extern "C" fn(
 +#[cfg(not(target_env = "musl"))]
-+static ARGV_INIT_FN: unsafe extern "C" fn(
+ static ARGV_INIT_FN: unsafe extern "C" fn(
    libc::c_int,
    *mut *mut libc::c_char,
-   *mut *mut libc::c_char,
 diff -ru a/deno_runtime/ops/worker_host.rs b/deno_runtime/ops/worker_host.rs
---- a/deno_runtime/ops/worker_host.rs
-+++ b/deno_runtime/ops/worker_host.rs
+--- a/deno_runtime/ops/worker_host.rs	2026-11-23 20:08:20
++++ b/deno_runtime/ops/worker_host.rs	2026-11-23 20:08:20
 @@ -436,7 +436,7 @@
      // OS. Without this, glibc in particular holds onto the fragmented heap
      // pages, causing RSS to remain high after many workers are created and
@@ -34,8 +31,8 @@ diff -ru a/deno_runtime/ops/worker_host.rs b/deno_runtime/ops/worker_host.rs
        // SAFETY: calling libc function with no preconditions.
        unsafe {
 diff -ru a/deno_runtime/worker.rs b/deno_runtime/worker.rs
---- a/deno_runtime/worker.rs
-+++ b/deno_runtime/worker.rs
+--- a/deno_runtime/worker.rs	2026-11-23 20:08:20
++++ b/deno_runtime/worker.rs	2026-11-23 20:08:20
 @@ -80,6 +80,7 @@
          sigusr2.recv().await;
  

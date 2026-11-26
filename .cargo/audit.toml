@@ -29,4 +29,6 @@ ignore = [
   "RUSTSEC-2024-0436",
   # Informational (unsound, no fix): rand 0.8 in the deno stack.
   "RUSTSEC-2026-0097",
+  # Informational: chrono 0.4.45 unmaintained (deno_cache dependency).
+  "RUSTSEC-2026-0543",
 ]

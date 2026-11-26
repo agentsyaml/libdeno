@@ -141,40 +141,54 @@ fixes flow into the tree.
 | RUSTSEC-2026-0118 | hickory-proto 0.25.x | NSEC3 denial-of-service, `patched = []` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0118) / [GHSA-3v94-mw7p-v465](https://github.com/hickory-dns/hickory-dns/security/advisories/GHSA-3v94-mw7p-v465) |
 | RUSTSEC-2026-0119 | hickory-proto 0.25.x | Denial-of-service, fixed `>= 0.26.1` (deno main not moved off 0.25) | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0119) / [GHSA-q2qq-hmj6-3wpp](https://github.com/hickory-dns/hickory-dns/security/advisories/GHSA-q2qq-hmj6-3wpp) |
 | RUSTSEC-2023-0071 | rsa 0.9.x | CVE-2023-49092 (Marvin timing attack), `patched = []` — no stable fixed release | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2023-0071) / [RustCrypto/RSA#626](https://github.com/RustCrypto/RSA/issues/626) |
-| RUSTSEC-2026-0285 | rustls 0.23.40 | TLS 1.3 handshake messages incorrectly accepted across encryption-level boundaries, fixed `>= 0.23.45` — `deno_tls` 0.246.0 exact-pins `rustls = "=0.23.40"` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0285) |
+| RUSTSEC-2026-0285 | rustls 0.23.40 | TLS 1.3 handshake messages incorrectly accepted across encryption-level boundaries, fixed `>= 0.23.45` — `deno_tls` 0.247.0 exact-pins `rustls = "=0.23.40"` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0285) |
 | RUSTSEC-2026-0346 | rustls 0.23.40 | Custom session-store `Debug` output can expose TLS secrets, fixed `>= 0.23.46` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0346) |
 | RUSTSEC-2026-0348 | rustls 0.23.40 | Brotli certificate decompression can allocate up to 1 GiB before authentication, fixed `>= 0.23.46` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0348) |
 | RUSTSEC-2026-0349 | rustls 0.23.40 | Unauthenticated ServerHello can downgrade later connections to classical key exchange, fixed `>= 0.23.46` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0349) |
 | RUSTSEC-2026-0387 | crypto-bigint 0.5.5 | Secret-dependent branches in supposedly constant-time arithmetic, fixed `>= 0.7.6` — `elliptic-curve` 0.13 in the Deno stack still depends on crypto-bigint 0.5 | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0387) |
+| RUSTSEC-2026-0487 … -0551 | hickory-proto 0.25.2 | SVCB/HTTPS parsing panics, DNS header memory amplification, and DNSSEC validation defects; fixed `>= 0.26.2`, and Deno 2.9.8 still pins 0.25 | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0487) |
+| RUSTSEC-2026-0514 | hickory-resolver 0.25.2 | `lookup` returned records that failed DNSSEC validation; fixed `>= 0.26.2` | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0514) |
+| RUSTSEC-2026-0459 | libsqlite3-sys 0.38.2 | Bundled SQLite < 3.54.0 can return uninitialized page-cache memory; fixed in 0.39.0, which needs `rusqlite` 0.41 | [CVE-2026-119375](https://nvd.nist.gov/vuln/detail/CVE-2026-119375) |
+| RUSTSEC-2026-0574 … -0582 | heapless 0.8.0 | Unsound collection APIs (use-after-free, inconsistent state, broken invariants); fixed `>= 0.9.4` — `faster-hex` in `deno_kv` pins 0.8 | [rustsec.org](https://rustsec.org/advisories/RUSTSEC-2026-0574) |
 
 The CI wrapper (`audit-with-temporary-exceptions.py`) applies time-limited
 exceptions, each only while its exact pinned version is in the lockfile:
 
 | Exception | Advisories | Expires (UTC) |
 |---|---|---|
-| rustls 0.23.40 | RUSTSEC-2026-0346, -0348, -0349 | 2026-11-17 |
-| crypto-bigint 0.5.5 | RUSTSEC-2026-0387 | 2026-12-31 |
-| zstd 0.13.2, zstd-safe 7.2.4, zstd-sys 2.0.16+zstd.1.5.7 | RUSTSEC-2026-0391, -0395, -0396, -0397, -0398, -0399, -0400, -0401, -0402, -0403, -0404, -0405, -0406, -0410 | 2026-11-26 |
+| rustls 0.23.40 | RUSTSEC-2026-0346, -0348, -0349 | 2027-01-31 |
+| crypto-bigint 0.5.5 | RUSTSEC-2026-0387 | 2027-01-31 |
+| zstd 0.13.2, zstd-safe 7.2.4, zstd-sys 2.0.16+zstd.1.5.7 | RUSTSEC-2026-0391, -0395, -0396, -0397, -0398, -0399, -0400, -0401, -0402, -0403, -0404, -0405, -0406, -0410 | 2027-01-31 |
+| hickory-proto 0.25.2 | RUSTSEC-2026-0487, -0489, -0490, -0491, -0504, -0505, -0511, -0512, -0530, -0531, -0532, -0549, -0550, -0551 | 2027-01-31 |
+| hickory-resolver 0.25.2 | RUSTSEC-2026-0514 | 2027-01-31 |
+| libsqlite3-sys 0.38.2 | RUSTSEC-2026-0459 | 2027-01-31 |
+| heapless 0.8.0 | RUSTSEC-2026-0574 … -0582 | 2027-01-31 |
 
 On or after an expiry date the wrapper fails the audit instead of ignoring the
 advisory; other audit findings remain fatal throughout. These are real risks:
 custom session-store logs may expose secrets, Brotli-enabled certificate
 processing can be exhausted by a malicious peer, affected connections may lose
 post-quantum key exchange, and secret integers used in the affected
-crypto-bigint operations may leak through timing. Remove each exception as soon
-as an upstream Deno update moves past the pinned version (rustls >=0.23.46,
-crypto-bigint >=0.7.6). The accepted zstd risks include memory-safety defects in
+crypto-bigint operations may leak through timing. The hickory entries cover
+parser panics and DNSSEC validation defects reachable when a script resolves
+attacker-influenced names; the libsqlite3-sys entry covers uninitialized memory
+returned when a crafted database is opened with a sibling `-wal`; the heapless
+entries are unsound collection APIs reached through `faster-hex` inside
+`deno_kv`. Remove each exception as soon as an upstream Deno update moves past
+the pinned version (rustls >=0.23.46, crypto-bigint >=0.7.6, hickory >=0.26.2,
+rusqlite >=0.41, heapless >=0.9.4). The accepted zstd risks include
+memory-safety defects in
 streaming/seekable APIs and a WebAssembly allocator-shim corruption on allocation
-failure; they are not fixed locally. Deno node 0.197.0 pins this chain, and 0.198.0
-plus upstream main still retain it, so the fixes remain unavailable through
-Deno. Remove this exception when upstream Deno selects zstd >=0.14.3,
-zstd-safe >=8.2.0, and zstd-sys >=2.1.2, or by 2026-11-26.
+failure; they are not fixed locally. Deno node 0.198.0 pins this chain, and
+upstream main still retains it, so the fixes remain unavailable through Deno.
+Remove this exception when upstream Deno selects zstd >=0.14.3, zstd-safe
+>=8.2.0, and zstd-sys >=2.1.2, or by 2027-01-31.
 
 Informational (no vulnerability): bincode 1.x (RUSTSEC-2025-0141),
 rustls-pemfile (RUSTSEC-2025-0134), smartstring (RUSTSEC-2026-0249), paste
-(RUSTSEC-2024-0436) — all unmaintained; rand 0.8 (RUSTSEC-2026-0097) —
-unsound, no fix. All are deno-stack transitive dependencies; libdeno cannot
-replace them.
+(RUSTSEC-2024-0436), chrono 0.4 (RUSTSEC-2026-0543) — all unmaintained;
+rand 0.8 (RUSTSEC-2026-0097) — unsound, no fix. All are deno-stack transitive
+dependencies; libdeno cannot replace them.
 
 Separately, **rusty_v8** (the V8 binding) rolls continuously: the exact V8
 version shipped in a given libdeno release depends on the
